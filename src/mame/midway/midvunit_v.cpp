@@ -475,6 +475,11 @@ void thread_main()
 	// seen at the rig as alternating sharp/chunky frames
 	SetWindowLongPtrA(parent, GWL_STYLE,
 		GetWindowLongPtrA(parent, GWL_STYLE) | WS_CLIPCHILDREN);
+	// style changes are NOT applied until a frame change is forced - without
+	// this, MAME's own blit keeps punching through the overlay (seen at the
+	// rig as alternating stretched/letterboxed frames)
+	SetWindowPos(parent, nullptr, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 	RECT rc; GetClientRect(parent, &rc);
 	// disabled + no-activate child: paints over MAME, never takes input
 	HWND child = CreateWindowExA(WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
