@@ -594,6 +594,7 @@ void thread_main()
 	bool pend_valid[2] = {};
 	static uint16_t shadow[2][HEIGHT * 512];
 	bool quad_fresh[2] = {};
+	bool crop2d[2] = {};
 	int quad_count[2] = {};
 	int visible = 0;
 	std::vector<uint8_t> staging(8 << 20);
@@ -714,6 +715,21 @@ void thread_main()
 			pend_valid[pg] = false;
 			build_vertices(pend[pg], float(MARGIN), fdata, udata);
 			quad_count[pg] = int(pend[pg].size());
+			// 2D screens (menus, high scores) are drawn almost entirely from
+			// axis-aligned rectangles; 3D scenes almost never are. Quad-count
+			// thresholds proved unreliable (2D ~160 vs 3D dipping to ~260).
+			int axis = 0;
+			for (auto const &q : pend[pg])
+			{
+				int16_t const x0 = int16_t(q.dma[2]), y0 = int16_t(q.dma[3]);
+				int16_t const x1 = int16_t(q.dma[4]), y1 = int16_t(q.dma[5]);
+				int16_t const x2 = int16_t(q.dma[6]), y2 = int16_t(q.dma[7]);
+				int16_t const x3 = int16_t(q.dma[8]), y3 = int16_t(q.dma[9]);
+				if ((y0 == y1 && y2 == y3 && x1 == x2 && x3 == x0) ||
+					(x0 == x1 && x2 == x3 && y1 == y2 && y3 == y0))
+					++axis;
+			}
+			crop2d[pg] = (axis * 10 >= int(pend[pg].size()) * 7);
 			gl.UseProgram(prog);
 			gl.BindVertexArray(vao);
 			gl.BindBuffer(ARRAY_BUFFER, vbo_f);
@@ -735,7 +751,7 @@ void thread_main()
 		gl.Viewport(0, 0, cw, ch);
 		gl.ClearColor(0, 0, 0, 1);
 		gl.Clear(0x4000);
-		bool const wide3d = quad_fresh[visible] && quad_count[visible] >= 120;
+		bool const wide3d = quad_fresh[visible] && !crop2d[visible];
 		float const content_w = wide3d ? float(WIDE) : 512.0f;
 		float const aspect = (content_w * PAR) / float(HEIGHT);
 		int vw = cw, vh = int(cw / aspect + 0.5f);
