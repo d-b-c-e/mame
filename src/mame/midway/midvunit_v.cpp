@@ -25,6 +25,15 @@
 // re-rasterizing the captured stream offline and diffing against videoram.
 #include <cstdio>
 #include <cstdlib>
+#include <cstdarg>
+#include <algorithm>
+#include <thread>
+#include <vector>
+#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#include "midvunit_gl_shaders.h"
+#endif
 
 namespace {
 
@@ -60,7 +69,6 @@ FILE *quadlog_open()
 //   4 TEXTURE u32 frame, u8 bytes[]
 //   5 VRAM    u32 frame, u32 offset, u32 count, u16 data[count]
 #ifdef _WIN32
-#include <windows.h>
 
 struct midv_live
 {
@@ -84,7 +92,7 @@ struct midv_live
 
 	midv_live()
 	{
-		if (!std::getenv("MIDV_LIVE"))
+		if (!std::getenv("MIDV_LIVE") && !std::getenv("MIDV_GL"))
 			return;
 		HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr,
 			PAGE_READWRITE, 0, HDR_SIZE + RING_SIZE, "Local\\MIDV_LIVE");
@@ -165,9 +173,631 @@ struct midv_live
 	}
 };
 
+midv_live &live();
+
+// ── MIDV_GL: in-process GL renderer (Phase 1 step 2) ─────────────────────
+//
+// MIDV_GL=1 spawns a render thread that consumes the same ring the external
+// viewer uses, renders scenes with the verified shaders, and presents into a
+// DISABLED overlay child window covering MAME's own window - so input,
+// audio, FFB proxying and window focus all stay exactly as stock MAME.
+// MIDV_GL_SCALE (default 3) sets internal scale; MIDV_GL_SNAP=<dir> writes a
+// backbuffer BMP every ~150 presents for unattended verification.
+namespace mvgl {
+
+// ---- minimal dynamic GL loader (no link-time deps beyond user32/gdi32) ----
+#define MVGL_E(n, v) constexpr unsigned n = v;
+MVGL_E(FRAGMENT_SHADER, 0x8B30) MVGL_E(VERTEX_SHADER, 0x8B31)
+MVGL_E(COMPILE_STATUS, 0x8B81) MVGL_E(LINK_STATUS, 0x8B82)
+MVGL_E(ARRAY_BUFFER, 0x8892) MVGL_E(STREAM_DRAW, 0x88E0)
+MVGL_E(FRAMEBUFFER, 0x8D40) MVGL_E(COLOR_ATTACHMENT0, 0x8CE0)
+MVGL_E(FRAMEBUFFER_COMPLETE, 0x8CD5) MVGL_E(TEXTURE0, 0x84C0)
+MVGL_E(R16UI, 0x8234) MVGL_E(R8UI, 0x8232) MVGL_E(R32UI, 0x8236)
+MVGL_E(RED_INTEGER, 0x8D94)
+#undef MVGL_E
+
+typedef unsigned uint;
+typedef ptrdiff_t glsizeiptr;
+struct GL
+{
+	HMODULE dll = nullptr;
+	// wgl
+	HGLRC (WINAPI *CreateContext)(HDC);
+	BOOL (WINAPI *DeleteContext)(HGLRC);
+	BOOL (WINAPI *MakeCurrent)(HDC, HGLRC);
+	PROC (WINAPI *GetProc)(LPCSTR);
+	HGLRC (WINAPI *CreateContextAttribs)(HDC, HGLRC, const int *);
+	BOOL (WINAPI *SwapIntervalEXT)(int);
+	// gl 1.1 (from opengl32.dll directly)
+	void (WINAPI *Viewport)(int, int, int, int);
+	void (WINAPI *ClearColor)(float, float, float, float);
+	void (WINAPI *Clear)(unsigned);
+	void (WINAPI *GenTextures)(int, uint *);
+	void (WINAPI *BindTexture)(unsigned, uint);
+	void (WINAPI *TexParameteri)(unsigned, unsigned, int);
+	void (WINAPI *TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+	void (WINAPI *TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+	void (WINAPI *PixelStorei)(unsigned, int);
+	void (WINAPI *DrawArrays)(unsigned, int, int);
+	void (WINAPI *ReadPixels)(int, int, int, int, unsigned, unsigned, void *);
+	unsigned (WINAPI *GetError)();
+	// modern (via wglGetProcAddress)
+	uint (WINAPI *CreateShader)(unsigned);
+	void (WINAPI *ShaderSource)(uint, int, const char *const *, const int *);
+	void (WINAPI *CompileShader)(uint);
+	void (WINAPI *GetShaderiv)(uint, unsigned, int *);
+	void (WINAPI *GetShaderInfoLog)(uint, int, int *, char *);
+	uint (WINAPI *CreateProgram)();
+	void (WINAPI *AttachShader)(uint, uint);
+	void (WINAPI *LinkProgram)(uint);
+	void (WINAPI *GetProgramiv)(uint, unsigned, int *);
+	void (WINAPI *GetProgramInfoLog)(uint, int, int *, char *);
+	void (WINAPI *UseProgram)(uint);
+	int (WINAPI *GetUniformLocation)(uint, const char *);
+	void (WINAPI *Uniform1i)(int, int);
+	void (WINAPI *Uniform2f)(int, float, float);
+	int (WINAPI *GetAttribLocation)(uint, const char *);
+	void (WINAPI *GenBuffers)(int, uint *);
+	void (WINAPI *BindBuffer)(unsigned, uint);
+	void (WINAPI *BufferData)(unsigned, glsizeiptr, const void *, unsigned);
+	void (WINAPI *BufferSubData)(unsigned, glsizeiptr, glsizeiptr, const void *);
+	void (WINAPI *GenVertexArrays)(int, uint *);
+	void (WINAPI *BindVertexArray)(uint);
+	void (WINAPI *EnableVertexAttribArray)(uint);
+	void (WINAPI *VertexAttribPointer)(uint, int, unsigned, unsigned char, int, const void *);
+	void (WINAPI *VertexAttribIPointer)(uint, int, unsigned, int, const void *);
+	void (WINAPI *GenFramebuffers)(int, uint *);
+	void (WINAPI *BindFramebuffer)(unsigned, uint);
+	void (WINAPI *FramebufferTexture2D)(unsigned, unsigned, unsigned, uint, int);
+	unsigned (WINAPI *CheckFramebufferStatus)(unsigned);
+	void (WINAPI *ActiveTexture)(unsigned);
+
+	template <typename T> void load1(T &fn, const char *name)
+	{
+		fn = (T)(void *)GetProcAddress(dll, name);
+		if (!fn)
+			fn = (T)(void *)GetProc(name);
+	}
+	bool load_base()
+	{
+		dll = LoadLibraryA("opengl32.dll");
+		if (!dll) return false;
+		CreateContext = (decltype(CreateContext))(void *)GetProcAddress(dll, "wglCreateContext");
+		DeleteContext = (decltype(DeleteContext))(void *)GetProcAddress(dll, "wglDeleteContext");
+		MakeCurrent = (decltype(MakeCurrent))(void *)GetProcAddress(dll, "wglMakeCurrent");
+		GetProc = (decltype(GetProc))(void *)GetProcAddress(dll, "wglGetProcAddress");
+		return CreateContext && MakeCurrent && GetProc;
+	}
+	bool load_rest()
+	{
+#define L(f, n) load1(f, n); if (!(f)) return false;
+		L(Viewport, "glViewport") L(ClearColor, "glClearColor") L(Clear, "glClear")
+		L(GenTextures, "glGenTextures") L(BindTexture, "glBindTexture")
+		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
+		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
+		L(DrawArrays, "glDrawArrays") L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
+		L(CreateShader, "glCreateShader") L(ShaderSource, "glShaderSource")
+		L(CompileShader, "glCompileShader") L(GetShaderiv, "glGetShaderiv")
+		L(GetShaderInfoLog, "glGetShaderInfoLog") L(CreateProgram, "glCreateProgram")
+		L(AttachShader, "glAttachShader") L(LinkProgram, "glLinkProgram")
+		L(GetProgramiv, "glGetProgramiv") L(GetProgramInfoLog, "glGetProgramInfoLog")
+		L(UseProgram, "glUseProgram") L(GetUniformLocation, "glGetUniformLocation")
+		L(Uniform1i, "glUniform1i") L(Uniform2f, "glUniform2f")
+		L(GetAttribLocation, "glGetAttribLocation") L(GenBuffers, "glGenBuffers")
+		L(BindBuffer, "glBindBuffer") L(BufferData, "glBufferData")
+		L(BufferSubData, "glBufferSubData") L(GenVertexArrays, "glGenVertexArrays")
+		L(BindVertexArray, "glBindVertexArray")
+		L(EnableVertexAttribArray, "glEnableVertexAttribArray")
+		L(VertexAttribPointer, "glVertexAttribPointer")
+		L(VertexAttribIPointer, "glVertexAttribIPointer")
+		L(GenFramebuffers, "glGenFramebuffers") L(BindFramebuffer, "glBindFramebuffer")
+		L(FramebufferTexture2D, "glFramebufferTexture2D")
+		L(CheckFramebufferStatus, "glCheckFramebufferStatus")
+		L(ActiveTexture, "glActiveTexture")
+#undef L
+		load1(CreateContextAttribs, "wglCreateContextAttribsARB");
+		load1(SwapIntervalEXT, "wglSwapIntervalEXT");
+		return true;
+	}
+};
+
+// ---- CPU-side quad -> vertex building (scalar port of the verified path) ----
+struct QuadMsg { uint32_t frame; uint16_t pc, pad; uint16_t dma[16]; };
+
+static void make_inclusive(float *vx, float *vy)
+{
+	int rmask = 0, bmask = 0, eqmask = 0;
+	for (int v = 0; v < 4; v++)
+	{
+		int n = (v + 1) & 3;
+		if (vy[n] == vy[v] && vx[n] == vx[v]) eqmask |= 1 << v;
+		if (vy[n] > vy[v] || (vy[n] == vy[v] && vx[n] < vx[v])) rmask |= 1 << v;
+		if (vx[n] < vx[v] || (vx[n] == vx[v] && vy[n] < vy[v])) bmask |= 1 << v;
+	}
+	if (eqmask == 0x0f) return;
+	for (int v = 0; v < 4; v++)
+	{
+		int eff = v;
+		while (eqmask & (1 << eff)) eff = (eff + 1) & 3;
+		if (rmask & (1 << eff)) vx[v] += 0.001f;
+		if (bmask & (1 << eff)) vy[v] += 0.001f;
+	}
+}
+
+static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
+	std::vector<float> &fdata, std::vector<uint32_t> &udata)
+{
+	fdata.resize(quads.size() * 6 * 18);
+	udata.resize(quads.size() * 6 * 4);
+	for (size_t q = 0; q < quads.size(); q++)
+	{
+		const uint16_t *dma = quads[q].dma;
+		float vx[4], vy[4], us[4] = {}, vs[4] = {};
+		for (int i = 0; i < 4; i++)
+		{
+			vx[i] = float(int16_t(dma[2 + i * 2])) + 0.5f + xoff;
+			vy[i] = float(int16_t(dma[3 + i * 2])) + 0.5f;
+		}
+		uint32_t pixdata = dma[1];
+		bool const textured = (dma[0] & 0x300) == 0x100;
+		uint32_t const dither = (dma[0] & 0x2000) ? 1 : 0;
+		uint32_t mode = 0;
+		if (!textured)
+			pixdata = (pixdata + (dma[0] & 0xff)) & 0xffff;
+		else
+		{
+			for (int i = 0; i < 4; i++)
+			{
+				us[i] = float(dma[10 + i] & 0xff) * 65536.0f + 32768.0f;
+				vs[i] = float(dma[10 + i] >> 8) * 65536.0f + 32768.0f;
+			}
+			switch (dma[0] & 0xc00)
+			{
+			case 0x000: mode = 1; break;
+			case 0x800: mode = 2; break;
+			case 0xc00: mode = 3; pixdata = (pixdata + (dma[0] & 0xff)) & 0xffff; break;
+			default: mode = 0; pixdata = (pixdata + (dma[0] & 0xff)) & 0xffff; break;
+			}
+		}
+		make_inclusive(vx, vy);
+		float x0 = vx[0], x1 = vx[0], y0 = vy[0], y1 = vy[0];
+		for (int i = 1; i < 4; i++)
+		{
+			x0 = std::min(x0, vx[i]); x1 = std::max(x1, vx[i]);
+			y0 = std::min(y0, vy[i]); y1 = std::max(y1, vy[i]);
+		}
+		x0 -= 1.0f; x1 += 1.0f; y0 -= 1.0f; y1 += 1.0f;
+		const float cx[6] = { x0, x1, x1, x0, x1, x0 };
+		const float cy[6] = { y0, y0, y1, y0, y1, y1 };
+		for (int k = 0; k < 6; k++)
+		{
+			float *f = &fdata[(q * 6 + k) * 18];
+			f[0] = cx[k]; f[1] = cy[k];
+			for (int i = 0; i < 4; i++) { f[2 + i * 2] = vx[i]; f[3 + i * 2] = vy[i]; }
+			f[10] = us[0]; f[11] = vs[0]; f[12] = us[1]; f[13] = vs[1];
+			f[14] = us[2]; f[15] = vs[2]; f[16] = us[3]; f[17] = vs[3];
+			uint32_t *u = &udata[(q * 6 + k) * 4];
+			u[0] = pixdata; u[1] = mode; u[2] = dither; u[3] = uint32_t(dma[14]) * 256;
+		}
+	}
+}
+
+// ---- the render thread ----
+constexpr int MARGIN = 86, WIDE = 512 + 2 * MARGIN, HEIGHT = 400;
+constexpr float PAR = 1.0417f;
+
+static FILE *s_log;
+static void logf(const char *fmt, ...)
+{
+	if (!s_log) return;
+	va_list ap; va_start(ap, fmt);
+	vfprintf(s_log, fmt, ap);
+	fprintf(s_log, "\n");
+	fflush(s_log);
+	va_end(ap);
+}
+
+static HWND find_mame_window()
+{
+	struct Ctx { DWORD pid; HWND found; } ctx{ GetCurrentProcessId(), nullptr };
+	EnumWindows([](HWND h, LPARAM lp) -> BOOL
+	{
+		Ctx &c = *(Ctx *)lp;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(h, &pid);
+		if (pid != c.pid || !IsWindowVisible(h)) return TRUE;
+		char cls[64] = {};
+		GetClassNameA(h, cls, 63);
+		if (strcmp(cls, "MAME") == 0) { c.found = h; return FALSE; }
+		return TRUE;
+	}, (LPARAM)&ctx);
+	return ctx.found;
+}
+
+static uint compile(GL &gl, unsigned type, const char *src)
+{
+	uint sh = gl.CreateShader(type);
+	gl.ShaderSource(sh, 1, &src, nullptr);
+	gl.CompileShader(sh);
+	int ok = 0;
+	gl.GetShaderiv(sh, COMPILE_STATUS, &ok);
+	if (!ok)
+	{
+		char buf[4096]; int n = 0;
+		gl.GetShaderInfoLog(sh, 4095, &n, buf);
+		logf("shader compile failed:\n%.*s", n, buf);
+		return 0;
+	}
+	return sh;
+}
+
+static uint link(GL &gl, const char *vs, const char *fs)
+{
+	uint p = gl.CreateProgram();
+	uint v = compile(gl, VERTEX_SHADER, vs);
+	uint f = compile(gl, FRAGMENT_SHADER, fs);
+	if (!v || !f) return 0;
+	gl.AttachShader(p, v);
+	gl.AttachShader(p, f);
+	gl.LinkProgram(p);
+	int ok = 0;
+	gl.GetProgramiv(p, LINK_STATUS, &ok);
+	if (!ok)
+	{
+		char buf[4096]; int n = 0;
+		gl.GetProgramInfoLog(p, 4095, &n, buf);
+		logf("link failed:\n%.*s", n, buf);
+		return 0;
+	}
+	return p;
+}
+
+void thread_main()
+{
+	midv_live &lv = live();
+	if (std::getenv("MIDV_GL_LOG"))
+		s_log = fopen("midv_gl.log", "w");
+	int const S = std::getenv("MIDV_GL_SCALE") ? atoi(std::getenv("MIDV_GL_SCALE")) : 3;
+	const char *snapdir = std::getenv("MIDV_GL_SNAP");
+	int const fw = WIDE * S, fh = HEIGHT * S;
+
+	// wait for MAME's window
+	HWND parent = nullptr;
+	for (int i = 0; i < 100 && !parent; i++) { Sleep(100); parent = find_mame_window(); }
+	if (!parent) { logf("no MAME window found"); return; }
+
+	WNDCLASSA wc = {};
+	wc.lpfnWndProc = DefWindowProcA;
+	wc.hInstance = GetModuleHandleA(nullptr);
+	wc.lpszClassName = "MidvGLOverlay";
+	RegisterClassA(&wc);
+	// parent must clip children or MAME's own present fights our overlay -
+	// seen at the rig as alternating sharp/chunky frames
+	SetWindowLongPtrA(parent, GWL_STYLE,
+		GetWindowLongPtrA(parent, GWL_STYLE) | WS_CLIPCHILDREN);
+	RECT rc; GetClientRect(parent, &rc);
+	// disabled + no-activate child: paints over MAME, never takes input
+	HWND child = CreateWindowExA(WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+		"MidvGLOverlay", "", WS_CHILD | WS_VISIBLE | WS_DISABLED,
+		0, 0, rc.right, rc.bottom, parent, nullptr, wc.hInstance, nullptr);
+	if (!child) { logf("child window failed"); return; }
+
+	HDC dc = GetDC(child);
+	PIXELFORMATDESCRIPTOR pfd = {};
+	pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
+	pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+	pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
+	SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd);
+
+	GL gl;
+	if (!gl.load_base()) { logf("opengl32 load failed"); return; }
+	HGLRC legacy = gl.CreateContext(dc);
+	gl.MakeCurrent(dc, legacy);
+	if (!gl.load_rest()) { logf("GL function resolution failed"); return; }
+	if (gl.CreateContextAttribs)
+	{
+		const int attrs[] = { 0x2091, 4, 0x2092, 3, 0x9126, 1, 0 };  // 4.3 core
+		HGLRC core = gl.CreateContextAttribs(dc, nullptr, attrs);
+		if (core)
+		{
+			gl.MakeCurrent(dc, core);
+			gl.DeleteContext(legacy);
+			gl.load_rest();   // re-resolve in the core context
+		}
+	}
+	if (gl.SwapIntervalEXT) gl.SwapIntervalEXT(1);
+
+	uint prog = link(gl, MVGL_VS, MVGL_FS);
+	uint pal = link(gl, MVGL_PAL_VS, MVGL_PAL_FS);
+	if (!prog || !pal) return;
+
+	gl.PixelStorei(0x0CF5 /*GL_UNPACK_ALIGNMENT*/, 1);
+	auto make_tex = [&](int w, int h, unsigned ifmt) -> uint
+	{
+		uint t; gl.GenTextures(1, &t);
+		gl.BindTexture(0x0DE1, t);
+		gl.TexParameteri(0x0DE1, 0x2801, 0x2600);  // MIN_FILTER NEAREST
+		gl.TexParameteri(0x0DE1, 0x2800, 0x2600);  // MAG_FILTER NEAREST
+		gl.TexParameteri(0x0DE1, 0x2802, 0x812F);  // WRAP_S CLAMP_TO_EDGE
+		gl.TexParameteri(0x0DE1, 0x2803, 0x812F);
+		unsigned fmt = RED_INTEGER;
+		unsigned type = (ifmt == R8UI) ? 0x1401 : (ifmt == R16UI) ? 0x1403 : 0x1405;
+		gl.TexImage2D(0x0DE1, 0, int(ifmt), w, h, 0, fmt, type, nullptr);
+		return t;
+	};
+	uint texram = make_tex(4096, 2048, R8UI);
+	uint paltex = make_tex(256, 128, R32UI);
+	uint pageTex[2] = { make_tex(fw, fh, R16UI), make_tex(fw, fh, R16UI) };
+	uint underTex[2] = { make_tex(512, HEIGHT, R16UI), make_tex(512, HEIGHT, R16UI) };
+	uint fbo[2];
+	gl.GenFramebuffers(2, fbo);
+	for (int i = 0; i < 2; i++)
+	{
+		gl.BindFramebuffer(FRAMEBUFFER, fbo[i]);
+		gl.FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0, 0x0DE1, pageTex[i], 0);
+		if (gl.CheckFramebufferStatus(FRAMEBUFFER) != FRAMEBUFFER_COMPLETE)
+			logf("fbo %d incomplete", i);
+		gl.Clear(0x4000);
+	}
+	gl.BindFramebuffer(FRAMEBUFFER, 0);
+
+	// geometry VAO: two streamed VBOs, attributes by name
+	uint vao, vbo_f, vbo_u, vao_empty;
+	gl.GenVertexArrays(1, &vao);
+	gl.GenVertexArrays(1, &vao_empty);
+	gl.GenBuffers(1, &vbo_f);
+	gl.GenBuffers(1, &vbo_u);
+	gl.BindVertexArray(vao);
+	gl.BindBuffer(ARRAY_BUFFER, vbo_f);
+	const char *fattr[] = { "in_corner", "in_v0", "in_v1", "in_v2", "in_v3", "in_uv01", "in_uv23" };
+	int const fsize[] = { 2, 2, 2, 2, 2, 4, 4 };
+	int off = 0;
+	for (int i = 0; i < 7; i++)
+	{
+		int loc = gl.GetAttribLocation(prog, fattr[i]);
+		if (loc >= 0)
+		{
+			gl.EnableVertexAttribArray(loc);
+			gl.VertexAttribPointer(loc, fsize[i], 0x1406 /*FLOAT*/, 0, 18 * 4,
+				(const void *)(uintptr_t)(off * 4));
+		}
+		off += fsize[i];
+	}
+	gl.BindBuffer(ARRAY_BUFFER, vbo_u);
+	{
+		int loc = gl.GetAttribLocation(prog, "in_meta");
+		gl.EnableVertexAttribArray(loc);
+		gl.VertexAttribIPointer(loc, 4, 0x1405 /*UNSIGNED_INT*/, 16, nullptr);
+	}
+
+	gl.UseProgram(prog);
+	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(WIDE), float(HEIGHT));
+	gl.Uniform1i(gl.GetUniformLocation(prog, "uScale"), S);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipRight"), WIDE - 1);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "texram"), 0);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "texMask"), (8 << 20) - 1);
+	gl.UseProgram(pal);
+	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
+	gl.Uniform1i(gl.GetUniformLocation(pal, "palTex"), 2);
+	int const uCrop = gl.GetUniformLocation(pal, "uCrop");
+	logf("GL up: scale %d canvas %dx%d snapdir=%s", S, fw, fh,
+		snapdir ? snapdir : "(null)");
+
+	// ---- stream state ----
+	std::vector<QuadMsg> run, pend[2];
+	uint16_t run_pc = 0xffff, pend_pc[2] = {};
+	bool pend_valid[2] = {};
+	static uint16_t shadow[2][HEIGHT * 512];
+	bool quad_fresh[2] = {};
+	int quad_count[2] = {};
+	int visible = 0;
+	std::vector<uint8_t> staging(8 << 20);
+	static uint32_t pal_copy[32768];
+	std::vector<float> fdata;
+	std::vector<uint32_t> udata;
+	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
+	int snap_n = 0;
+
+	auto ring_read = [&](uint64_t pos, void *dst, uint32_t len)
+	{
+		uint32_t o = uint32_t(pos % midv_live::RING_SIZE);
+		uint32_t first = std::min(len, midv_live::RING_SIZE - o);
+		memcpy(dst, lv.data + o, first);
+		if (len > first) memcpy((uint8_t *)dst + first, lv.data, len - first);
+	};
+	uint64_t n_flips = 0;
+	int logged_runs = 0;
+	auto complete_run = [&]()
+	{
+		if (run.empty()) return;
+		if (logged_runs < 30)
+			logf("run: pc=%u quads=%zu", run_pc, run.size()), ++logged_runs;
+		int pg = (run_pc & 4) ? 1 : 0;
+		pend[pg].swap(run);
+		pend_pc[pg] = run_pc;
+		pend_valid[pg] = true;
+		run.clear();
+	};
+
+	while (IsWindow(parent))
+	{
+		MSG msg;
+		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+		GetClientRect(parent, &rc);
+		RECT crc; GetClientRect(child, &crc);
+		if (crc.right != rc.right || crc.bottom != rc.bottom)
+			MoveWindow(child, 0, 0, rc.right, rc.bottom, FALSE);
+
+		// ---- drain ----
+		uint64_t w = *lv.wpos, r = *lv.rpos;
+		while (r < w)
+		{
+			uint32_t hdr[2];
+			ring_read(r, hdr, 8);
+			uint32_t const type = hdr[0], len = hdr[1];
+			if (len > staging.size()) staging.resize(len);
+			ring_read(r + 8, staging.data(), len);
+			r += (8 + len + 7) & ~7u;
+			*lv.rpos = r;
+			switch (type)
+			{
+			case 1:
+			{
+				QuadMsg q;
+				memcpy(&q, staging.data(), sizeof(q));
+				if (run_pc != 0xffff && q.pc != run_pc) complete_run();
+				run_pc = q.pc;
+				run.push_back(q);
+				++n_quads;
+				break;
+			}
+			case 2:
+			{
+				++n_flips;
+				complete_run();
+				uint16_t newpc; memcpy(&newpc, staging.data() + 6, 2);
+				visible = (newpc & 1) ? 1 : 0;
+				break;
+			}
+			case 3:
+				++n_pal;
+				memcpy(pal_copy, staging.data() + 4, sizeof(pal_copy));
+				gl.ActiveTexture(TEXTURE0 + 2);
+				gl.BindTexture(0x0DE1, paltex);
+				gl.TexSubImage2D(0x0DE1, 0, 0, 0, 256, 128, RED_INTEGER, 0x1405, staging.data() + 4);
+				break;
+			case 4:
+				++n_tex;
+				gl.ActiveTexture(TEXTURE0);
+				gl.BindTexture(0x0DE1, texram);
+				gl.TexSubImage2D(0x0DE1, 0, 0, 0, 4096, 2048, RED_INTEGER, 0x1401, staging.data() + 4);
+				break;
+			case 5:
+			{
+				uint32_t o, n;
+				memcpy(&o, staging.data() + 4, 4);
+				memcpy(&n, staging.data() + 8, 4);
+				int pg = (o & 0x40000) ? 1 : 0;
+				uint32_t rel = o & 0x3ffff;
+				++n_vram;
+				if (rel < HEIGHT * 512)
+				{
+					uint32_t end = std::min(rel + n, uint32_t(HEIGHT * 512));
+					memcpy(&shadow[pg][rel], staging.data() + 12, (end - rel) * 2);
+					quad_fresh[pg] = false;
+				}
+				break;
+			}
+			}
+		}
+
+		// ---- render pending scenes (skip-to-latest already applied) ----
+		for (int pg = 0; pg < 2; pg++)
+		{
+			if (!pend_valid[pg]) continue;
+			pend_valid[pg] = false;
+			build_vertices(pend[pg], float(MARGIN), fdata, udata);
+			quad_count[pg] = int(pend[pg].size());
+			gl.UseProgram(prog);
+			gl.BindVertexArray(vao);
+			gl.BindBuffer(ARRAY_BUFFER, vbo_f);
+			gl.BufferData(ARRAY_BUFFER, fdata.size() * 4, fdata.data(), STREAM_DRAW);
+			gl.BindBuffer(ARRAY_BUFFER, vbo_u);
+			gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
+			gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
+			gl.Viewport(0, 0, fw, fh);
+			gl.ActiveTexture(TEXTURE0);
+			gl.BindTexture(0x0DE1, texram);
+			gl.DrawArrays(0x0004 /*TRIANGLES*/, 0, int(pend[pg].size() * 6));
+			gl.BindFramebuffer(FRAMEBUFFER, 0);
+			quad_fresh[pg] = true;
+			++n_scenes;
+		}
+
+		// ---- present ----
+		int const cw = rc.right, ch = rc.bottom;
+		gl.Viewport(0, 0, cw, ch);
+		gl.ClearColor(0, 0, 0, 1);
+		gl.Clear(0x4000);
+		bool const wide3d = quad_fresh[visible] && quad_count[visible] >= 120;
+		float const content_w = wide3d ? float(WIDE) : 512.0f;
+		float const aspect = (content_w * PAR) / float(HEIGHT);
+		int vw = cw, vh = int(cw / aspect + 0.5f);
+		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
+		gl.UseProgram(pal);
+		gl.Uniform1i(uCrop, (quad_fresh[visible] && !wide3d) ? MARGIN * S : 0);
+		gl.ActiveTexture(TEXTURE0 + 1);
+		if (quad_fresh[visible])
+			gl.BindTexture(0x0DE1, pageTex[visible]);
+		else
+		{
+			gl.BindTexture(0x0DE1, underTex[visible]);
+			gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, HEIGHT, RED_INTEGER, 0x1403, shadow[visible]);
+		}
+		gl.ActiveTexture(TEXTURE0 + 2);
+		gl.BindTexture(0x0DE1, paltex);
+		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
+		gl.BindVertexArray(vao_empty);
+		gl.DrawArrays(0x0004, 0, 3);
+
+		++presents;
+		if (s_log && (presents % 300) == 0)
+			logf("t=%llu quads=%llu scenes=%llu pal=%llu tex=%llu vram=%llu "
+				"flips=%llu backlog=%llu vis=%d fresh=%d cnt=%d err=%u",
+				(unsigned long long)presents, (unsigned long long)n_quads,
+				(unsigned long long)n_scenes, (unsigned long long)n_pal,
+				(unsigned long long)n_tex, (unsigned long long)n_vram,
+				(unsigned long long)n_flips,
+				(unsigned long long)(*lv.wpos - *lv.rpos), visible,
+				int(quad_fresh[visible]), quad_count[visible], gl.GetError());
+		if (snapdir && (presents % 150) == 0)
+		{
+			std::vector<uint8_t> px(size_t(cw) * ch * 3);
+			gl.ReadPixels(0, 0, cw, ch, 0x80E0 /*BGR*/, 0x1401, px.data());
+			char path[512];
+			snprintf(path, sizeof(path), "%s\\mvgl_%03d.bmp", snapdir, snap_n++);
+			FILE *f = fopen(path, "wb");
+			logf("snap %s -> %s", path, f ? "ok" : "FOPEN FAILED");
+			if (f)
+			{
+				int const rowsz = (cw * 3 + 3) & ~3;
+				uint32_t const img = rowsz * ch;
+				uint8_t bh[54] = { 'B', 'M' };
+				*(uint32_t *)(bh + 2) = 54 + img;
+				*(uint32_t *)(bh + 10) = 54;
+				*(uint32_t *)(bh + 14) = 40;
+				*(int32_t *)(bh + 18) = cw;
+				*(int32_t *)(bh + 22) = ch;
+				*(uint16_t *)(bh + 26) = 1;
+				*(uint16_t *)(bh + 28) = 24;
+				*(uint32_t *)(bh + 34) = img;
+				fwrite(bh, 1, 54, f);
+				std::vector<uint8_t> row(rowsz, 0);
+				for (int y = 0; y < ch; y++)
+				{
+					memcpy(row.data(), &px[size_t(y) * cw * 3], cw * 3);
+					fwrite(row.data(), 1, rowsz, f);
+				}
+				fclose(f);
+			}
+		}
+		SwapBuffers(dc);
+	}
+	logf("parent gone after %llu presents, %d snaps", (unsigned long long)presents, snap_n);
+}
+
+} // namespace mvgl
+
 midv_live &live()
 {
 	static midv_live s;
+	static bool gl_spawned = [&]() -> bool
+	{
+		if (s.enabled && std::getenv("MIDV_GL"))
+			std::thread(mvgl::thread_main).detach();
+		return true;
+	}();
+	(void)gl_spawned;
 	return s;
 }
 
@@ -757,6 +1387,14 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	uint32_t offset;
 
 	m_poly->wait("Refresh Time");
+
+	// live bridge: palette/texture must flow even before any quad is drawn -
+	// boot and test screens are CPU-drawn, and without this the palette never
+	// reaches the renderer until the first 3D scene (boot showed black).
+	if (live().enabled)
+		live().sync_state(uint32_t(screen.frame_number()),
+			m_paletteram.target(), uint32_t(m_paletteram.bytes()),
+			m_textureram.target(), uint32_t(m_textureram.bytes()));
 
 	// POC: one-shot memory dump so the quad stream can be re-rasterized and
 	// verified offline. Runs after the poly wait, so all quads have landed.
