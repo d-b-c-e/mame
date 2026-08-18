@@ -731,8 +731,14 @@ void thread_main()
 			gl.BindTexture(0x0DE1, pageTex[visible]);
 		else
 		{
+			// the pal pass samples rows bottom-up (the quad path flips Y in
+			// its VS); the CPU shadow is top-down, so upload row-reversed or
+			// boot/test screens display vertically flipped
+			static uint16_t flipped[HEIGHT * 512];
+			for (int y = 0; y < HEIGHT; y++)
+				memcpy(&flipped[y * 512], &shadow[visible][(HEIGHT - 1 - y) * 512], 512 * 2);
 			gl.BindTexture(0x0DE1, underTex[visible]);
-			gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, HEIGHT, RED_INTEGER, 0x1403, shadow[visible]);
+			gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, HEIGHT, RED_INTEGER, 0x1403, flipped);
 		}
 		gl.ActiveTexture(TEXTURE0 + 2);
 		gl.BindTexture(0x0DE1, paltex);
