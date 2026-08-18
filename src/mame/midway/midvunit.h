@@ -115,7 +115,10 @@ protected:
 	required_device<palette_device> m_palette;
 	required_device_array<timer_device, 2> m_timer;
 	required_device<dcs_audio_device> m_dcs;
+public:
+	// POC live bridge reads this from midvunit_renderer (see midvunit_v.cpp)
 	required_shared_ptr<uint32_t> m_paletteram;
+protected:
 	required_shared_ptr<uint32_t> m_ram_base;
 	required_shared_ptr<uint32_t> m_tms320c31_control;
 
