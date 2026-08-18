@@ -749,9 +749,17 @@ void thread_main()
 			// strips beside a 4:3 screen and a thin border at crop edges.
 			gl.Enable(0x0C11 /*SCISSOR_TEST*/);
 			gl.ClearColor(0, 0, 0, 0);
-			gl.Scissor(0, 0, MARGIN * S, fh);
+			// widen by a 2-pixel overscan inset: the outermost rows/columns
+			// of the hardware region carry edge pixels a real CRT never
+			// showed (seen as a thin bright border at the rig)
+			int const os = 2 * S;
+			gl.Scissor(0, 0, MARGIN * S + os, fh);
 			gl.Clear(0x4000);
-			gl.Scissor(fw - MARGIN * S, 0, MARGIN * S, fh);
+			gl.Scissor(fw - MARGIN * S - os, 0, MARGIN * S + os, fh);
+			gl.Clear(0x4000);
+			gl.Scissor(0, 0, fw, os);
+			gl.Clear(0x4000);
+			gl.Scissor(0, fh - os, fw, os);
 			gl.Clear(0x4000);
 			gl.Disable(0x0C11);
 			gl.ActiveTexture(TEXTURE0);
