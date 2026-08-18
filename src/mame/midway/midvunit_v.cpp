@@ -466,26 +466,26 @@ void thread_main()
 	for (int i = 0; i < 100 && !parent; i++) { Sleep(100); parent = find_mame_window(); }
 	if (!parent) { logf("no MAME window found"); return; }
 
+	// Owned top-level popup, NOT a child: MAME's gdi renderer caches its
+	// window DC, so child-clipping (WS_CLIPCHILDREN, even with
+	// SWP_FRAMECHANGED) never reaches it and its blit punches through the
+	// overlay - seen at the rig as alternating stretched/letterboxed frames.
+	// A separate owned window is composited by DWM and occludes the owner
+	// absolutely. NOACTIVATE+TRANSPARENT+DISABLED keep every input event
+	// (keyboard focus, mouse, DirectInput foreground) on MAME's window.
 	WNDCLASSA wc = {};
 	wc.lpfnWndProc = DefWindowProcA;
 	wc.hInstance = GetModuleHandleA(nullptr);
 	wc.lpszClassName = "MidvGLOverlay";
 	RegisterClassA(&wc);
-	// parent must clip children or MAME's own present fights our overlay -
-	// seen at the rig as alternating sharp/chunky frames
-	SetWindowLongPtrA(parent, GWL_STYLE,
-		GetWindowLongPtrA(parent, GWL_STYLE) | WS_CLIPCHILDREN);
-	// style changes are NOT applied until a frame change is forced - without
-	// this, MAME's own blit keeps punching through the overlay (seen at the
-	// rig as alternating stretched/letterboxed frames)
-	SetWindowPos(parent, nullptr, 0, 0, 0, 0,
-		SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 	RECT rc; GetClientRect(parent, &rc);
-	// disabled + no-activate child: paints over MAME, never takes input
-	HWND child = CreateWindowExA(WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-		"MidvGLOverlay", "", WS_CHILD | WS_VISIBLE | WS_DISABLED,
-		0, 0, rc.right, rc.bottom, parent, nullptr, wc.hInstance, nullptr);
-	if (!child) { logf("child window failed"); return; }
+	POINT tl = { 0, 0 };
+	ClientToScreen(parent, &tl);
+	HWND child = CreateWindowExA(
+		WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+		"MidvGLOverlay", "", WS_POPUP | WS_VISIBLE | WS_DISABLED,
+		tl.x, tl.y, rc.right, rc.bottom, parent, nullptr, wc.hInstance, nullptr);
+	if (!child) { logf("overlay window failed"); return; }
 
 	HDC dc = GetDC(child);
 	PIXELFORMATDESCRIPTOR pfd = {};
@@ -629,9 +629,20 @@ void thread_main()
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
 		GetClientRect(parent, &rc);
-		RECT crc; GetClientRect(child, &crc);
-		if (crc.right != rc.right || crc.bottom != rc.bottom)
-			MoveWindow(child, 0, 0, rc.right, rc.bottom, FALSE);
+		POINT ntl = { 0, 0 };
+		ClientToScreen(parent, &ntl);
+		RECT crc; GetWindowRect(child, &crc);
+		if (IsIconic(parent))
+			ShowWindow(child, SW_HIDE);
+		else
+		{
+			if (!IsWindowVisible(child))
+				ShowWindow(child, SW_SHOWNA);
+			if (crc.left != ntl.x || crc.top != ntl.y ||
+				crc.right - crc.left != rc.right || crc.bottom - crc.top != rc.bottom)
+				SetWindowPos(child, nullptr, ntl.x, ntl.y, rc.right, rc.bottom,
+					SWP_NOACTIVATE | SWP_NOZORDER);
+		}
 
 		// ---- drain ----
 		uint64_t w = *lv.wpos, r = *lv.rpos;
