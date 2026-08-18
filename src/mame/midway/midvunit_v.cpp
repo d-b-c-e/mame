@@ -219,6 +219,9 @@ struct GL
 	void (WINAPI *TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
 	void (WINAPI *PixelStorei)(unsigned, int);
 	void (WINAPI *DrawArrays)(unsigned, int, int);
+	void (WINAPI *Enable)(unsigned);
+	void (WINAPI *Disable)(unsigned);
+	void (WINAPI *Scissor)(int, int, int, int);
 	void (WINAPI *ReadPixels)(int, int, int, int, unsigned, unsigned, void *);
 	unsigned (WINAPI *GetError)();
 	// modern (via wglGetProcAddress)
@@ -275,7 +278,8 @@ struct GL
 		L(GenTextures, "glGenTextures") L(BindTexture, "glBindTexture")
 		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
 		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
-		L(DrawArrays, "glDrawArrays") L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
+		L(DrawArrays, "glDrawArrays") L(Enable, "glEnable")
+		L(Disable, "glDisable") L(Scissor, "glScissor") L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
 		L(CreateShader, "glCreateShader") L(ShaderSource, "glShaderSource")
 		L(CompileShader, "glCompileShader") L(GetShaderiv, "glGetShaderiv")
 		L(GetShaderInfoLog, "glGetShaderInfoLog") L(CreateProgram, "glCreateProgram")
@@ -738,6 +742,18 @@ void thread_main()
 			gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
 			gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
 			gl.Viewport(0, 0, fw, fh);
+			// The game guarantees repainting only the 512-wide hardware
+			// region; the 16:9 margins are ours. Scenes that draw nothing
+			// there (2D screens, showcase scenes) would otherwise show the
+			// previous scene's stale margins - seen at the rig as scenery
+			// strips beside a 4:3 screen and a thin border at crop edges.
+			gl.Enable(0x0C11 /*SCISSOR_TEST*/);
+			gl.ClearColor(0, 0, 0, 0);
+			gl.Scissor(0, 0, MARGIN * S, fh);
+			gl.Clear(0x4000);
+			gl.Scissor(fw - MARGIN * S, 0, MARGIN * S, fh);
+			gl.Clear(0x4000);
+			gl.Disable(0x0C11);
 			gl.ActiveTexture(TEXTURE0);
 			gl.BindTexture(0x0DE1, texram);
 			gl.DrawArrays(0x0004 /*TRIANGLES*/, 0, int(pend[pg].size() * 6));
