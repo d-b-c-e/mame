@@ -1,6 +1,4 @@
-// GENERATED from cruisn-poc/gpu/renderer.py - do not edit by hand.
-// These shaders are verified 100.0000% bit-exact against MAME's
-// software rasterizer (see cruisn-poc/results/RESULTS.md).
+// GENERATED from cruisn-poc/gpu/renderer.py
 
 static const char *MVGL_VS = R"GLSL(
 #version 430
@@ -201,17 +199,67 @@ static const char *MVGL_PAL_FS = R"GLSL(
 uniform usampler2D idxTex;
 uniform usampler2D palTex;   // 256x128 R32UI - 32768 palette words
 uniform int uCrop;           // fine pixels to crop from each side (2D screens)
+uniform int uCrt;            // 1 = CRT pass (mask+scanline+curvature), 0 = raw
+uniform float uSrcH;         // simulated source scanline count (coarse height)
 in vec2 uv;
 out vec4 color;
-void main() {
-    ivec2 sz = textureSize(idxTex, 0);
-    ivec2 p = ivec2(float(uCrop) + uv.x * float(sz.x - 2 * uCrop),
-                    uv.y * float(sz.y));
+
+vec3 fetch_at(ivec2 p) {
     uint pen = texelFetch(idxTex, p, 0).r & 0x7fffu;
     uint w = texelFetch(palTex, ivec2(pen & 255u, pen >> 8), 0).r;
     uint r = (w >> 10) & 31u, g = (w >> 5) & 31u, b = w & 31u;
-    color = vec4(float((r << 3) | (r >> 2)) / 255.0,
-                 float((g << 3) | (g >> 2)) / 255.0,
-                 float((b << 3) | (b >> 2)) / 255.0, 1.0);
+    return vec3(float((r << 3) | (r >> 2)) / 255.0,
+                float((g << 3) | (g >> 2)) / 255.0,
+                float((b << 3) | (b >> 2)) / 255.0);
+}
+
+ivec2 src_px(vec2 tuv) {
+    ivec2 sz = textureSize(idxTex, 0);
+    return ivec2(float(uCrop) + tuv.x * float(sz.x - 2 * uCrop),
+                 tuv.y * float(sz.y));
+}
+
+vec3 fetch_rgb(vec2 tuv) { return fetch_at(src_px(tuv)); }
+
+void main() {
+    if (uCrt == 0) {                       // raw path - untouched product look
+        color = vec4(fetch_rgb(uv), 1.0);
+        return;
+    }
+
+    // ---- tube geometry: gentle barrel warp, black outside the glass ----
+    vec2 c = uv * 2.0 - 1.0;
+    c *= vec2(1.0 + 0.041 * c.y * c.y, 1.0 + 0.052 * c.x * c.x);
+    vec2 wuv = c * 0.5 + 0.5;
+    if (any(lessThan(wuv, vec2(0.0))) || any(greaterThan(wuv, vec2(1.0)))) {
+        color = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    // ---- horizontal beam softness: 3-tap blur in fine pixels ----
+    ivec2 p = src_px(wuv);
+    int s = max(1, int(float(textureSize(idxTex, 0).y) / uSrcH * 0.45));
+    vec3 rgb = 0.5 * fetch_at(p)
+             + 0.25 * fetch_at(p + ivec2(s, 0))
+             + 0.25 * fetch_at(p - ivec2(s, 0));
+
+    // ---- scanlines: gaussian beam per source line, bright beams bloom ----
+    float d = fract(wuv.y * uSrcH) - 0.5;
+    float lum = dot(rgb, vec3(0.299, 0.587, 0.114));
+    float width = mix(0.35, 0.65, lum);
+    float scan = exp(-(d * d) / (2.0 * width * width));
+
+    // ---- shadow mask: two-phase magenta/green (rainbow-free at any res) ----
+    vec3 mask = ((int(gl_FragCoord.x) & 1) == 0)
+        ? vec3(1.0, 0.62, 1.0) : vec3(0.62, 1.0, 0.62);
+
+    // ---- rounded corners + vignette ----
+    vec2 cc = abs(wuv * 2.0 - 1.0);
+    float cornerd = length(max(cc - vec2(0.94), 0.0)) / 0.06;
+    float cornerm = 1.0 - smoothstep(0.8, 1.0, cornerd);
+    float vig = 1.0 - 0.10 * dot(cc, cc);
+
+    rgb *= scan * cornerm * vig * 1.42;
+    color = vec4(min(rgb * mask, 1.0), 1.0);
 }
 )GLSL";
+

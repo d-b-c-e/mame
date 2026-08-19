@@ -238,6 +238,7 @@ struct GL
 	void (WINAPI *UseProgram)(uint);
 	int (WINAPI *GetUniformLocation)(uint, const char *);
 	void (WINAPI *Uniform1i)(int, int);
+	void (WINAPI *Uniform1f)(int, float);
 	void (WINAPI *Uniform2f)(int, float, float);
 	int (WINAPI *GetAttribLocation)(uint, const char *);
 	void (WINAPI *GenBuffers)(int, uint *);
@@ -286,7 +287,8 @@ struct GL
 		L(AttachShader, "glAttachShader") L(LinkProgram, "glLinkProgram")
 		L(GetProgramiv, "glGetProgramiv") L(GetProgramInfoLog, "glGetProgramInfoLog")
 		L(UseProgram, "glUseProgram") L(GetUniformLocation, "glGetUniformLocation")
-		L(Uniform1i, "glUniform1i") L(Uniform2f, "glUniform2f")
+		L(Uniform1i, "glUniform1i") L(Uniform1f, "glUniform1f")
+		L(Uniform2f, "glUniform2f")
 		L(GetAttribLocation, "glGetAttribLocation") L(GenBuffers, "glGenBuffers")
 		L(BindBuffer, "glBindBuffer") L(BufferData, "glBufferData")
 		L(BufferSubData, "glBufferSubData") L(GenVertexArrays, "glGenVertexArrays")
@@ -589,7 +591,16 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "palTex"), 2);
 	int const uCrop = gl.GetUniformLocation(pal, "uCrop");
-	logf("GL up: scale %d canvas %dx%d snapdir=%s", S, fw, fh,
+	// CRT pass: MIDV_GL_CRT=1 enables at boot, F9 toggles live. The raw
+	// (uCrt=0) shader path is byte-identical to the pre-CRT palette pass.
+	int const uCrt = gl.GetUniformLocation(pal, "uCrt");
+	int const uSrcH = gl.GetUniformLocation(pal, "uSrcH");
+	bool crt = std::getenv("MIDV_GL_CRT") && atoi(std::getenv("MIDV_GL_CRT")) != 0;
+	gl.Uniform1i(uCrt, crt ? 1 : 0);
+	gl.Uniform1f(uSrcH, float(HEIGHT));
+	bool f9_prev = false;
+	logf("GL up: scale %d canvas %dx%d crt=%d locs crop=%d crt=%d srch=%d err=%u snapdir=%s",
+		S, fw, fh, int(crt), uCrop, uCrt, uSrcH, gl.GetError(),
 		snapdir ? snapdir : "(null)");
 
 	// ---- stream state ----
@@ -633,6 +644,16 @@ void thread_main()
 	{
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+		// F9: live CRT toggle (edge-triggered; global key, only polled here)
+		bool const f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+		if (f9 && !f9_prev)
+		{
+			crt = !crt;
+			gl.UseProgram(pal);
+			gl.Uniform1i(uCrt, crt ? 1 : 0);
+			logf("F9 -> crt=%d", int(crt));
+		}
+		f9_prev = f9;
 		GetClientRect(parent, &rc);
 		POINT ntl = { 0, 0 };
 		ClientToScreen(parent, &ntl);
