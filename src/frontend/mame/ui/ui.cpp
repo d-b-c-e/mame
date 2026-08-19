@@ -48,6 +48,7 @@
 #include "../osd/modules/lib/osdlib.h"
 #include "../osd/modules/lib/osdobj_common.h"
 
+#include <cstdlib>
 #include <functional>
 #include <type_traits>
 
@@ -639,6 +640,12 @@ void mame_ui_manager::display_startup_screens(bool first_time)
 	// disable everything if we are using -str for 300 or fewer seconds, or if we're the empty driver,
 	// or if we are debugging, or if there's no mame window to send inputs to
 	if (!first_time || (str > 0 && str < 60*5) || &machine().system() == &GAME_NAME(___empty) || (machine().debug_flags & DEBUG_FLAG_ENABLED) || video_none)
+		show_gameinfo = show_warnings = false;
+
+	// V-Unit collection build (env-gated, inert when unset): boot straight to
+	// the game - BAD_DUMP sets (crusnwld c31boot) force the warning screen
+	// past skip_warnings by design, which blocks unattended rig launches
+	if (std::getenv("MIDV_SKIP_STARTUP_SCREENS"))
 		show_gameinfo = show_warnings = false;
 
 #if defined(__EMSCRIPTEN__)
