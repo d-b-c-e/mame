@@ -485,10 +485,28 @@ void thread_main()
 	// SWP_FRAMECHANGED) never reaches it and its blit punches through the
 	// overlay - seen at the rig as alternating stretched/letterboxed frames.
 	// A separate owned window is composited by DWM and occludes the owner
-	// absolutely. NOACTIVATE+TRANSPARENT+DISABLED keep every input event
-	// (keyboard focus, mouse, DirectInput foreground) on MAME's window.
+	// absolutely. WS_EX_NOACTIVATE keeps keyboard focus and DirectInput
+	// foreground on MAME's window; the wndproc hides the cursor over the
+	// game and turns clicks into refocus-the-owner (the earlier
+	// DISABLED+TRANSPARENT combination made every click a Windows error
+	// beep - EX_TRANSPARENT does not pass hit-tests without EX_LAYERED).
 	WNDCLASSA wc = {};
-	wc.lpfnWndProc = DefWindowProcA;
+	wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT
+	{
+		switch (msg)
+		{
+		case WM_SETCURSOR:
+			SetCursor(nullptr);   // no arrow over the game
+			return TRUE;
+		case WM_LBUTTONDOWN:
+		case WM_RBUTTONDOWN:
+		case WM_MBUTTONDOWN:
+			// we never activate; hand the click to MAME's window instead
+			SetForegroundWindow(GetWindow(hwnd, GW_OWNER));
+			return 0;
+		}
+		return DefWindowProcA(hwnd, msg, wp, lp);
+	};
 	wc.hInstance = GetModuleHandleA(nullptr);
 	wc.lpszClassName = "MidvGLOverlay";
 	RegisterClassA(&wc);
@@ -496,8 +514,8 @@ void thread_main()
 	POINT tl = { 0, 0 };
 	ClientToScreen(parent, &tl);
 	HWND child = CreateWindowExA(
-		WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
-		"MidvGLOverlay", "", WS_POPUP | WS_VISIBLE | WS_DISABLED,
+		WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+		"MidvGLOverlay", "", WS_POPUP | WS_VISIBLE,
 		tl.x, tl.y, rc.right, rc.bottom, parent, nullptr, wc.hInstance, nullptr);
 	if (!child) { logf("overlay window failed"); return; }
 
