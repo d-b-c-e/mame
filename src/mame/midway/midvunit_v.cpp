@@ -23,6 +23,7 @@
 //
 // Purpose: prove process_dma_queue() is the complete render surface by
 // re-rasterizing the captured stream offline and diffing against videoram.
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
@@ -184,6 +185,11 @@ midv_live &live();
 // MIDV_GL_SCALE (default 3) sets internal scale; MIDV_GL_SNAP=<dir> writes a
 // backbuffer BMP every ~150 presents for unattended verification.
 namespace mvgl {
+
+// teardown handshake: machine exit flags the GL thread down and waits for
+// its acknowledgement (see midvunit_base_state::mvgl_exit)
+static std::atomic<bool> s_stop{false};
+static std::atomic<bool> s_done{false};
 
 // ---- minimal dynamic GL loader (no link-time deps beyond user32/gdi32) ----
 #define MVGL_E(n, v) constexpr unsigned n = v;
@@ -460,6 +466,8 @@ static uint link(GL &gl, const char *vs, const char *fs)
 
 void thread_main()
 {
+	// every exit path must acknowledge shutdown or mvgl_exit stalls 1 s
+	struct DoneGuard { ~DoneGuard() { s_done.store(true); } } done_guard;
 	midv_live &lv = live();
 	if (std::getenv("MIDV_GL_LOG"))
 		s_log = fopen("midv_gl.log", "w");
@@ -640,7 +648,7 @@ void thread_main()
 		run.clear();
 	};
 
-	while (IsWindow(parent))
+	while (IsWindow(parent) && !s_stop.load())
 	{
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
@@ -866,7 +874,9 @@ void thread_main()
 		}
 		SwapBuffers(dc);
 	}
-	logf("parent gone after %llu presents, %d snaps", (unsigned long long)presents, snap_n);
+	logf("%s after %llu presents, %d snaps",
+		s_stop.load() ? "machine exit" : "parent gone",
+		(unsigned long long)presents, snap_n);
 }
 
 } // namespace mvgl
@@ -942,8 +952,23 @@ TIMER_CALLBACK_MEMBER(midvunit_base_state::eoi_timer_cb)
 	m_maincpu->set_input_line(0, CLEAR_LINE);
 }
 
+void midvunit_base_state::mvgl_exit()
+{
+	// POC: a detached GL thread that outlives the machine races teardown
+	// (msvcrt!memcpy AVs logged at roughly every second exit). Flag it down
+	// and give it up to a second to acknowledge before destruction proceeds.
+	mvgl::s_stop.store(true);
+	for (int i = 0; i < 100 && !mvgl::s_done.load(); i++)
+		Sleep(10);
+}
+
 void midvunit_base_state::video_start()
 {
+	// POC: only when the GL overlay can actually spawn
+	if (std::getenv("MIDV_GL"))
+		machine().add_notifier(MACHINE_NOTIFY_EXIT,
+			machine_notify_delegate(&midvunit_base_state::mvgl_exit, this));
+
 	m_scanline_timer = timer_alloc(FUNC(midvunit_base_state::scanline_timer_cb), this);
 	m_eoi_timer = timer_alloc(FUNC(midvunit_base_state::eoi_timer_cb), this);
 

@@ -83,6 +83,7 @@ protected:
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
 	virtual void video_start() override ATTR_COLD;
+	void mvgl_exit();   // POC: stop the GL overlay thread before teardown
 
 	void cmos_protect_w(uint32_t data);
 	void dma_queue_w(uint32_t data);
