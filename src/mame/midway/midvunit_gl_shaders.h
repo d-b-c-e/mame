@@ -267,3 +267,32 @@ static const char *MVGL_PAL_FS =
 	"}\n"
 	"\n";
 
+static const char *MVGL_MENU_VS =
+	"\n"
+	"#version 430\n"
+	"uniform vec4 uRect;    // x, y, w, h in window pixels, y-down from top-left\n"
+	"uniform vec2 uScreen;  // window size\n"
+	"out vec2 uv;\n"
+	"void main() {\n"
+	"    vec2 p = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));\n"
+	"    uv = p;\n"
+	"    vec2 px = uRect.xy + p * uRect.zw;\n"
+	"    gl_Position = vec4(px.x / uScreen.x * 2.0 - 1.0,\n"
+	"                       1.0 - px.y / uScreen.y * 2.0, 0.0, 1.0);\n"
+	"}\n"
+	"\n";
+
+static const char *MVGL_MENU_FS =
+	"\n"
+	"#version 430\n"
+	"uniform sampler2D uTex;   // A8 label bitmap\n"
+	"uniform vec4 uColor;      // rgb tint, a = opacity\n"
+	"uniform int uSolid;       // 1 = ignore texture (solid fill)\n"
+	"in vec2 uv;\n"
+	"out vec4 color;\n"
+	"void main() {\n"
+	"    float a = (uSolid == 1) ? 1.0 : texture(uTex, uv).r;\n"
+	"    color = vec4(uColor.rgb, uColor.a * a);\n"
+	"}\n"
+	"\n";
+

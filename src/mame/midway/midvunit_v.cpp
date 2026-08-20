@@ -32,8 +32,10 @@
 #include <vector>
 #include <string>
 #ifdef _WIN32
+#include <winsock2.h>
 #include <windows.h>
 #include "midvunit_gl_shaders.h"
+#include "midvunit_menu_assets.h"
 #endif
 
 namespace {
@@ -184,6 +186,57 @@ midv_live &live();
 // audio, FFB proxying and window focus all stay exactly as stock MAME.
 // MIDV_GL_SCALE (default 3) sets internal scale; MIDV_GL_SNAP=<dir> writes a
 // backbuffer BMP every ~150 presents for unattended verification.
+// ---- UDP telemetry (Phase A): mirror MAME outputs as JSON datagrams -------
+// MIDV_TELEM_UDP=host:port (or just port; default 127.0.0.1:20777).
+// Consumers: SimHub custom UDP / Buttkicker pipelines. The "wheel" output
+// carries the FFB force value each frame.
+static SOCKET s_telem_sock = INVALID_SOCKET;
+static sockaddr_in s_telem_addr;
+static char s_telem_game[16];
+
+static void telem_notify(const char *outname, s32 value, void *)
+{
+	if (s_telem_sock == INVALID_SOCKET)
+		return;
+	char buf[160];
+	int n = snprintf(buf, sizeof(buf),
+			"{\"game\":\"%s\",\"out\":\"%s\",\"value\":%d}\n",
+			s_telem_game, outname ? outname : "", int(value));
+	sendto(s_telem_sock, buf, n, 0,
+			(const sockaddr *)&s_telem_addr, sizeof(s_telem_addr));
+}
+
+static void telem_init(const char *spec, const char *game)
+{
+	char host[64] = "127.0.0.1";
+	int port = 20777;
+	if (spec && *spec)
+	{
+		const char *c = strchr(spec, ':');
+		if (c)
+		{
+			size_t n = std::min(size_t(c - spec), sizeof(host) - 1);
+			memcpy(host, spec, n);
+			host[n] = 0;
+			port = atoi(c + 1);
+		}
+		else if (atoi(spec) > 0)
+			port = atoi(spec);
+	}
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+		return;
+	SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s == INVALID_SOCKET)
+		return;
+	memset(&s_telem_addr, 0, sizeof(s_telem_addr));
+	s_telem_addr.sin_family = AF_INET;
+	s_telem_addr.sin_port = htons(uint16_t(port));
+	s_telem_addr.sin_addr.s_addr = inet_addr(host);
+	strncpy(s_telem_game, game, sizeof(s_telem_game) - 1);
+	s_telem_sock = s;
+}
+
 namespace mvgl {
 
 // teardown handshake: machine exit flags the GL thread down and waits for
@@ -246,6 +299,8 @@ struct GL
 	void (WINAPI *Uniform1i)(int, int);
 	void (WINAPI *Uniform1f)(int, float);
 	void (WINAPI *Uniform2f)(int, float, float);
+	void (WINAPI *Uniform4f)(int, float, float, float, float);
+	void (WINAPI *BlendFunc)(unsigned, unsigned);
 	int (WINAPI *GetAttribLocation)(uint, const char *);
 	void (WINAPI *GenBuffers)(int, uint *);
 	void (WINAPI *BindBuffer)(unsigned, uint);
@@ -294,7 +349,8 @@ struct GL
 		L(GetProgramiv, "glGetProgramiv") L(GetProgramInfoLog, "glGetProgramInfoLog")
 		L(UseProgram, "glUseProgram") L(GetUniformLocation, "glGetUniformLocation")
 		L(Uniform1i, "glUniform1i") L(Uniform1f, "glUniform1f")
-		L(Uniform2f, "glUniform2f")
+		L(Uniform2f, "glUniform2f") L(Uniform4f, "glUniform4f")
+		L(BlendFunc, "glBlendFunc")
 		L(GetAttribLocation, "glGetAttribLocation") L(GenBuffers, "glGenBuffers")
 		L(BindBuffer, "glBindBuffer") L(BufferData, "glBufferData")
 		L(BufferSubData, "glBufferSubData") L(GenVertexArrays, "glGenVertexArrays")
@@ -625,6 +681,42 @@ void thread_main()
 	gl.Uniform1i(uCrt, crt ? 1 : 0);
 	gl.Uniform1f(uSrcH, float(HEIGHT));
 	bool f9_prev = false;
+
+	// ---- in-game Esc options menu (drawn by the overlay itself) ----
+	// Esc is detached from MAME's quit in the generated ctrlr (F12 remains
+	// the emergency quit); the GL thread polls physical keys via
+	// GetAsyncKeyState, which rawinput cannot intercept away from us.
+	uint menuprog = link(gl, MVGL_MENU_VS, MVGL_MENU_FS);
+	struct Label { uint tex; int w, h; };
+	auto make_label = [&](const unsigned char *px, int w, int h) -> Label
+	{
+		uint t;
+		gl.GenTextures(1, &t);
+		gl.BindTexture(0x0DE1, t);
+		gl.TexParameteri(0x0DE1, 0x2801, 0x2601);   // MIN LINEAR
+		gl.TexParameteri(0x0DE1, 0x2800, 0x2601);   // MAG LINEAR
+		gl.TexParameteri(0x0DE1, 0x2802, 0x812F);
+		gl.TexParameteri(0x0DE1, 0x2803, 0x812F);
+		gl.TexImage2D(0x0DE1, 0, 0x8229 /*R8*/, w, h, 0,
+				0x1903 /*RED*/, 0x1401 /*UNSIGNED_BYTE*/, px);
+		return Label{ t, w, h };
+	};
+	Label lb_title = make_label(MVMENU_TITLE, MVMENU_TITLE_W, MVMENU_TITLE_H);
+	Label lb_resume = make_label(MVMENU_RESUME, MVMENU_RESUME_W, MVMENU_RESUME_H);
+	Label lb_crt_on = make_label(MVMENU_CRT_ON, MVMENU_CRT_ON_W, MVMENU_CRT_ON_H);
+	Label lb_crt_off = make_label(MVMENU_CRT_OFF, MVMENU_CRT_OFF_W, MVMENU_CRT_OFF_H);
+	Label lb_exit = make_label(MVMENU_EXIT, MVMENU_EXIT_W, MVMENU_EXIT_H);
+	Label lb_hint = make_label(MVMENU_HINT, MVMENU_HINT_W, MVMENU_HINT_H);
+	int const mRect = gl.GetUniformLocation(menuprog, "uRect");
+	int const mScreen = gl.GetUniformLocation(menuprog, "uScreen");
+	int const mColor = gl.GetUniformLocation(menuprog, "uColor");
+	int const mSolid = gl.GetUniformLocation(menuprog, "uSolid");
+	gl.UseProgram(menuprog);
+	gl.Uniform1i(gl.GetUniformLocation(menuprog, "uTex"), 0);
+	bool menu_open = false;
+	int menu_sel = 0;
+	bool esc_prev = false, up_prev = false, down_prev = false, ret_prev = false;
+
 	logf("GL up: scale %d canvas %dx%d crt=%d locs crop=%d crt=%d srch=%d err=%u snapdir=%s",
 		S, fw, fh, int(crt), uCrop, uCrt, uSrcH, gl.GetError(),
 		snapdir ? snapdir : "(null)");
@@ -680,6 +772,44 @@ void thread_main()
 			logf("F9 -> crt=%d", int(crt));
 		}
 		f9_prev = f9;
+
+		// Esc options menu: physical-key polls, only while MAME is foreground
+		{
+			bool const fg = (GetForegroundWindow() == parent);
+			auto edge = [&](int vk, bool &prev) -> bool
+			{
+				bool const down = fg && (GetAsyncKeyState(vk) & 0x8000) != 0;
+				bool const e = down && !prev;
+				prev = down;
+				return e;
+			};
+			if (edge(VK_ESCAPE, esc_prev) && menuprog)
+				menu_open = !menu_open;
+			bool const up = edge(VK_UP, up_prev);
+			bool const dn = edge(VK_DOWN, down_prev);
+			bool const ok = edge(VK_RETURN, ret_prev);
+			if (menu_open)
+			{
+				if (up) menu_sel = (menu_sel + 2) % 3;
+				if (dn) menu_sel = (menu_sel + 1) % 3;
+				if (ok)
+				{
+					if (menu_sel == 0)
+						menu_open = false;
+					else if (menu_sel == 1)
+					{
+						crt = !crt;
+						gl.UseProgram(pal);
+						gl.Uniform1i(uCrt, crt ? 1 : 0);
+					}
+					else
+					{
+						PostMessageA(parent, WM_CLOSE, 0, 0);
+						menu_open = false;
+					}
+				}
+			}
+		}
 		GetClientRect(parent, &rc);
 		POINT ntl = { 0, 0 };
 		ClientToScreen(parent, &ntl);
@@ -849,6 +979,49 @@ void thread_main()
 		gl.BindVertexArray(vao_empty);
 		gl.DrawArrays(0x0004, 0, 3);
 
+		// ---- Esc options menu overlay ----
+		if (menu_open)
+		{
+			gl.Viewport(0, 0, cw, ch);
+			gl.Enable(0x0BE2 /*BLEND*/);
+			gl.BlendFunc(0x0302 /*SRC_ALPHA*/, 0x0303 /*ONE_MINUS_SRC_ALPHA*/);
+			gl.UseProgram(menuprog);
+			gl.Uniform2f(mScreen, float(cw), float(ch));
+			auto mrect = [&](Label const *L, float x, float y, float w, float h,
+					float r, float g2, float b, float a)
+			{
+				gl.Uniform4f(mRect, x, y, w, h);
+				gl.Uniform4f(mColor, r, g2, b, a);
+				gl.Uniform1i(mSolid, L ? 0 : 1);
+				if (L)
+				{
+					gl.ActiveTexture(TEXTURE0);
+					gl.BindTexture(0x0DE1, L->tex);
+				}
+				gl.DrawArrays(0x0005 /*TRIANGLE_STRIP*/, 0, 4);
+			};
+			auto mlabel = [&](Label const &L, float cy, float px,
+					float r, float g2, float b)
+			{
+				float const h = px, w = L.w * px / L.h;
+				mrect(&L, (cw - w) / 2.0f, cy, w, h, r, g2, b, 1.0f);
+			};
+			float const sc = ch / 1080.0f;
+			mrect(nullptr, 0, 0, float(cw), float(ch), 0, 0, 0, 0.55f);
+			mlabel(lb_title, ch * 0.24f, 72 * sc, 1.0f, 0.72f, 0.20f);
+			Label const *items[3] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_exit };
+			for (int i = 0; i < 3; i++)
+			{
+				bool const s = (i == menu_sel);
+				mlabel(*items[i], ch * (0.42f + 0.10f * i), 44 * sc,
+					s ? 1.0f : 0.85f, s ? 0.72f : 0.85f, s ? 0.20f : 0.90f);
+			}
+			mlabel(lb_hint, ch * 0.86f, 22 * sc, 0.75f, 0.75f, 0.80f);
+			gl.Disable(0x0BE2);
+			gl.ActiveTexture(TEXTURE0);
+			gl.BindTexture(0x0DE1, texram);   // restore for the quad pass
+		}
+
 		++presents;
 		if (s_log && (presents % 300) == 0)
 			logf("t=%llu quads=%llu scenes=%llu pal=%llu tex=%llu vram=%llu "
@@ -986,6 +1159,14 @@ void midvunit_base_state::video_start()
 	if (std::getenv("MIDV_GL"))
 		machine().add_notifier(MACHINE_NOTIFY_EXIT,
 			machine_notify_delegate(&midvunit_base_state::mvgl_exit, this));
+
+	// POC: UDP telemetry (Phase A) - mirror every output change (wheel
+	// force, lamps) to a UDP consumer. Env-gated, inert unset.
+	if (const char *spec = std::getenv("MIDV_TELEM_UDP"))
+	{
+		telem_init(spec, machine().system().name);
+		machine().output().set_global_notifier(&telem_notify, nullptr);
+	}
 
 	m_scanline_timer = timer_alloc(FUNC(midvunit_base_state::scanline_timer_cb), this);
 	m_eoi_timer = timer_alloc(FUNC(midvunit_base_state::eoi_timer_cb), this);
