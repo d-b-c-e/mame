@@ -451,7 +451,9 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 }
 
 // ---- the render thread ----
-constexpr int MARGIN = 86, WIDE = 512 + 2 * MARGIN, HEIGHT = 400;
+// HEIGHT is the default coarse height; offroadc runs a 512x401 mode, so
+// the launcher passes MIDV_GL_HEIGHT=401 and statics size for MAXH
+constexpr int MARGIN = 86, WIDE = 512 + 2 * MARGIN, HEIGHT = 400, MAXH = 401;
 constexpr float PAR = 1.0417f;
 
 static FILE *s_log;
@@ -529,7 +531,10 @@ void thread_main()
 		s_log = fopen("midv_gl.log", "w");
 	int const S = std::getenv("MIDV_GL_SCALE") ? atoi(std::getenv("MIDV_GL_SCALE")) : 3;
 	const char *snapdir = std::getenv("MIDV_GL_SNAP");
-	int const fw = WIDE * S, fh = HEIGHT * S;
+	int H = std::getenv("MIDV_GL_HEIGHT") ? atoi(std::getenv("MIDV_GL_HEIGHT")) : HEIGHT;
+	if (H < HEIGHT || H > MAXH)
+		H = HEIGHT;
+	int const fw = WIDE * S, fh = H * S;
 
 	// wait for MAME's window
 	HWND parent = nullptr;
@@ -621,7 +626,7 @@ void thread_main()
 	uint texram = make_tex(4096, 2048, R8UI);
 	uint paltex = make_tex(256, 128, R32UI);
 	uint pageTex[2] = { make_tex(fw, fh, R16UI), make_tex(fw, fh, R16UI) };
-	uint underTex[2] = { make_tex(512, HEIGHT, R16UI), make_tex(512, HEIGHT, R16UI) };
+	uint underTex[2] = { make_tex(512, H, R16UI), make_tex(512, H, R16UI) };
 	uint fbo[2];
 	gl.GenFramebuffers(2, fbo);
 	for (int i = 0; i < 2; i++)
@@ -664,7 +669,7 @@ void thread_main()
 	}
 
 	gl.UseProgram(prog);
-	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(WIDE), float(HEIGHT));
+	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(WIDE), float(H));
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uScale"), S);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipRight"), WIDE - 1);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "texram"), 0);
@@ -679,7 +684,7 @@ void thread_main()
 	int const uSrcH = gl.GetUniformLocation(pal, "uSrcH");
 	bool crt = std::getenv("MIDV_GL_CRT") && atoi(std::getenv("MIDV_GL_CRT")) != 0;
 	gl.Uniform1i(uCrt, crt ? 1 : 0);
-	gl.Uniform1f(uSrcH, float(HEIGHT));
+	gl.Uniform1f(uSrcH, float(H));
 	bool f9_prev = false;
 
 	// ---- in-game Esc options menu (drawn by the overlay itself) ----
@@ -725,7 +730,7 @@ void thread_main()
 	std::vector<QuadMsg> run, pend[2];
 	uint16_t run_pc = 0xffff, pend_pc[2] = {};
 	bool pend_valid[2] = {};
-	static uint16_t shadow[2][HEIGHT * 512];
+	static uint16_t shadow[2][MAXH * 512];
 	bool quad_fresh[2] = {};
 	bool crop2d[2] = {};
 	int quad_count[2] = {};
@@ -878,9 +883,9 @@ void thread_main()
 				int pg = (o & 0x40000) ? 1 : 0;
 				uint32_t rel = o & 0x3ffff;
 				++n_vram;
-				if (rel < HEIGHT * 512)
+				if (rel < uint32_t(H) * 512)
 				{
-					uint32_t end = std::min(rel + n, uint32_t(HEIGHT * 512));
+					uint32_t end = std::min(rel + n, uint32_t(H) * 512);
 					memcpy(&shadow[pg][rel], staging.data() + 12, (end - rel) * 2);
 					quad_fresh[pg] = false;
 				}
@@ -954,7 +959,7 @@ void thread_main()
 		gl.Clear(0x4000);
 		bool const wide3d = quad_fresh[visible] && !crop2d[visible];
 		float const content_w = wide3d ? float(WIDE) : 512.0f;
-		float const aspect = (content_w * PAR) / float(HEIGHT);
+		float const aspect = (content_w * PAR) / float(H);
 		int vw = cw, vh = int(cw / aspect + 0.5f);
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
 		gl.UseProgram(pal);
@@ -967,11 +972,11 @@ void thread_main()
 			// the pal pass samples rows bottom-up (the quad path flips Y in
 			// its VS); the CPU shadow is top-down, so upload row-reversed or
 			// boot/test screens display vertically flipped
-			static uint16_t flipped[HEIGHT * 512];
-			for (int y = 0; y < HEIGHT; y++)
-				memcpy(&flipped[y * 512], &shadow[visible][(HEIGHT - 1 - y) * 512], 512 * 2);
+			static uint16_t flipped[MAXH * 512];
+			for (int y = 0; y < H; y++)
+				memcpy(&flipped[y * 512], &shadow[visible][(H - 1 - y) * 512], 512 * 2);
 			gl.BindTexture(0x0DE1, underTex[visible]);
-			gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, HEIGHT, RED_INTEGER, 0x1403, flipped);
+			gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, H, RED_INTEGER, 0x1403, flipped);
 		}
 		gl.ActiveTexture(TEXTURE0 + 2);
 		gl.BindTexture(0x0DE1, paltex);
