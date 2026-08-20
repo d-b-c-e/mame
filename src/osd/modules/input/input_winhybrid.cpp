@@ -197,11 +197,16 @@ public:
 					}
 
 					// allocate and link in a new device
+					// c_dfDIJoystick2 primary for 128-button support (racing
+					// wheels, button boxes) - the DIJOYSTATE2 change in
+					// input_dinput.cpp only covered the pure dinput module,
+					// but winhybrid is the default Windows provider, so
+					// high-numbered buttons stayed capped at 32 here
 					auto devinfo = m_dinput_helper->create_device<dinput_joystick_device>(
 							*this,
 							instance,
+							&c_dfDIJoystick2,
 							&c_dfDIJoystick,
-							nullptr,
 							background_input() ? dinput_cooperative_level::BACKGROUND : dinput_cooperative_level::FOREGROUND,
 							[] (auto const &device, auto const &format) -> bool
 							{

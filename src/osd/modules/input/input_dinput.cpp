@@ -557,6 +557,11 @@ dinput_joystick_device::dinput_joystick_device(
 	dinput_device(std::move(name), std::move(id), module, std::move(device), caps, format),
 	m_joystick({ { 0 } })
 {
+	osd_printf_verbose(
+			"DirectInput joystick: %u buttons reported, %s format accepted\n",
+			unsigned(m_caps.dwButtons),
+			(m_format == &c_dfDIJoystick) ? "DIJoystick (32-button legacy)" : "DIJoystick2 (128-button)");
+
 	// cap the number of axes, POVs, and buttons based on the format
 	m_caps.dwAxes = std::min(m_caps.dwAxes, DWORD(8));
 	m_caps.dwPOVs = std::min(m_caps.dwPOVs, DWORD(4));
