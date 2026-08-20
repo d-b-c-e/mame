@@ -160,6 +160,12 @@ void zeus2_device::device_reset()
 #include <iostream>
 #include <fstream>
 #endif
+
+// POC scoping (env-gated, inert unset): count quads per frame to size a GL
+// renderer replacement - see cruisn-poc RESULTS.md, Zeus scoping
+static int s_mz_stats = -1;
+static unsigned s_mz_quads = 0, s_mz_frames = 0, s_mz_qmax = 0;
+
 void zeus2_device::device_stop()
 {
 #if DUMP_WAVE_RAM
@@ -222,6 +228,16 @@ uint32_t zeus2_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap
 	// Wait until configuration is completed before transfering anything
 	if (!(m_zeusbase[0x10] & 0x20))
 		return 0;
+
+	// POC scoping stats (MIDZ_STATS=1): quads/frame profile to stderr
+	if (s_mz_stats > 0)
+	{
+		if (s_mz_quads > s_mz_qmax) s_mz_qmax = s_mz_quads;
+		if ((++s_mz_frames % 300) == 0)
+			fprintf(stderr, "MIDZ frame %u: quads this frame %u, max %u\n",
+					s_mz_frames, s_mz_quads, s_mz_qmax);
+		s_mz_quads = 0;
+	}
 
 	int x, y;
 
@@ -1550,6 +1566,11 @@ void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit
 void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdata, int logit)
 {
 	z2_poly_vertex vert[4];
+
+	if (s_mz_stats < 0)
+		s_mz_stats = std::getenv("MIDZ_STATS") ? 1 : 0;
+	if (s_mz_stats)
+		++s_mz_quads;
 
 	if (logit) {
 		m_state->logerror("quad %d", m_state->zeus_quad_size);

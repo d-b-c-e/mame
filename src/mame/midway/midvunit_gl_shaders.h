@@ -1,265 +1,269 @@
-// GENERATED from cruisn-poc/gpu/renderer.py
+// GENERATED from cruisn-poc/gpu/renderer.py - regenerate with harness/gen_shaders.py, never hand-edit
 
-static const char *MVGL_VS = R"GLSL(
-#version 430
-uniform vec2 uCanvas;      // coarse canvas size (W, H)
-in vec2 in_corner;         // bbox corner, coarse pixel space
-in vec2 in_v0; in vec2 in_v1; in vec2 in_v2; in vec2 in_v3;
-in vec4 in_uv01;           // u0,v0,u1,v1
-in vec4 in_uv23;           // u2,v2,u3,v3
-in uvec4 in_meta;          // pixdata, mode, dither, texbase
-flat out vec2 v0; flat out vec2 v1; flat out vec2 v2; flat out vec2 v3;
-flat out vec4 uv01; flat out vec4 uv23;
-flat out uvec4 meta;
-void main() {
-    v0 = in_v0; v1 = in_v1; v2 = in_v2; v3 = in_v3;
-    uv01 = in_uv01; uv23 = in_uv23; meta = in_meta;
-    // y-down pixel space -> NDC (y flipped)
-    gl_Position = vec4(in_corner.x / uCanvas.x * 2.0 - 1.0,
-                       1.0 - in_corner.y / uCanvas.y * 2.0, 0.0, 1.0);
-}
-)GLSL";
+static const char *MVGL_VS =
+	"\n"
+	"#version 430\n"
+	"uniform vec2 uCanvas;      // coarse canvas size (W, H)\n"
+	"in vec2 in_corner;         // bbox corner, coarse pixel space\n"
+	"in vec2 in_v0; in vec2 in_v1; in vec2 in_v2; in vec2 in_v3;\n"
+	"in vec4 in_uv01;           // u0,v0,u1,v1\n"
+	"in vec4 in_uv23;           // u2,v2,u3,v3\n"
+	"in uvec4 in_meta;          // pixdata, mode, dither, texbase\n"
+	"flat out vec2 v0; flat out vec2 v1; flat out vec2 v2; flat out vec2 v3;\n"
+	"flat out vec4 uv01; flat out vec4 uv23;\n"
+	"flat out uvec4 meta;\n"
+	"void main() {\n"
+	"    v0 = in_v0; v1 = in_v1; v2 = in_v2; v3 = in_v3;\n"
+	"    uv01 = in_uv01; uv23 = in_uv23; meta = in_meta;\n"
+	"    // y-down pixel space -> NDC (y flipped)\n"
+	"    gl_Position = vec4(in_corner.x / uCanvas.x * 2.0 - 1.0,\n"
+	"                       1.0 - in_corner.y / uCanvas.y * 2.0, 0.0, 1.0);\n"
+	"}\n"
+	"\n";
 
-static const char *MVGL_FS = R"GLSL(
-#version 430
-uniform int  uScale;       // 1 = exact mode, >1 = quality mode
-uniform vec2 uCanvas;      // coarse canvas size
-uniform int  uClipRight;   // coarse cliprect right (W-1)
-uniform usampler2D texram; // 4096-wide R8UI, 8 MB of texture RAM
-uniform int  texMask;      // byte-size mask (size-1)
-flat in vec2 v0; flat in vec2 v1; flat in vec2 v2; flat in vec2 v3;
-flat in vec4 uv01; flat in vec4 uv23;
-flat in uvec4 meta;
-out uint outIndex;
+static const char *MVGL_FS =
+	"\n"
+	"#version 430\n"
+	"uniform int  uScale;       // 1 = exact mode, >1 = quality mode\n"
+	"uniform vec2 uCanvas;      // coarse canvas size\n"
+	"uniform int  uClipRight;   // coarse cliprect right (W-1)\n"
+	"uniform usampler2D texram; // 4096-wide R8UI, 8 MB of texture RAM\n"
+	"uniform int  texMask;      // byte-size mask (size-1)\n"
+	"flat in vec2 v0; flat in vec2 v1; flat in vec2 v2; flat in vec2 v3;\n"
+	"flat in vec4 uv01; flat in vec4 uv23;\n"
+	"flat in uvec4 meta;\n"
+	"out uint outIndex;\n"
+	"\n"
+	"int round_coord(float f) {           // poly.h: floor, +1 iff frac > 0.5\n"
+	"    float ip = floor(f);\n"
+	"    return int(ip) + (((f - ip) > 0.5) ? 1 : 0);\n"
+	"}\n"
+	"int c_int32(float f) {               // C float->int32: trunc, OOR -> INT_MIN\n"
+	"    if (!(abs(f) < 2147483648.0)) return -2147483648;\n"
+	"    return int(f);\n"
+	"}\n"
+	"uint fetch_texel(int idx) {\n"
+	"    idx &= texMask;\n"
+	"    return texelFetch(texram, ivec2(idx & 4095, idx >> 12), 0).r;\n"
+	"}\n"
+	"\n"
+	"void main() {\n"
+	"    vec2 vx[4] = vec2[4](v0, v1, v2, v3);\n"
+	"    float fx = gl_FragCoord.x;\n"
+	"    float fy = uCanvas.y * float(uScale) - gl_FragCoord.y;   // y-down\n"
+	"    float cx = fx / float(uScale);\n"
+	"    float cy = fy / float(uScale);\n"
+	"    int px = int(floor(cx));\n"
+	"    int py = int(floor(cy));\n"
+	"    // exact mode evaluates at MAME's scanline centre; quality mode uses the\n"
+	"    // fine fragment's own continuous coordinate\n"
+	"    precise float fully = (uScale == 1) ? float(py) + 0.5 : cy;\n"
+	"\n"
+	"    // ---- min/max Y vertices (poly.h render_polygon) ----\n"
+	"    int minv = 0, maxv = 0;\n"
+	"    for (int i = 1; i < 4; i++) {\n"
+	"        if (vx[i].y < vx[minv].y) minv = i;\n"
+	"        else if (vx[i].y > vx[maxv].y) maxv = i;\n"
+	"    }\n"
+	"    if (round_coord(vx[maxv].y) - round_coord(vx[minv].y) <= 0) discard;\n"
+	"    float maxvy = vx[maxv].y;\n"
+	"\n"
+	"    // poly.h renders scanlines [round(miny), round(maxy)) only - the expanded\n"
+	"    // bounding box generates fragments beyond that, where extrapolated edges\n"
+	"    // still yield plausible x-extents. Without this cut, later quads steal\n"
+	"    // their neighbours' shared-edge rows.\n"
+	"    if (uScale == 1) {\n"
+	"        if (py < round_coord(vx[minv].y) || py >= round_coord(maxvy)) discard;\n"
+	"    } else {\n"
+	"        if (cy < vx[minv].y || cy >= maxvy) discard;\n"
+	"    }\n"
+	"\n"
+	"    // ---- forward / backward edge lists (<=3 each) ----\n"
+	"    // e[k] = (v1x, v1y, v2y, dxdy), p[k] = (u1, v1_p, dudy, dvdy)\n"
+	"    precise vec4 fe[3]; precise vec4 fp[3]; int fn = 0;\n"
+	"    precise vec4 be[3]; precise vec4 bp[3]; int bn = 0;\n"
+	"    vec4 uvs[4] = vec4[4](vec4(uv01.xy, 0, 0), vec4(uv01.zw, 0, 0),\n"
+	"                          vec4(uv23.xy, 0, 0), vec4(uv23.zw, 0, 0));\n"
+	"    for (int curv = minv; curv != maxv; curv = (curv + 1) & 3) {\n"
+	"        int nxt = (curv + 1) & 3;\n"
+	"        if (vx[nxt].y != vx[curv].y) {\n"
+	"            precise float ooy = 1.0 / (vx[nxt].y - vx[curv].y);\n"
+	"            fe[fn] = vec4(vx[curv].x, vx[curv].y, vx[nxt].y,\n"
+	"                          (vx[nxt].x - vx[curv].x) * ooy);\n"
+	"            fp[fn] = vec4(uvs[curv].xy,\n"
+	"                          (uvs[nxt].x - uvs[curv].x) * ooy,\n"
+	"                          (uvs[nxt].y - uvs[curv].y) * ooy);\n"
+	"            fn++;\n"
+	"        }\n"
+	"    }\n"
+	"    for (int curv = minv; curv != maxv; curv = (curv - 1) & 3) {\n"
+	"        int nxt = (curv - 1) & 3;\n"
+	"        if (vx[nxt].y != vx[curv].y) {\n"
+	"            precise float ooy = 1.0 / (vx[nxt].y - vx[curv].y);\n"
+	"            be[bn] = vec4(vx[curv].x, vx[curv].y, vx[nxt].y,\n"
+	"                          (vx[nxt].x - vx[curv].x) * ooy);\n"
+	"            bp[bn] = vec4(uvs[curv].xy,\n"
+	"                          (uvs[nxt].x - uvs[curv].x) * ooy,\n"
+	"                          (uvs[nxt].y - uvs[curv].y) * ooy);\n"
+	"            bn++;\n"
+	"        }\n"
+	"    }\n"
+	"    if (fn == 0 || bn == 0) discard;\n"
+	"\n"
+	"    // ---- left/right decision (poly.h:1194) ----\n"
+	"    bool sharedFirst = (fe[0].x == be[0].x) && (fe[0].y == be[0].y);\n"
+	"    bool fwd_left = (sharedFirst && fe[0].w < be[0].w)\n"
+	"                 || (!sharedFirst && fe[0].x < be[0].x);\n"
+	"\n"
+	"    // ---- advance to the edge pair spanning this scanline ----\n"
+	"    int li = 0, ri = 0;\n"
+	"    vec4 le, lp, re, rp;\n"
+	"    if (fwd_left) {\n"
+	"        while (fully > fe[li].z && fully < maxvy && li + 1 < fn) li++;\n"
+	"        while (fully > be[ri].z && fully < maxvy && ri + 1 < bn) ri++;\n"
+	"        le = fe[li]; lp = fp[li]; re = be[ri]; rp = bp[ri];\n"
+	"    } else {\n"
+	"        while (fully > be[li].z && fully < maxvy && li + 1 < bn) li++;\n"
+	"        while (fully > fe[ri].z && fully < maxvy && ri + 1 < fn) ri++;\n"
+	"        le = be[li]; lp = bp[li]; re = fe[ri]; rp = fp[ri];\n"
+	"    }\n"
+	"\n"
+	"    precise float startx = le.x + (fully - le.y) * le.w;\n"
+	"    precise float stopx  = re.x + (fully - re.y) * re.w;\n"
+	"    int istartx = round_coord(startx);\n"
+	"    int istopx  = round_coord(stopx);\n"
+	"    if (istartx > istopx) { int t = istartx; istartx = istopx; istopx = t; }\n"
+	"\n"
+	"    // ---- params at this scanline (poly.h:1250) ----\n"
+	"    precise float ldy = fully - le.y;\n"
+	"    precise float rdy = fully - re.y;\n"
+	"    precise float oox = 1.0 / (stopx - startx);\n"
+	"    precise float lu = lp.x + ldy * lp.z;\n"
+	"    precise float lv = lp.y + ldy * lp.w;\n"
+	"    precise float dudx = (rp.x + rdy * rp.z - lu) * oox;\n"
+	"    precise float dvdx = (rp.y + rdy * rp.w - lv) * oox;\n"
+	"    precise float su = lu + (float(istartx) + 0.5 - startx) * dudx;\n"
+	"    precise float sv = lv + (float(istartx) + 0.5 - startx) * dvdx;\n"
+	"\n"
+	"    // ---- left/right clip with param adjust ----\n"
+	"    if (istartx < 0) {\n"
+	"        su += float(-istartx) * dudx;\n"
+	"        sv += float(-istartx) * dvdx;\n"
+	"        istartx = 0;\n"
+	"    }\n"
+	"    if (istopx > uClipRight) istopx = uClipRight + 1;\n"
+	"    if (istartx >= istopx) discard;\n"
+	"\n"
+	"    // ---- coverage ----\n"
+	"    if (uScale == 1) {\n"
+	"        if (px < istartx || px >= istopx) discard;\n"
+	"    } else {\n"
+	"        // continuous edges at fine resolution; clip window still applies\n"
+	"        float lo = max(min(startx, stopx), 0.0);\n"
+	"        float hi = min(max(startx, stopx), float(uClipRight + 1));\n"
+	"        if (cx < lo || cx >= hi) discard;\n"
+	"    }\n"
+	"\n"
+	"    uint pixdata = meta.x, mode = meta.y, dither = meta.z;\n"
+	"    if (dither == 1u && ((px ^ py) & 1) != 0) discard;   // coarse-space mask\n"
+	"\n"
+	"    if (mode == 0u) { outIndex = pixdata & 0xffffu; return; }\n"
+	"\n"
+	"    int ui, vi;\n"
+	"    if (uScale == 1) {   // MAME's integer DDA, analytically\n"
+	"        ui = c_int32(su) + (px - istartx) * c_int32(dudx);\n"
+	"        vi = c_int32(sv) + (px - istartx) * c_int32(dvdx);\n"
+	"    } else {             // sub-pixel float interpolation\n"
+	"        ui = c_int32(lu + (cx - startx) * dudx);\n"
+	"        vi = c_int32(lv + (cx - startx) * dvdx);\n"
+	"    }\n"
+	"    uint texel = fetch_texel(int(meta.w) + ((vi >> 8) & 0xff00) + (ui >> 16));\n"
+	"    if (mode == 1u)      outIndex = (pixdata + texel) & 0xffffu;\n"
+	"    else if (mode == 2u) { if (texel == 0u) discard;\n"
+	"                           outIndex = (pixdata + texel) & 0xffffu; }\n"
+	"    else                 { if (texel == 0u) discard;\n"
+	"                           outIndex = pixdata & 0xffffu; }\n"
+	"}\n"
+	"\n";
 
-int round_coord(float f) {           // poly.h: floor, +1 iff frac > 0.5
-    float ip = floor(f);
-    return int(ip) + (((f - ip) > 0.5) ? 1 : 0);
-}
-int c_int32(float f) {               // C float->int32: trunc, OOR -> INT_MIN
-    if (!(abs(f) < 2147483648.0)) return -2147483648;
-    return int(f);
-}
-uint fetch_texel(int idx) {
-    idx &= texMask;
-    return texelFetch(texram, ivec2(idx & 4095, idx >> 12), 0).r;
-}
+static const char *MVGL_PAL_VS =
+	"\n"
+	"#version 430\n"
+	"out vec2 uv;\n"
+	"void main() {  // full-screen triangle\n"
+	"    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+	"    uv = p;\n"
+	"    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n"
+	"\n";
 
-void main() {
-    vec2 vx[4] = vec2[4](v0, v1, v2, v3);
-    float fx = gl_FragCoord.x;
-    float fy = uCanvas.y * float(uScale) - gl_FragCoord.y;   // y-down
-    float cx = fx / float(uScale);
-    float cy = fy / float(uScale);
-    int px = int(floor(cx));
-    int py = int(floor(cy));
-    // exact mode evaluates at MAME's scanline centre; quality mode uses the
-    // fine fragment's own continuous coordinate
-    precise float fully = (uScale == 1) ? float(py) + 0.5 : cy;
-
-    // ---- min/max Y vertices (poly.h render_polygon) ----
-    int minv = 0, maxv = 0;
-    for (int i = 1; i < 4; i++) {
-        if (vx[i].y < vx[minv].y) minv = i;
-        else if (vx[i].y > vx[maxv].y) maxv = i;
-    }
-    if (round_coord(vx[maxv].y) - round_coord(vx[minv].y) <= 0) discard;
-    float maxvy = vx[maxv].y;
-
-    // poly.h renders scanlines [round(miny), round(maxy)) only - the expanded
-    // bounding box generates fragments beyond that, where extrapolated edges
-    // still yield plausible x-extents. Without this cut, later quads steal
-    // their neighbours' shared-edge rows.
-    if (uScale == 1) {
-        if (py < round_coord(vx[minv].y) || py >= round_coord(maxvy)) discard;
-    } else {
-        if (cy < vx[minv].y || cy >= maxvy) discard;
-    }
-
-    // ---- forward / backward edge lists (<=3 each) ----
-    // e[k] = (v1x, v1y, v2y, dxdy), p[k] = (u1, v1_p, dudy, dvdy)
-    precise vec4 fe[3]; precise vec4 fp[3]; int fn = 0;
-    precise vec4 be[3]; precise vec4 bp[3]; int bn = 0;
-    vec4 uvs[4] = vec4[4](vec4(uv01.xy, 0, 0), vec4(uv01.zw, 0, 0),
-                          vec4(uv23.xy, 0, 0), vec4(uv23.zw, 0, 0));
-    for (int curv = minv; curv != maxv; curv = (curv + 1) & 3) {
-        int nxt = (curv + 1) & 3;
-        if (vx[nxt].y != vx[curv].y) {
-            precise float ooy = 1.0 / (vx[nxt].y - vx[curv].y);
-            fe[fn] = vec4(vx[curv].x, vx[curv].y, vx[nxt].y,
-                          (vx[nxt].x - vx[curv].x) * ooy);
-            fp[fn] = vec4(uvs[curv].xy,
-                          (uvs[nxt].x - uvs[curv].x) * ooy,
-                          (uvs[nxt].y - uvs[curv].y) * ooy);
-            fn++;
-        }
-    }
-    for (int curv = minv; curv != maxv; curv = (curv - 1) & 3) {
-        int nxt = (curv - 1) & 3;
-        if (vx[nxt].y != vx[curv].y) {
-            precise float ooy = 1.0 / (vx[nxt].y - vx[curv].y);
-            be[bn] = vec4(vx[curv].x, vx[curv].y, vx[nxt].y,
-                          (vx[nxt].x - vx[curv].x) * ooy);
-            bp[bn] = vec4(uvs[curv].xy,
-                          (uvs[nxt].x - uvs[curv].x) * ooy,
-                          (uvs[nxt].y - uvs[curv].y) * ooy);
-            bn++;
-        }
-    }
-    if (fn == 0 || bn == 0) discard;
-
-    // ---- left/right decision (poly.h:1194) ----
-    bool sharedFirst = (fe[0].x == be[0].x) && (fe[0].y == be[0].y);
-    bool fwd_left = (sharedFirst && fe[0].w < be[0].w)
-                 || (!sharedFirst && fe[0].x < be[0].x);
-
-    // ---- advance to the edge pair spanning this scanline ----
-    int li = 0, ri = 0;
-    vec4 le, lp, re, rp;
-    if (fwd_left) {
-        while (fully > fe[li].z && fully < maxvy && li + 1 < fn) li++;
-        while (fully > be[ri].z && fully < maxvy && ri + 1 < bn) ri++;
-        le = fe[li]; lp = fp[li]; re = be[ri]; rp = bp[ri];
-    } else {
-        while (fully > be[li].z && fully < maxvy && li + 1 < bn) li++;
-        while (fully > fe[ri].z && fully < maxvy && ri + 1 < fn) ri++;
-        le = be[li]; lp = bp[li]; re = fe[ri]; rp = fp[ri];
-    }
-
-    precise float startx = le.x + (fully - le.y) * le.w;
-    precise float stopx  = re.x + (fully - re.y) * re.w;
-    int istartx = round_coord(startx);
-    int istopx  = round_coord(stopx);
-    if (istartx > istopx) { int t = istartx; istartx = istopx; istopx = t; }
-
-    // ---- params at this scanline (poly.h:1250) ----
-    precise float ldy = fully - le.y;
-    precise float rdy = fully - re.y;
-    precise float oox = 1.0 / (stopx - startx);
-    precise float lu = lp.x + ldy * lp.z;
-    precise float lv = lp.y + ldy * lp.w;
-    precise float dudx = (rp.x + rdy * rp.z - lu) * oox;
-    precise float dvdx = (rp.y + rdy * rp.w - lv) * oox;
-    precise float su = lu + (float(istartx) + 0.5 - startx) * dudx;
-    precise float sv = lv + (float(istartx) + 0.5 - startx) * dvdx;
-
-    // ---- left/right clip with param adjust ----
-    if (istartx < 0) {
-        su += float(-istartx) * dudx;
-        sv += float(-istartx) * dvdx;
-        istartx = 0;
-    }
-    if (istopx > uClipRight) istopx = uClipRight + 1;
-    if (istartx >= istopx) discard;
-
-    // ---- coverage ----
-    if (uScale == 1) {
-        if (px < istartx || px >= istopx) discard;
-    } else {
-        // continuous edges at fine resolution; clip window still applies
-        float lo = max(min(startx, stopx), 0.0);
-        float hi = min(max(startx, stopx), float(uClipRight + 1));
-        if (cx < lo || cx >= hi) discard;
-    }
-
-    uint pixdata = meta.x, mode = meta.y, dither = meta.z;
-    if (dither == 1u && ((px ^ py) & 1) != 0) discard;   // coarse-space mask
-
-    if (mode == 0u) { outIndex = pixdata & 0xffffu; return; }
-
-    int ui, vi;
-    if (uScale == 1) {   // MAME's integer DDA, analytically
-        ui = c_int32(su) + (px - istartx) * c_int32(dudx);
-        vi = c_int32(sv) + (px - istartx) * c_int32(dvdx);
-    } else {             // sub-pixel float interpolation
-        ui = c_int32(lu + (cx - startx) * dudx);
-        vi = c_int32(lv + (cx - startx) * dvdx);
-    }
-    uint texel = fetch_texel(int(meta.w) + ((vi >> 8) & 0xff00) + (ui >> 16));
-    if (mode == 1u)      outIndex = (pixdata + texel) & 0xffffu;
-    else if (mode == 2u) { if (texel == 0u) discard;
-                           outIndex = (pixdata + texel) & 0xffffu; }
-    else                 { if (texel == 0u) discard;
-                           outIndex = pixdata & 0xffffu; }
-}
-)GLSL";
-
-static const char *MVGL_PAL_VS = R"GLSL(
-#version 430
-out vec2 uv;
-void main() {  // full-screen triangle
-    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-    uv = p;
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-}
-)GLSL";
-
-static const char *MVGL_PAL_FS = R"GLSL(
-#version 430
-uniform usampler2D idxTex;
-uniform usampler2D palTex;   // 256x128 R32UI - 32768 palette words
-uniform int uCrop;           // fine pixels to crop from each side (2D screens)
-uniform int uCrt;            // 1 = CRT pass (mask+scanline+curvature), 0 = raw
-uniform float uSrcH;         // simulated source scanline count (coarse height)
-in vec2 uv;
-out vec4 color;
-
-vec3 fetch_at(ivec2 p) {
-    uint pen = texelFetch(idxTex, p, 0).r & 0x7fffu;
-    uint w = texelFetch(palTex, ivec2(pen & 255u, pen >> 8), 0).r;
-    uint r = (w >> 10) & 31u, g = (w >> 5) & 31u, b = w & 31u;
-    return vec3(float((r << 3) | (r >> 2)) / 255.0,
-                float((g << 3) | (g >> 2)) / 255.0,
-                float((b << 3) | (b >> 2)) / 255.0);
-}
-
-ivec2 src_px(vec2 tuv) {
-    ivec2 sz = textureSize(idxTex, 0);
-    return ivec2(float(uCrop) + tuv.x * float(sz.x - 2 * uCrop),
-                 tuv.y * float(sz.y));
-}
-
-vec3 fetch_rgb(vec2 tuv) { return fetch_at(src_px(tuv)); }
-
-void main() {
-    if (uCrt == 0) {                       // raw path - untouched product look
-        color = vec4(fetch_rgb(uv), 1.0);
-        return;
-    }
-
-    // ---- tube geometry: gentle barrel warp, black outside the glass ----
-    vec2 c = uv * 2.0 - 1.0;
-    c *= vec2(1.0 + 0.041 * c.y * c.y, 1.0 + 0.052 * c.x * c.x);
-    vec2 wuv = c * 0.5 + 0.5;
-    if (any(lessThan(wuv, vec2(0.0))) || any(greaterThan(wuv, vec2(1.0)))) {
-        color = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    // ---- horizontal beam softness: 3-tap blur in fine pixels ----
-    ivec2 p = src_px(wuv);
-    int s = max(1, int(float(textureSize(idxTex, 0).y) / uSrcH * 0.45));
-    vec3 rgb = 0.5 * fetch_at(p)
-             + 0.25 * fetch_at(p + ivec2(s, 0))
-             + 0.25 * fetch_at(p - ivec2(s, 0));
-
-    // ---- scanlines: gaussian beam per source line, bright beams bloom ----
-    float d = fract(wuv.y * uSrcH) - 0.5;
-    float lum = dot(rgb, vec3(0.299, 0.587, 0.114));
-    float width = mix(0.35, 0.65, lum);
-    float scan = exp(-(d * d) / (2.0 * width * width));
-
-    // ---- shadow mask: two-phase magenta/green (rainbow-free at any res) ----
-    vec3 mask = ((int(gl_FragCoord.x) & 1) == 0)
-        ? vec3(1.0, 0.62, 1.0) : vec3(0.62, 1.0, 0.62);
-
-    // ---- rounded corners + vignette ----
-    vec2 cc = abs(wuv * 2.0 - 1.0);
-    float cornerd = length(max(cc - vec2(0.94), 0.0)) / 0.06;
-    float cornerm = 1.0 - smoothstep(0.8, 1.0, cornerd);
-    float vig = 1.0 - 0.10 * dot(cc, cc);
-
-    rgb *= scan * cornerm * vig * 1.42;
-    color = vec4(min(rgb * mask, 1.0), 1.0);
-}
-)GLSL";
+static const char *MVGL_PAL_FS =
+	"\n"
+	"#version 430\n"
+	"uniform usampler2D idxTex;\n"
+	"uniform usampler2D palTex;   // 256x128 R32UI - 32768 palette words\n"
+	"uniform int uCrop;           // fine pixels to crop from each side (2D screens)\n"
+	"uniform int uCrt;            // 1 = CRT pass (mask+scanline+curvature), 0 = raw\n"
+	"uniform float uSrcH;         // simulated source scanline count (coarse height)\n"
+	"in vec2 uv;\n"
+	"out vec4 color;\n"
+	"\n"
+	"vec3 fetch_at(ivec2 p) {\n"
+	"    uint pen = texelFetch(idxTex, p, 0).r & 0x7fffu;\n"
+	"    uint w = texelFetch(palTex, ivec2(pen & 255u, pen >> 8), 0).r;\n"
+	"    uint r = (w >> 10) & 31u, g = (w >> 5) & 31u, b = w & 31u;\n"
+	"    return vec3(float((r << 3) | (r >> 2)) / 255.0,\n"
+	"                float((g << 3) | (g >> 2)) / 255.0,\n"
+	"                float((b << 3) | (b >> 2)) / 255.0);\n"
+	"}\n"
+	"\n"
+	"ivec2 src_px(vec2 tuv) {\n"
+	"    ivec2 sz = textureSize(idxTex, 0);\n"
+	"    return ivec2(float(uCrop) + tuv.x * float(sz.x - 2 * uCrop),\n"
+	"                 tuv.y * float(sz.y));\n"
+	"}\n"
+	"\n"
+	"vec3 fetch_rgb(vec2 tuv) { return fetch_at(src_px(tuv)); }\n"
+	"\n"
+	"void main() {\n"
+	"    if (uCrt == 0) {                       // raw path - untouched product look\n"
+	"        color = vec4(fetch_rgb(uv), 1.0);\n"
+	"        return;\n"
+	"    }\n"
+	"\n"
+	"    // ---- tube geometry: gentle barrel warp, black outside the glass ----\n"
+	"    vec2 c = uv * 2.0 - 1.0;\n"
+	"    c *= vec2(1.0 + 0.041 * c.y * c.y, 1.0 + 0.052 * c.x * c.x);\n"
+	"    vec2 wuv = c * 0.5 + 0.5;\n"
+	"    if (any(lessThan(wuv, vec2(0.0))) || any(greaterThan(wuv, vec2(1.0)))) {\n"
+	"        color = vec4(0.0, 0.0, 0.0, 1.0);\n"
+	"        return;\n"
+	"    }\n"
+	"    // ---- horizontal beam softness: 3-tap blur in fine pixels ----\n"
+	"    ivec2 p = src_px(wuv);\n"
+	"    int s = max(1, int(float(textureSize(idxTex, 0).y) / uSrcH * 0.45));\n"
+	"    vec3 rgb = 0.5 * fetch_at(p)\n"
+	"             + 0.25 * fetch_at(p + ivec2(s, 0))\n"
+	"             + 0.25 * fetch_at(p - ivec2(s, 0));\n"
+	"\n"
+	"    // ---- scanlines: gaussian beam per source line, bright beams bloom ----\n"
+	"    float d = fract(wuv.y * uSrcH) - 0.5;\n"
+	"    float lum = dot(rgb, vec3(0.299, 0.587, 0.114));\n"
+	"    float width = mix(0.35, 0.65, lum);\n"
+	"    float scan = exp(-(d * d) / (2.0 * width * width));\n"
+	"\n"
+	"    // ---- shadow mask: two-phase magenta/green (rainbow-free at any res) ----\n"
+	"    vec3 mask = ((int(gl_FragCoord.x) & 1) == 0)\n"
+	"        ? vec3(1.0, 0.62, 1.0) : vec3(0.62, 1.0, 0.62);\n"
+	"\n"
+	"    // ---- rounded corners + vignette ----\n"
+	"    vec2 cc = abs(wuv * 2.0 - 1.0);\n"
+	"    float cornerd = length(max(cc - vec2(0.94), 0.0)) / 0.06;\n"
+	"    float cornerm = 1.0 - smoothstep(0.8, 1.0, cornerd);\n"
+	"    float vig = 1.0 - 0.10 * dot(cc, cc);\n"
+	"\n"
+	"    rgb *= scan * cornerm * vig * 1.42;\n"
+	"    color = vec4(min(rgb * mask, 1.0), 1.0);\n"
+	"}\n"
+	"\n";
 
