@@ -1099,6 +1099,18 @@ void thread_main()
 		}
 		SwapBuffers(dc);
 	}
+	// persist live-toggle state (F9 / Esc-menu CRT) for the launcher: the
+	// collection shell reads this back so its SETTINGS row and the next
+	// launch match what the player last saw on screen
+	if (char const *sf = std::getenv("MIDV_GL_STATEFILE"))
+	{
+		FILE *f = fopen(sf, "w");
+		if (f)
+		{
+			fprintf(f, "crt=%d\n", crt ? 1 : 0);
+			fclose(f);
+		}
+	}
 	logf("%s after %llu presents, %d snaps",
 		s_stop.load() ? "machine exit" : "parent gone",
 		(unsigned long long)presents, snap_n);
