@@ -316,6 +316,8 @@ struct GL
 	void (WINAPI *FramebufferTexture2D)(unsigned, unsigned, unsigned, uint, int);
 	unsigned (WINAPI *CheckFramebufferStatus)(unsigned);
 	void (WINAPI *ActiveTexture)(unsigned);
+	void (WINAPI *DrawBuffers)(int, const unsigned *);
+	void (WINAPI *ClearBufferuiv)(unsigned, int, const uint *);
 
 	template <typename T> void load1(T &fn, const char *name)
 	{
@@ -362,6 +364,7 @@ struct GL
 		L(FramebufferTexture2D, "glFramebufferTexture2D")
 		L(CheckFramebufferStatus, "glCheckFramebufferStatus")
 		L(ActiveTexture, "glActiveTexture")
+		L(DrawBuffers, "glDrawBuffers") L(ClearBufferuiv, "glClearBufferuiv")
 #undef L
 		load1(CreateContextAttribs, "wglCreateContextAttribsARB");
 		load1(SwapIntervalEXT, "wglSwapIntervalEXT");
@@ -626,6 +629,10 @@ void thread_main()
 	uint texram = make_tex(4096, 2048, R8UI);
 	uint paltex = make_tex(256, 128, R32UI);
 	uint pageTex[2] = { make_tex(fw, fh, R16UI), make_tex(fw, fh, R16UI) };
+	// crack-fill mask: attachment 1 flags pixels the CURRENT scene wrote;
+	// the palette pass fills unwritten slivers (hardware quad cracks that
+	// would show the stale page) from axis-bounded neighbours
+	uint maskTex[2] = { make_tex(fw, fh, R8UI), make_tex(fw, fh, R8UI) };
 	uint underTex[2] = { make_tex(512, H, R16UI), make_tex(512, H, R16UI) };
 	uint fbo[2];
 	gl.GenFramebuffers(2, fbo);
@@ -633,6 +640,9 @@ void thread_main()
 	{
 		gl.BindFramebuffer(FRAMEBUFFER, fbo[i]);
 		gl.FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0, 0x0DE1, pageTex[i], 0);
+		gl.FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0 + 1, 0x0DE1, maskTex[i], 0);
+		unsigned const bufs[2] = { COLOR_ATTACHMENT0, COLOR_ATTACHMENT0 + 1 };
+		gl.DrawBuffers(2, bufs);
 		if (gl.CheckFramebufferStatus(FRAMEBUFFER) != FRAMEBUFFER_COMPLETE)
 			logf("fbo %d incomplete", i);
 		gl.Clear(0x4000);
@@ -682,9 +692,15 @@ void thread_main()
 	// (uCrt=0) shader path is byte-identical to the pre-CRT palette pass.
 	int const uCrt = gl.GetUniformLocation(pal, "uCrt");
 	int const uSrcH = gl.GetUniformLocation(pal, "uSrcH");
+	int const uFillR = gl.GetUniformLocation(pal, "uFillR");
 	bool crt = std::getenv("MIDV_GL_CRT") && atoi(std::getenv("MIDV_GL_CRT")) != 0;
+	// crack fill defaults ON (a pure improvement: only pixels the scene
+	// never wrote are touched); MIDV_GL_CRACKFILL=0 restores raw hardware
+	bool const fill_on = !(std::getenv("MIDV_GL_CRACKFILL")
+			&& atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0);
 	gl.Uniform1i(uCrt, crt ? 1 : 0);
 	gl.Uniform1f(uSrcH, float(H));
+	gl.Uniform1i(gl.GetUniformLocation(pal, "maskTex"), 3);
 	bool f9_prev = false;
 
 	// ---- in-game Esc options menu (drawn by the overlay itself) ----
@@ -924,6 +940,13 @@ void thread_main()
 			gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
 			gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
 			gl.Viewport(0, 0, fw, fh);
+			// reset the crack-fill mask to "unwritten" for the whole frame -
+			// glClearBufferuiv touches ONLY attachment 1, so the page itself
+			// still persists between scenes (hardware behavior)
+			{
+				uint const zero[4] = { 0, 0, 0, 0 };
+				gl.ClearBufferuiv(0x1800 /*GL_COLOR*/, 1, zero);
+			}
 			// The game guarantees repainting only the 512-wide hardware
 			// region; the 16:9 margins are ours. Scenes that draw nothing
 			// there (2D screens, showcase scenes) would otherwise show the
@@ -964,6 +987,12 @@ void thread_main()
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
 		gl.UseProgram(pal);
 		gl.Uniform1i(uCrop, (quad_fresh[visible] && !wide3d) ? MARGIN * S : 0);
+		// fill only live 3D scenes (2D screens and the CPU-shadow path have
+		// no meaningful mask; persistence there may be intentional)
+		gl.Uniform1i(uFillR,
+			(fill_on && quad_fresh[visible] && !crop2d[visible]) ? 4 * S : 0);
+		gl.ActiveTexture(TEXTURE0 + 3);
+		gl.BindTexture(0x0DE1, maskTex[visible]);
 		gl.ActiveTexture(TEXTURE0 + 1);
 		if (quad_fresh[visible])
 			gl.BindTexture(0x0DE1, pageTex[visible]);
