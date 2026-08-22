@@ -243,6 +243,9 @@ namespace mvgl {
 // its acknowledgement (see midvunit_base_state::mvgl_exit)
 static std::atomic<bool> s_stop{false};
 static std::atomic<bool> s_done{false};
+// Esc-menu pause request: set by the GL thread, acted on by the emu
+// thread in screen_update (pause/resume are not thread-safe from here)
+static std::atomic<int> s_menu_pause{0};
 
 // ---- minimal dynamic GL loader (no link-time deps beyond user32/gdi32) ----
 #define MVGL_E(n, v) constexpr unsigned n = v;
@@ -698,9 +701,16 @@ void thread_main()
 	// never wrote are touched); MIDV_GL_CRACKFILL=0 restores raw hardware
 	bool const fill_on = !(std::getenv("MIDV_GL_CRACKFILL")
 			&& atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0);
+	// margin extend: clamp-stretch the hardware-boundary column into
+	// unwritten margin pixels (black holes where 4:3-era culling never
+	// drew). MIDV_GL_MARGINFILL=0 disables independently of crack fill.
+	bool const margin_on = !(std::getenv("MIDV_GL_MARGINFILL")
+			&& atoi(std::getenv("MIDV_GL_MARGINFILL")) == 0);
 	gl.Uniform1i(uCrt, crt ? 1 : 0);
 	gl.Uniform1f(uSrcH, float(H));
 	gl.Uniform1i(gl.GetUniformLocation(pal, "maskTex"), 3);
+	gl.Uniform1i(gl.GetUniformLocation(pal, "uMargin"),
+		(fill_on && margin_on) ? MARGIN * S : 0);
 	bool f9_prev = false;
 
 	// ---- in-game Esc options menu (drawn by the overlay itself) ----
@@ -830,6 +840,7 @@ void thread_main()
 					}
 				}
 			}
+			s_menu_pause.store(menu_open ? 1 : 0);
 		}
 		GetClientRect(parent, &rc);
 		POINT ntl = { 0, 0 };
@@ -1194,6 +1205,7 @@ void midvunit_base_state::mvgl_exit()
 	// POC: a detached GL thread that outlives the machine races teardown
 	// (msvcrt!memcpy AVs logged at roughly every second exit). Flag it down
 	// and give it up to a second to acknowledge before destruction proceeds.
+	mvgl::s_menu_pause.store(0);
 	mvgl::s_stop.store(true);
 	for (int i = 0; i < 100 && !mvgl::s_done.load(); i++)
 		Sleep(10);
@@ -1740,6 +1752,22 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	uint32_t offset;
 
 	m_poly->wait("Refresh Time");
+
+	// Esc options menu pauses the machine while open. The request comes
+	// from the GL thread; pause/resume must run on the emu thread, and we
+	// act only on transitions so a manual pause is never fought.
+	{
+		static int s_prev_req = 0;
+		int const req = mvgl::s_menu_pause.load();
+		if (req != s_prev_req)
+		{
+			s_prev_req = req;
+			if (req && !machine().paused())
+				machine().pause();
+			else if (!req && machine().paused())
+				machine().resume();
+		}
+	}
 
 	// live bridge: palette/texture must flow even before any quad is drawn -
 	// boot and test screens are CPU-drawn, and without this the palette never
