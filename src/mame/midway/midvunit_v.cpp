@@ -59,7 +59,7 @@ FILE *quadlog_open()
 // MIDV_LIVE=1 opens a named shared-memory ring ("Local\\MIDV_LIVE") and
 // streams, in strict emulation order: quads, page flips, coalesced CPU
 // videoram writes, and texture/palette snapshots when dirty. A viewer
-// process (cruisn-poc/gpu/live_viewer.py) renders and presents them live.
+// process (cruisn-collection/gpu/live_viewer.py) renders and presents them live.
 // Single producer (the scheduler thread), single consumer. Zero cost when
 // the env var is unset.
 //

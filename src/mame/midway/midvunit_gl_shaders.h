@@ -1,4 +1,4 @@
-// GENERATED from cruisn-poc/gpu/renderer.py - regenerate with harness/gen_shaders.py, never hand-edit
+// GENERATED from cruisn-collection/gpu/renderer.py - regenerate with harness/gen_shaders.py, never hand-edit
 
 static const char *MVGL_VS =
 	"\n"

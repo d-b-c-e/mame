@@ -12,6 +12,19 @@
 
 #include <algorithm>
 
+// MIDZ_GL in-process renderer (Windows-only, env-gated; see mzgl below)
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include "zeus2_gl_shaders.h"
+#include "../../mame/midway/midvunit_menu_assets.h"
+namespace mzgl { void start(); void stop(); }
+#endif
+
 
 #define LOG_REGS         1
 // Setting ALWAYS_LOG_FIFO will always log the fifo versus having to hold 'L'
@@ -74,6 +87,15 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+#ifdef _WIN32
+	// MIDZ_GL=1: spawn the in-process GL renderer thread (see mzgl below)
+	if (std::getenv("MIDZ_GL") && atoi(std::getenv("MIDZ_GL")) != 0)
+	{
+		midz_live = true;
+		mzgl::start();
+	}
+#endif
+
 	/* allocate memory for "wave" RAM */
 	m_waveram = std::make_unique<uint32_t[]>(WAVERAM0_WIDTH * WAVERAM0_HEIGHT * 8/4);
 	s_waveram_base = reinterpret_cast<uint8_t *>(m_waveram.get());
@@ -165,7 +187,7 @@ void zeus2_device::device_reset()
 #endif
 
 // POC scoping (env-gated, inert unset): count quads per frame to size a GL
-// renderer replacement - see cruisn-poc RESULTS.md, Zeus scoping
+// renderer replacement - see cruisn-collection RESULTS.md, Zeus scoping
 static int s_mz_stats = -1;
 static unsigned s_mz_quads = 0, s_mz_frames = 0, s_mz_qmax = 0;
 
@@ -190,6 +212,11 @@ static FILE *s_cap_rec = nullptr;
 static char s_cap_dir[400];
 static uint32_t s_cap_pal[256];
 static bool s_cap_pal_valid = false;
+// set by load_pal_table; checked (cheaply) per quad instead of a 1 KB
+// memcmp per quad, which cost ~1 ms/frame at 6k quads
+static bool s_pal_dirty = true;
+// waveram dirty span since the last screen_hook flush (live renderer)
+static uint32_t s_wave_lo = ~0u, s_wave_hi = 0;
 
 struct midz_quad_rec
 {
@@ -213,17 +240,932 @@ static void midz_dump(const char *dir, const char *name, const void *data, size_
 	}
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// MIDZ_GL: in-process GL renderer for Zeus2 (Cruis'n Exotica) - the live
+// half of the renderer-replacement arc. Mirrors the midvunit_v.cpp
+// overlay: an owned NOACTIVATE popup over MAME's window and a render
+// thread consuming an in-process ring of the SAME records MIDZ_CAPTURE
+// writes (types 1-4) plus waveram dirty spans (5) and per-frame ticks
+// carrying the display base (6). The GPU pipeline is the oracle-verified
+// gpu/zeus_renderer.py port; shaders are generated into
+// zeus2_gl_shaders.h by harness/gen_shaders.py - never hand-edit them.
+// Env: MIDZ_GL=1 enables; MIDZ_GL_SCALE (falls back to MIDV_GL_SCALE),
+// MIDZ_GL_CRT (falls back to MIDV_GL_CRT), MIDZ_GL_SNAP, MIDZ_GL_LOG,
+// MIDV_GL_STATEFILE (crt persist for the launcher).
+#ifdef _WIN32
+namespace mzgl {
+
+#define MZGL_E(n, v) constexpr unsigned n = v;
+MZGL_E(FRAGMENT_SHADER, 0x8B30) MZGL_E(VERTEX_SHADER, 0x8B31)
+MZGL_E(COMPILE_STATUS, 0x8B81) MZGL_E(LINK_STATUS, 0x8B82)
+MZGL_E(ARRAY_BUFFER, 0x8892) MZGL_E(STREAM_DRAW, 0x88E0)
+MZGL_E(FRAMEBUFFER, 0x8D40) MZGL_E(COLOR_ATTACHMENT0, 0x8CE0)
+MZGL_E(DEPTH_ATTACHMENT, 0x8D00)
+MZGL_E(FRAMEBUFFER_COMPLETE, 0x8CD5) MZGL_E(TEXTURE0, 0x84C0)
+MZGL_E(R8UI, 0x8232) MZGL_E(R32UI, 0x8236) MZGL_E(RED_INTEGER, 0x8D94)
+MZGL_E(RGBA8, 0x8058) MZGL_E(RGBA, 0x1908)
+MZGL_E(DEPTH_COMPONENT24, 0x81A6) MZGL_E(DEPTH_COMPONENT, 0x1902)
+MZGL_E(GLDEPTH_TEST, 0x0B71) MZGL_E(GLBLEND, 0x0BE2)
+MZGL_E(GLSCISSOR_TEST, 0x0C11)
+MZGL_E(GLLEQUAL, 0x0203) MZGL_E(GLALWAYS, 0x0207)
+MZGL_E(GLONE, 1) MZGL_E(GLSRC_ALPHA, 0x0302)
+#undef MZGL_E
+
+typedef unsigned uint;
+typedef ptrdiff_t glsizeiptr;
+
+struct GL
+{
+	HMODULE dll = nullptr;
+	HGLRC (WINAPI *CreateContext)(HDC);
+	BOOL (WINAPI *DeleteContext)(HGLRC);
+	BOOL (WINAPI *MakeCurrent)(HDC, HGLRC);
+	PROC (WINAPI *GetProc)(LPCSTR);
+	HGLRC (WINAPI *CreateContextAttribs)(HDC, HGLRC, const int *);
+	BOOL (WINAPI *SwapIntervalEXT)(int);
+	void (WINAPI *Viewport)(int, int, int, int);
+	void (WINAPI *ClearColor)(float, float, float, float);
+	void (WINAPI *ClearDepth)(double);
+	void (WINAPI *Clear)(unsigned);
+	void (WINAPI *GenTextures)(int, uint *);
+	void (WINAPI *BindTexture)(unsigned, uint);
+	void (WINAPI *TexParameteri)(unsigned, unsigned, int);
+	void (WINAPI *TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+	void (WINAPI *TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+	void (WINAPI *PixelStorei)(unsigned, int);
+	void (WINAPI *DrawArrays)(unsigned, int, int);
+	void (WINAPI *Enable)(unsigned);
+	void (WINAPI *Disable)(unsigned);
+	void (WINAPI *Scissor)(int, int, int, int);
+	void (WINAPI *ReadPixels)(int, int, int, int, unsigned, unsigned, void *);
+	unsigned (WINAPI *GetError)();
+	void (WINAPI *DepthFunc)(unsigned);
+	void (WINAPI *DepthMask)(unsigned char);
+	void (WINAPI *ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
+	void (WINAPI *BlendFunc)(unsigned, unsigned);
+	uint (WINAPI *CreateShader)(unsigned);
+	void (WINAPI *ShaderSource)(uint, int, const char *const *, const int *);
+	void (WINAPI *CompileShader)(uint);
+	void (WINAPI *GetShaderiv)(uint, unsigned, int *);
+	void (WINAPI *GetShaderInfoLog)(uint, int, int *, char *);
+	uint (WINAPI *CreateProgram)();
+	void (WINAPI *AttachShader)(uint, uint);
+	void (WINAPI *LinkProgram)(uint);
+	void (WINAPI *GetProgramiv)(uint, unsigned, int *);
+	void (WINAPI *GetProgramInfoLog)(uint, int, int *, char *);
+	void (WINAPI *UseProgram)(uint);
+	int (WINAPI *GetUniformLocation)(uint, const char *);
+	void (WINAPI *Uniform1i)(int, int);
+	void (WINAPI *Uniform1f)(int, float);
+	void (WINAPI *Uniform2f)(int, float, float);
+	void (WINAPI *Uniform4f)(int, float, float, float, float);
+	int (WINAPI *GetAttribLocation)(uint, const char *);
+	void (WINAPI *GenBuffers)(int, uint *);
+	void (WINAPI *BindBuffer)(unsigned, uint);
+	void (WINAPI *BufferData)(unsigned, glsizeiptr, const void *, unsigned);
+	void (WINAPI *GenVertexArrays)(int, uint *);
+	void (WINAPI *BindVertexArray)(uint);
+	void (WINAPI *EnableVertexAttribArray)(uint);
+	void (WINAPI *VertexAttribPointer)(uint, int, unsigned, unsigned char, int, const void *);
+	void (WINAPI *VertexAttribIPointer)(uint, int, unsigned, int, const void *);
+	void (WINAPI *GenFramebuffers)(int, uint *);
+	void (WINAPI *BindFramebuffer)(unsigned, uint);
+	void (WINAPI *FramebufferTexture2D)(unsigned, unsigned, unsigned, uint, int);
+	unsigned (WINAPI *CheckFramebufferStatus)(unsigned);
+	void (WINAPI *ActiveTexture)(unsigned);
+
+	template <typename T> void load1(T &fn, const char *name)
+	{
+		fn = (T)(void *)GetProcAddress(dll, name);
+		if (!fn)
+			fn = (T)(void *)GetProc(name);
+	}
+	bool load_base()
+	{
+		dll = LoadLibraryA("opengl32.dll");
+		if (!dll) return false;
+		CreateContext = (decltype(CreateContext))(void *)GetProcAddress(dll, "wglCreateContext");
+		DeleteContext = (decltype(DeleteContext))(void *)GetProcAddress(dll, "wglDeleteContext");
+		MakeCurrent = (decltype(MakeCurrent))(void *)GetProcAddress(dll, "wglMakeCurrent");
+		GetProc = (decltype(GetProc))(void *)GetProcAddress(dll, "wglGetProcAddress");
+		return CreateContext && MakeCurrent && GetProc;
+	}
+	bool load_rest()
+	{
+#define L(f, n) load1(f, n); if (!(f)) return false;
+		L(Viewport, "glViewport") L(ClearColor, "glClearColor")
+		L(ClearDepth, "glClearDepth") L(Clear, "glClear")
+		L(GenTextures, "glGenTextures") L(BindTexture, "glBindTexture")
+		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
+		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
+		L(DrawArrays, "glDrawArrays") L(Enable, "glEnable")
+		L(Disable, "glDisable") L(Scissor, "glScissor")
+		L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
+		L(DepthFunc, "glDepthFunc") L(DepthMask, "glDepthMask")
+		L(ColorMask, "glColorMask") L(BlendFunc, "glBlendFunc")
+		L(CreateShader, "glCreateShader") L(ShaderSource, "glShaderSource")
+		L(CompileShader, "glCompileShader") L(GetShaderiv, "glGetShaderiv")
+		L(GetShaderInfoLog, "glGetShaderInfoLog") L(CreateProgram, "glCreateProgram")
+		L(AttachShader, "glAttachShader") L(LinkProgram, "glLinkProgram")
+		L(GetProgramiv, "glGetProgramiv") L(GetProgramInfoLog, "glGetProgramInfoLog")
+		L(UseProgram, "glUseProgram") L(GetUniformLocation, "glGetUniformLocation")
+		L(Uniform1i, "glUniform1i") L(Uniform1f, "glUniform1f")
+		L(Uniform2f, "glUniform2f") L(Uniform4f, "glUniform4f")
+		L(GetAttribLocation, "glGetAttribLocation") L(GenBuffers, "glGenBuffers")
+		L(BindBuffer, "glBindBuffer") L(BufferData, "glBufferData")
+		L(GenVertexArrays, "glGenVertexArrays") L(BindVertexArray, "glBindVertexArray")
+		L(EnableVertexAttribArray, "glEnableVertexAttribArray")
+		L(VertexAttribPointer, "glVertexAttribPointer")
+		L(VertexAttribIPointer, "glVertexAttribIPointer")
+		L(GenFramebuffers, "glGenFramebuffers") L(BindFramebuffer, "glBindFramebuffer")
+		L(FramebufferTexture2D, "glFramebufferTexture2D")
+		L(CheckFramebufferStatus, "glCheckFramebufferStatus")
+		L(ActiveTexture, "glActiveTexture")
+#undef L
+		load1(CreateContextAttribs, "wglCreateContextAttribsARB");
+		load1(SwapIntervalEXT, "wglSwapIntervalEXT");
+		return true;
+	}
+};
+
+// ---- in-process ring (single producer: emu thread; single consumer) ----
+constexpr size_t RING = 64u << 20;
+static uint8_t *s_ringbuf = nullptr;
+static std::atomic<uint64_t> s_rw{0}, s_rr{0};
+static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
+static std::atomic<int> s_zpause{0};
+static std::thread s_thread;
+
+static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
+		const void *p2, uint32_t n2)
+{
+	if (!s_on.load(std::memory_order_relaxed))
+		return;
+	uint32_t const bytes = n1 + n2;
+	uint64_t w = s_rw.load(std::memory_order_relaxed);
+	uint64_t const r = s_rr.load(std::memory_order_acquire);
+	uint64_t const need = 8 + ((uint64_t(bytes) + 7) & ~7ull);
+	if (w - r + need > RING)
+		return;   // full: drop (the overlay just misses a beat)
+	auto put = [&](const void *src, uint32_t n)
+	{
+		uint32_t const o = uint32_t(w % RING);
+		uint32_t const first = std::min(n, uint32_t(RING - o));
+		memcpy(s_ringbuf + o, src, first);
+		if (n > first)
+			memcpy(s_ringbuf, (const uint8_t *)src + first, n - first);
+		w += n;
+	};
+	uint32_t hdr[2] = { type, bytes };
+	put(hdr, 8);
+	if (n1) put(p1, n1);
+	if (n2) put(p2, n2);
+	w = (w + 7) & ~7ull;
+	s_rw.store(w, std::memory_order_release);
+}
+
+static FILE *s_zlog;
+static void zlogf(const char *fmt, ...)
+{
+	if (!s_zlog) return;
+	va_list ap; va_start(ap, fmt);
+	vfprintf(s_zlog, fmt, ap);
+	fprintf(s_zlog, "\n");
+	fflush(s_zlog);
+	va_end(ap);
+}
+
+static HWND find_mame_window()
+{
+	struct Ctx { DWORD pid; HWND found; } ctx{ GetCurrentProcessId(), nullptr };
+	EnumWindows([](HWND h, LPARAM lp) -> BOOL
+	{
+		Ctx &c = *(Ctx *)lp;
+		DWORD pid = 0;
+		GetWindowThreadProcessId(h, &pid);
+		if (pid != c.pid || !IsWindowVisible(h)) return TRUE;
+		char cls[64] = {};
+		GetClassNameA(h, cls, 63);
+		if (strcmp(cls, "MAME") == 0) { c.found = h; return FALSE; }
+		return TRUE;
+	}, (LPARAM)&ctx);
+	return ctx.found;
+}
+
+static uint zcompile(GL &gl, unsigned type, const char *src)
+{
+	uint sh = gl.CreateShader(type);
+	gl.ShaderSource(sh, 1, &src, nullptr);
+	gl.CompileShader(sh);
+	int ok = 0;
+	gl.GetShaderiv(sh, COMPILE_STATUS, &ok);
+	if (!ok)
+	{
+		char buf[4096]; int n = 0;
+		gl.GetShaderInfoLog(sh, 4095, &n, buf);
+		zlogf("shader compile failed:\n%.*s", n, buf);
+		return 0;
+	}
+	return sh;
+}
+
+static uint zlink(GL &gl, const char *vs, const char *fs)
+{
+	uint p = gl.CreateProgram();
+	uint v = zcompile(gl, VERTEX_SHADER, vs);
+	uint f = zcompile(gl, FRAGMENT_SHADER, fs);
+	if (!v || !f) return 0;
+	gl.AttachShader(p, v);
+	gl.AttachShader(p, f);
+	gl.LinkProgram(p);
+	int ok = 0;
+	gl.GetProgramiv(p, LINK_STATUS, &ok);
+	if (!ok)
+	{
+		char buf[4096]; int n = 0;
+		gl.GetProgramInfoLog(p, 4095, &n, buf);
+		zlogf("link failed:\n%.*s", n, buf);
+		return 0;
+	}
+	return p;
+}
+
+void thread_main();   // defined after the record structs it consumes
+
+}   // namespace mzgl
+#endif   // _WIN32
+
 static void midz_rec(uint32_t type, const void *payload, uint32_t bytes)
 {
-	if (!s_cap_rec)
-		return;
-	fwrite(&type, 4, 1, s_cap_rec);
-	fwrite(&bytes, 4, 1, s_cap_rec);
-	fwrite(payload, 1, bytes, s_cap_rec);
+	if (s_cap_rec)
+	{
+		fwrite(&type, 4, 1, s_cap_rec);
+		fwrite(&bytes, 4, 1, s_cap_rec);
+		fwrite(payload, 1, bytes, s_cap_rec);
+	}
+#ifdef _WIN32
+	mzgl::ring_push2(type, payload, bytes, nullptr, 0);
+#endif
 }
+
+#ifdef _WIN32
+namespace mzgl {
+
+void thread_main()
+{
+	struct DoneGuard { ~DoneGuard() { s_donez.store(true); } } done_guard;
+	if (std::getenv("MIDZ_GL_LOG"))
+		s_zlog = fopen("midz_gl.log", "w");
+	auto envi = [](const char *a, const char *b, int dflt) -> int
+	{
+		if (const char *v = std::getenv(a)) return atoi(v);
+		if (b) if (const char *v = std::getenv(b)) return atoi(v);
+		return dflt;
+	};
+	int const S = std::max(1, std::min(4, envi("MIDZ_GL_SCALE", "MIDV_GL_SCALE", 3)));
+	bool crt = envi("MIDZ_GL_CRT", "MIDV_GL_CRT", 0) != 0;
+	const char *snapdir = std::getenv("MIDZ_GL_SNAP");
+	// crusnexo touches FB rows 0..800 (pages at 0 and 400); 1024 rows
+	// halve texture memory/traffic vs the full 2048-row address space, and
+	// the masks below wrap the (never-observed) high addresses harmlessly
+	constexpr int CW = 512, CH = 1024, DISPH = 400;
+	int const fw = CW * S, fh = CH * S;
+
+	HWND parent = nullptr;
+	for (int i = 0; i < 100 && !parent; i++) { Sleep(100); parent = find_mame_window(); }
+	if (!parent) { zlogf("no MAME window found"); return; }
+
+	// owned top-level popup, NOT a child (see midvunit_v.cpp for the war
+	// stories: gdi caches its window DC; never activate the overlay)
+	WNDCLASSA wc = {};
+	wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT
+	{
+		switch (msg)
+		{
+		case WM_SETCURSOR:
+			SetCursor(nullptr);
+			return TRUE;
+		case WM_LBUTTONDOWN:
+		case WM_RBUTTONDOWN:
+		case WM_MBUTTONDOWN:
+			SetForegroundWindow(GetWindow(hwnd, GW_OWNER));
+			return 0;
+		}
+		return DefWindowProcA(hwnd, msg, wp, lp);
+	};
+	wc.hInstance = GetModuleHandleA(nullptr);
+	wc.lpszClassName = "MidzGLOverlay";
+	RegisterClassA(&wc);
+	// the overlay covers the MONITOR, not MAME's window: MAME's gdi window
+	// stays small (its software stretch to 4K cost ~3% emulation speed),
+	// it just holds keyboard focus and DirectInput foreground under us
+	auto monitor_rect = [&]() -> RECT
+	{
+		MONITORINFO mi{};
+		mi.cbSize = sizeof(mi);
+		GetMonitorInfoA(MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST), &mi);
+		return mi.rcMonitor;
+	};
+	RECT rc = monitor_rect();
+	HWND child = CreateWindowExA(
+		WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+		"MidzGLOverlay", "", WS_POPUP | WS_VISIBLE,
+		rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+		parent, nullptr, wc.hInstance, nullptr);
+	if (!child) { zlogf("overlay window failed"); return; }
+
+	HDC dc = GetDC(child);
+	PIXELFORMATDESCRIPTOR pfd = {};
+	pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
+	pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+	pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
+	SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd);
+	GL gl;
+	if (!gl.load_base()) { zlogf("opengl32 load failed"); return; }
+	HGLRC legacy = gl.CreateContext(dc);
+	gl.MakeCurrent(dc, legacy);
+	if (!gl.load_rest()) { zlogf("GL function resolution failed"); return; }
+	if (gl.CreateContextAttribs)
+	{
+		const int attrs[] = { 0x2091, 4, 0x2092, 3, 0x9126, 1, 0 };
+		HGLRC core = gl.CreateContextAttribs(dc, nullptr, attrs);
+		if (core)
+		{
+			gl.MakeCurrent(dc, core);
+			gl.DeleteContext(legacy);
+			gl.load_rest();
+		}
+	}
+	// perf attribution (2026-08-22): d3d-no-overlay 100.00%, gdi-no-overlay
+	// 99.48%, gdi+overlay ~97.5% - the ~2% overlay cost is independent of
+	// scale (1..4), vsync, FB size and the emit path; needs an ETW/GPUView
+	// session to pin down. MIDZ_GL_VSYNC=0 runs the overlay unthrottled.
+	bool const vsync = envi("MIDZ_GL_VSYNC", nullptr, 1) != 0;
+	if (gl.SwapIntervalEXT) gl.SwapIntervalEXT(vsync ? 1 : 0);
+
+	uint prog = zlink(gl, MZGL_VS, MZGL_FS);
+	uint present = zlink(gl, MZGL_PRESENT_VS, MZGL_PRESENT_FS);
+	uint menuprog = zlink(gl, MZGL_MENU_VS, MZGL_MENU_FS);
+	if (!prog || !present) return;
+
+	gl.PixelStorei(0x0CF5 /*UNPACK_ALIGNMENT*/, 1);
+	auto make_tex = [&](int w, int h, unsigned ifmt, unsigned fmt, unsigned type) -> uint
+	{
+		uint t; gl.GenTextures(1, &t);
+		gl.BindTexture(0x0DE1, t);
+		gl.TexParameteri(0x0DE1, 0x2801, 0x2600);   // MIN NEAREST
+		gl.TexParameteri(0x0DE1, 0x2800, 0x2600);   // MAG NEAREST
+		gl.TexParameteri(0x0DE1, 0x2802, 0x812F);
+		gl.TexParameteri(0x0DE1, 0x2803, 0x812F);
+		gl.TexImage2D(0x0DE1, 0, int(ifmt), w, h, 0, fmt, type, nullptr);
+		return t;
+	};
+	uint waveTex = make_tex(4096, 4096, R8UI, RED_INTEGER, 0x1401);
+	uint palTex = make_tex(256, 256, R32UI, RED_INTEGER, 0x1405);
+	uint fbTex = make_tex(fw, fh, RGBA8, RGBA, 0x1401);
+	uint depthTex = make_tex(fw, fh, DEPTH_COMPONENT24, DEPTH_COMPONENT, 0x1405);
+	uint fbo;
+	gl.GenFramebuffers(1, &fbo);
+	gl.BindFramebuffer(FRAMEBUFFER, fbo);
+	gl.FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0, 0x0DE1, fbTex, 0);
+	gl.FramebufferTexture2D(FRAMEBUFFER, DEPTH_ATTACHMENT, 0x0DE1, depthTex, 0);
+	if (gl.CheckFramebufferStatus(FRAMEBUFFER) != FRAMEBUFFER_COMPLETE)
+		zlogf("fbo incomplete");
+	gl.Viewport(0, 0, fw, fh);
+	gl.ClearColor(0, 0, 0, 1);
+	gl.ClearDepth(1.0);
+	gl.Clear(0x4100);   // COLOR | DEPTH
+	gl.BindFramebuffer(FRAMEBUFFER, 0);
+
+	uint vao, vbo_f, vbo_u, vao_empty;
+	gl.GenVertexArrays(1, &vao);
+	gl.GenVertexArrays(1, &vao_empty);
+	gl.GenBuffers(1, &vbo_f);
+	gl.GenBuffers(1, &vbo_u);
+	gl.BindVertexArray(vao);
+	gl.BindBuffer(ARRAY_BUFFER, vbo_f);
+	{
+		const char *fattr[] = { "in_pos", "in_rowbase", "in_p" };
+		int const fsize[] = { 2, 1, 4 };
+		int off = 0;
+		for (int i = 0; i < 3; i++)
+		{
+			int loc = gl.GetAttribLocation(prog, fattr[i]);
+			if (loc >= 0)
+			{
+				gl.EnableVertexAttribArray(loc);
+				gl.VertexAttribPointer(loc, fsize[i], 0x1406, 0, 7 * 4,
+					(const void *)(uintptr_t)(off * 4));
+			}
+			off += fsize[i];
+		}
+	}
+	gl.BindBuffer(ARRAY_BUFFER, vbo_u);
+	{
+		const char *uattr[] = { "in_meta0", "in_meta1", "in_meta2" };
+		int const usize[] = { 4, 4, 2 };
+		int off = 0;
+		for (int i = 0; i < 3; i++)
+		{
+			int loc = gl.GetAttribLocation(prog, uattr[i]);
+			if (loc >= 0)
+			{
+				gl.EnableVertexAttribArray(loc);
+				gl.VertexAttribIPointer(loc, usize[i], 0x1405, 10 * 4,
+					(const void *)(uintptr_t)(off * 4));
+			}
+			off += usize[i];
+		}
+	}
+	gl.UseProgram(prog);
+	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(CW), float(CH));
+	gl.Uniform1i(gl.GetUniformLocation(prog, "waveram"), 0);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "palTex"), 1);
+	gl.UseProgram(present);
+	gl.Uniform1i(gl.GetUniformLocation(present, "fbTex"), 3);
+	gl.Uniform1i(gl.GetUniformLocation(present, "uScale"), S);
+	gl.Uniform1f(gl.GetUniformLocation(present, "uSrcH"), float(DISPH));
+	int const uBaseRow = gl.GetUniformLocation(present, "uBaseRow");
+	int const uCrt = gl.GetUniformLocation(present, "uCrt");
+
+	// menu (labels shared with the V-Unit overlay)
+	struct Label { uint tex; int w, h; };
+	auto make_label = [&](const unsigned char *px, int w, int h) -> Label
+	{
+		uint t;
+		gl.GenTextures(1, &t);
+		gl.BindTexture(0x0DE1, t);
+		gl.TexParameteri(0x0DE1, 0x2801, 0x2601);
+		gl.TexParameteri(0x0DE1, 0x2800, 0x2601);
+		gl.TexParameteri(0x0DE1, 0x2802, 0x812F);
+		gl.TexParameteri(0x0DE1, 0x2803, 0x812F);
+		gl.TexImage2D(0x0DE1, 0, 0x8229 /*R8*/, w, h, 0, 0x1903, 0x1401, px);
+		return Label{ t, w, h };
+	};
+	Label lb_title = make_label(MVMENU_TITLE, MVMENU_TITLE_W, MVMENU_TITLE_H);
+	Label lb_resume = make_label(MVMENU_RESUME, MVMENU_RESUME_W, MVMENU_RESUME_H);
+	Label lb_crt_on = make_label(MVMENU_CRT_ON, MVMENU_CRT_ON_W, MVMENU_CRT_ON_H);
+	Label lb_crt_off = make_label(MVMENU_CRT_OFF, MVMENU_CRT_OFF_W, MVMENU_CRT_OFF_H);
+	Label lb_exit = make_label(MVMENU_EXIT, MVMENU_EXIT_W, MVMENU_EXIT_H);
+	Label lb_hint = make_label(MVMENU_HINT, MVMENU_HINT_W, MVMENU_HINT_H);
+	int const mRect = gl.GetUniformLocation(menuprog, "uRect");
+	int const mScreen = gl.GetUniformLocation(menuprog, "uScreen");
+	int const mColor = gl.GetUniformLocation(menuprog, "uColor");
+	int const mSolid = gl.GetUniformLocation(menuprog, "uSolid");
+	gl.UseProgram(menuprog);
+	gl.Uniform1i(gl.GetUniformLocation(menuprog, "uTex"), 0);
+	bool menu_open = false;
+	int menu_sel = 0;
+	bool f9_prev = false, esc_prev = false, up_prev = false,
+		down_prev = false, ret_prev = false;
+
+	// ---- streaming batch state (port of gpu/zeus_renderer.py) ----
+	std::vector<float> fdata;
+	std::vector<uint32_t> udata;
+	struct Batch
+	{
+		int first, count;
+		bool blend, dtest, dwrite, cmask;
+		int rowbase, clip[4];
+	};
+	std::vector<Batch> batches;
+	static uint8_t *wave_mirror = (uint8_t *)calloc(1, 16u << 20);
+	uint32_t pal_slot = 0;
+	uint32_t zb38 = 0x1900000;
+	uint64_t presents = 0, n_quads = 0;
+	int snap_n = 0;
+
+	auto vert = [&](float x, float y, float rowbase, const float *p,
+			const uint32_t *meta)
+	{
+		fdata.insert(fdata.end(), { x, y, rowbase, p[0], p[1], p[2], p[3] });
+		udata.insert(udata.end(), meta, meta + 10);
+	};
+	auto want_batch = [&](bool blend, bool dtest, bool dwrite, bool cmask,
+			int rowbase, const int32_t *clip)
+	{
+		int const nv = int(fdata.size() / 7);
+		if (!batches.empty())
+		{
+			Batch &b = batches.back();
+			if (b.blend == blend && b.dtest == dtest && b.dwrite == dwrite
+				&& b.cmask == cmask && b.rowbase == rowbase
+				&& b.clip[0] == clip[0] && b.clip[1] == clip[1]
+				&& b.clip[2] == clip[2] && b.clip[3] == clip[3])
+				return;
+			b.count = nv - b.first;
+		}
+		batches.push_back({ nv, 0, blend, dtest, dwrite, cmask, rowbase,
+			{ int(clip[0]), int(clip[1]), int(clip[2]), int(clip[3]) } });
+	};
+	auto flush = [&]()
+	{
+		if (fdata.empty()) { batches.clear(); return; }
+		if (!batches.empty())
+			batches.back().count = int(fdata.size() / 7) - batches.back().first;
+		gl.UseProgram(prog);
+		gl.BindVertexArray(vao);
+		gl.BindBuffer(ARRAY_BUFFER, vbo_f);
+		gl.BufferData(ARRAY_BUFFER, fdata.size() * 4, fdata.data(), STREAM_DRAW);
+		gl.BindBuffer(ARRAY_BUFFER, vbo_u);
+		gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
+		gl.BindFramebuffer(FRAMEBUFFER, fbo);
+		gl.Viewport(0, 0, fw, fh);
+		gl.Enable(GLDEPTH_TEST);
+		gl.Enable(GLSCISSOR_TEST);
+		gl.BlendFunc(GLONE, GLSRC_ALPHA);
+		gl.ActiveTexture(TEXTURE0);
+		gl.BindTexture(0x0DE1, waveTex);
+		gl.ActiveTexture(TEXTURE0 + 1);
+		gl.BindTexture(0x0DE1, palTex);
+		for (Batch const &b : batches)
+		{
+			if (!b.count) continue;
+			if (b.blend) gl.Enable(GLBLEND); else gl.Disable(GLBLEND);
+			gl.DepthFunc(b.dtest ? GLLEQUAL : GLALWAYS);
+			gl.DepthMask(b.dwrite ? 1 : 0);
+			gl.ColorMask(b.cmask, b.cmask, b.cmask, b.cmask);
+			gl.Scissor(b.clip[0] * S, (b.rowbase + b.clip[1]) * S,
+				(b.clip[2] - b.clip[0] + 1) * S,
+				(b.clip[3] - b.clip[1] + 1) * S);
+			gl.DrawArrays(0x0004, b.first, b.count);
+		}
+		gl.Disable(GLBLEND);
+		gl.Disable(GLSCISSOR_TEST);
+		gl.DepthMask(1);
+		gl.ColorMask(1, 1, 1, 1);
+		gl.BindFramebuffer(FRAMEBUFFER, 0);
+		fdata.clear();
+		udata.clear();
+		batches.clear();
+	};
+	auto add_quad = [&](const midz_quad_rec &r)
+	{
+		++n_quads;
+		bool const blend = (r.flags & 2) != 0;
+		bool const dtest = (r.flags & 8) != 0;
+		bool const dwrite = ((r.flags & 16) != 0) && !(r.flags & 128);
+		want_batch(blend, dtest, dwrite, true, int(r.rr04), r.clip);
+		uint32_t const meta[10] = { r.flags, (r.tex_src * 8) & 0xFFFFFF,
+			r.texwidth, r.texdata & 0xffff, r.transcolor, r.solidcolor,
+			pal_slot, r.srcAlpha, r.dstAlpha, uint32_t(r.zbuf_min) };
+		float const rb = float(r.rr04);
+		for (uint32_t i = 2; i < r.numverts && i < 8; i++)
+			for (uint32_t vi : { 0u, i - 1, i })
+			{
+				const float *v = r.verts[vi];
+				float const p[4] = { v[2], v[3], v[4], v[5] };
+				vert(v[0], v[1], rb, p, meta);
+			}
+	};
+	// raw fills (fast clears / frame writes) go through the same pipeline
+	// as FLAG_RAW rectangles so ordering with quads is exact
+	int32_t const fullclip[4] = { 0, 0, CW - 1, CH - 1 };
+	auto add_rect = [&](int x0, int y0, int x1, int y1, uint32_t rgb24,
+			int32_t depth, bool dwrite, bool cmask)
+	{
+		want_batch(false, false, dwrite, cmask, 0, fullclip);
+		uint32_t const meta[10] = { 256u | (dwrite ? 16u : 0u), 0, 0, 0, 0,
+			rgb24, 0, 0, 0, 0 };
+		float const p[4] = { float(depth), 0.0f, 0.0f, 1.0f };
+		float const fx0 = float(x0), fy0 = float(y0);
+		float const fx1 = float(x1), fy1 = float(y1);
+		float const cs[6][2] = { { fx0, fy0 }, { fx1, fy0 }, { fx1, fy1 },
+			{ fx0, fy0 }, { fx1, fy1 }, { fx0, fy1 } };
+		for (auto const &c : cs)
+			vert(c[0], c[1], 0.0f, p, meta);
+	};
+	auto add_span = [&](uint32_t addr, uint32_t n, uint32_t rgb24,
+			int32_t depth, bool dwrite, bool cmask)
+	{
+		while (n)
+		{
+			uint32_t const row = addr / CW, x = addr % CW;
+			uint32_t const take = std::min(n, CW - x);
+			add_rect(int(x), int(row), int(x + take), int(row + 1),
+				rgb24, depth, dwrite, cmask);
+			addr = (addr + take) & (CW * CH - 1);
+			n -= take;
+		}
+	};
+
+	std::vector<uint8_t> rec;
+	zlogf("MZGL up: scale %d fb %dx%d crt=%d", S, fw, fh, int(crt));
+
+	while (IsWindow(parent) && !s_stopz.load())
+	{
+		MSG msg;
+		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+
+		bool const f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+		if (f9 && !f9_prev)
+			crt = !crt;
+		f9_prev = f9;
+		{
+			bool const fg = (GetForegroundWindow() == parent);
+			auto edge = [&](int vk, bool &prev) -> bool
+			{
+				bool const down = fg && (GetAsyncKeyState(vk) & 0x8000) != 0;
+				bool const e = down && !prev;
+				prev = down;
+				return e;
+			};
+			if (edge(VK_ESCAPE, esc_prev) && menuprog)
+				menu_open = !menu_open;
+			bool const up = edge(VK_UP, up_prev);
+			bool const dn = edge(VK_DOWN, down_prev);
+			bool const ok = edge(VK_RETURN, ret_prev);
+			if (menu_open)
+			{
+				if (up) menu_sel = (menu_sel + 2) % 3;
+				if (dn) menu_sel = (menu_sel + 1) % 3;
+				if (ok)
+				{
+					if (menu_sel == 0)
+						menu_open = false;
+					else if (menu_sel == 1)
+						crt = !crt;
+					else
+					{
+						PostMessageA(parent, WM_CLOSE, 0, 0);
+						menu_open = false;
+					}
+				}
+			}
+			s_zpause.store(menu_open ? 1 : 0);
+		}
+		rc = monitor_rect();
+		RECT crc; GetWindowRect(child, &crc);
+		if (IsIconic(parent))
+			ShowWindow(child, SW_HIDE);
+		else
+		{
+			if (!IsWindowVisible(child))
+				ShowWindow(child, SW_SHOWNA);
+			if (crc.left != rc.left || crc.top != rc.top ||
+				crc.right != rc.right || crc.bottom != rc.bottom)
+				SetWindowPos(child, nullptr, rc.left, rc.top,
+					rc.right - rc.left, rc.bottom - rc.top,
+					SWP_NOACTIVATE | SWP_NOZORDER);
+		}
+
+		// ---- drain the ring ----
+		uint64_t w = s_rw.load(std::memory_order_acquire);
+		uint64_t r = s_rr.load(std::memory_order_relaxed);
+		auto ring_get = [&](void *dst, uint32_t n)
+		{
+			uint32_t const o = uint32_t(r % RING);
+			uint32_t const first = std::min(n, uint32_t(RING - o));
+			memcpy(dst, s_ringbuf + o, first);
+			if (n > first) memcpy((uint8_t *)dst + first, s_ringbuf, n - first);
+			r += n;
+		};
+		while (r < w)
+		{
+			uint32_t hdr[2];
+			ring_get(hdr, 8);
+			rec.resize(hdr[1]);
+			if (hdr[1]) ring_get(rec.data(), hdr[1]);
+			r = (r + 7) & ~7ull;
+			switch (hdr[0])
+			{
+			case 1:
+				if (rec.size() >= sizeof(midz_quad_rec))
+					add_quad(*(const midz_quad_rec *)rec.data());
+				break;
+			case 2:
+			{
+				pal_slot = (pal_slot + 1) & 255;
+				gl.ActiveTexture(TEXTURE0 + 1);
+				gl.BindTexture(0x0DE1, palTex);
+				gl.TexSubImage2D(0x0DE1, 0, 0, int(pal_slot), 256, 1,
+					RED_INTEGER, 0x1405, rec.data());
+				break;
+			}
+			case 3:
+			{
+				uint32_t const *p = (const uint32_t *)rec.data();
+				add_span(p[0] & (CW * CH - 1), std::min(p[1], uint32_t(CW * CH)),
+					p[2] & 0xffffff, int32_t(p[3]), true, true);
+				break;
+			}
+			case 4:
+			{
+				uint32_t const *p = (const uint32_t *)rec.data();
+				uint32_t const addr = p[0] & (CW * CH - 1);
+				uint32_t const r57 = p[1], r58 = p[2], r59 = p[3],
+					r5a = p[4], r5e = p[5];
+				if (r57 & 0x1)
+					add_span(addr, 1, r58 & 0xffffff, 0, false, true);
+				if (r5e & 0x20)
+				{
+					if (r57 & 0x4)
+						add_span(addr + 1, 1, r5a & 0xffffff, 0, false, true);
+				}
+				else
+				{
+					if (r57 & 0x4)
+						add_span(addr + 1, 1, r59 & 0xffffff, 0, false, true);
+					if (r57 & 0x10)
+						add_span(addr, 1, 0, int32_t(r5a), true, false);
+				}
+				break;
+			}
+			case 5:
+			{
+				// waveram dirty span: draw everything queued first - those
+				// quads must sample the texture as it was
+				flush();
+				uint32_t const *p = (const uint32_t *)rec.data();
+				uint32_t const off = p[0], len = p[1];
+				if (off + len <= (16u << 20) && rec.size() >= 8 + len)
+				{
+					memcpy(wave_mirror + off, rec.data() + 8, len);
+					int const row0 = int(off / 4096), row1 = int((off + len - 1) / 4096);
+					gl.ActiveTexture(TEXTURE0);
+					gl.BindTexture(0x0DE1, waveTex);
+					gl.TexSubImage2D(0x0DE1, 0, 0, row0, 4096, row1 - row0 + 1,
+						RED_INTEGER, 0x1401, wave_mirror + size_t(row0) * 4096);
+				}
+				break;
+			}
+			case 6:
+				zb38 = ((const uint32_t *)rec.data())[0];
+				break;
+			}
+		}
+		s_rr.store(r, std::memory_order_release);
+		flush();
+
+		// ---- present (letterboxed 4:3) ----
+		int const cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+		gl.BindFramebuffer(FRAMEBUFFER, 0);
+		gl.Disable(GLDEPTH_TEST);
+		gl.Disable(GLSCISSOR_TEST);
+		gl.Viewport(0, 0, cw, ch);
+		gl.ClearColor(0, 0, 0, 1);
+		gl.Clear(0x4000);
+		float const aspect = 4.0f / 3.0f;
+		int vw = cw, vh = int(cw / aspect + 0.5f);
+		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
+		gl.UseProgram(present);
+		gl.Uniform1i(uBaseRow, int((zb38 >> 16) & (CH - 1)));
+		gl.Uniform1i(uCrt, crt ? 1 : 0);
+		gl.ActiveTexture(TEXTURE0 + 3);
+		gl.BindTexture(0x0DE1, fbTex);
+		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
+		gl.BindVertexArray(vao_empty);
+		gl.DrawArrays(0x0004, 0, 3);
+
+		if (menu_open)
+		{
+			gl.Viewport(0, 0, cw, ch);
+			gl.Enable(0x0BE2);
+			gl.BlendFunc(0x0302, 0x0303);
+			gl.UseProgram(menuprog);
+			gl.Uniform2f(mScreen, float(cw), float(ch));
+			auto mrect = [&](Label const *L, float x, float y, float w2, float h2,
+					float r2, float g2, float b2, float a2)
+			{
+				gl.Uniform4f(mRect, x, y, w2, h2);
+				gl.Uniform4f(mColor, r2, g2, b2, a2);
+				gl.Uniform1i(mSolid, L ? 0 : 1);
+				if (L)
+				{
+					gl.ActiveTexture(TEXTURE0);
+					gl.BindTexture(0x0DE1, L->tex);
+				}
+				gl.DrawArrays(0x0005, 0, 4);
+			};
+			auto mlabel = [&](Label const &L, float cy, float px,
+					float r2, float g2, float b2)
+			{
+				float const h2 = px, w2 = L.w * px / L.h;
+				mrect(&L, (cw - w2) / 2.0f, cy, w2, h2, r2, g2, b2, 1.0f);
+			};
+			float const sc = ch / 1080.0f;
+			mrect(nullptr, 0, 0, float(cw), float(ch), 0, 0, 0, 0.55f);
+			mlabel(lb_title, ch * 0.24f, 72 * sc, 1.0f, 0.72f, 0.20f);
+			Label const *items[3] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_exit };
+			for (int i = 0; i < 3; i++)
+			{
+				bool const sel = (i == menu_sel);
+				mlabel(*items[i], ch * (0.42f + 0.10f * i), 44 * sc,
+					sel ? 1.0f : 0.85f, sel ? 0.72f : 0.85f, sel ? 0.20f : 0.90f);
+			}
+			mlabel(lb_hint, ch * 0.86f, 22 * sc, 0.75f, 0.75f, 0.80f);
+			gl.Disable(0x0BE2);
+		}
+
+		++presents;
+		if (snapdir && (presents % 150) == 0)
+		{
+			std::vector<uint8_t> px(size_t(cw) * ch * 3);
+			gl.ReadPixels(0, 0, cw, ch, 0x80E0, 0x1401, px.data());
+			char path[512];
+			snprintf(path, sizeof(path), "%s\\mzgl_%03d.bmp", snapdir, snap_n++);
+			FILE *f = fopen(path, "wb");
+			if (f)
+			{
+				int const rowsz = (cw * 3 + 3) & ~3;
+				uint32_t const img = rowsz * ch;
+				uint8_t bh[54] = { 'B', 'M' };
+				*(uint32_t *)(bh + 2) = 54 + img;
+				*(uint32_t *)(bh + 10) = 54;
+				*(uint32_t *)(bh + 14) = 40;
+				*(int32_t *)(bh + 18) = cw;
+				*(int32_t *)(bh + 22) = ch;
+				*(uint16_t *)(bh + 26) = 1;
+				*(uint16_t *)(bh + 28) = 24;
+				*(uint32_t *)(bh + 34) = img;
+				fwrite(bh, 1, 54, f);
+				std::vector<uint8_t> rowbuf(rowsz, 0);
+				for (int y = 0; y < ch; y++)
+				{
+					memcpy(rowbuf.data(), &px[size_t(y) * cw * 3], cw * 3);
+					fwrite(rowbuf.data(), 1, rowsz, f);
+				}
+				fclose(f);
+			}
+		}
+		SwapBuffers(dc);
+		if (!vsync)
+			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
+	}
+
+	if (char const *sf = std::getenv("MIDV_GL_STATEFILE"))
+	{
+		FILE *f = fopen(sf, "w");
+		if (f)
+		{
+			fprintf(f, "crt=%d\n", crt ? 1 : 0);
+			fclose(f);
+		}
+	}
+	s_zpause.store(0);
+	zlogf("exit after %llu presents, %llu quads",
+		(unsigned long long)presents, (unsigned long long)n_quads);
+	gl.MakeCurrent(nullptr, nullptr);
+	ReleaseDC(child, dc);
+	DestroyWindow(child);
+}
+
+void start()
+{
+	if (s_on.load())
+		return;
+	if (!s_ringbuf)
+		s_ringbuf = (uint8_t *)malloc(RING);
+	if (!s_ringbuf)
+		return;
+	s_stopz.store(false);
+	s_donez.store(false);
+	s_on.store(true);
+	s_thread = std::thread(thread_main);
+}
+
+void stop()
+{
+	if (!s_on.load())
+		return;
+	s_stopz.store(true);
+	if (s_thread.joinable())
+		s_thread.join();
+	s_on.store(false);
+}
+
+}   // namespace mzgl
+#endif   // _WIN32
 
 void zeus2_device::midz_screen_hook()
 {
+#ifdef _WIN32
+	if (midz_live)
+	{
+		// Esc-menu pause sync for the live overlay (emu thread; act only
+		// on transitions so a manual pause is never fought)
+		static int s_zprev = 0;
+		int const req = mzgl::s_zpause.load();
+		if (req != s_zprev)
+		{
+			s_zprev = req;
+			if (req && !machine().paused())
+				machine().pause();
+			else if (!req && machine().paused())
+				machine().resume();
+		}
+		// flush the waveram dirty span, then the per-frame display tick
+		if (s_wave_hi > s_wave_lo)
+		{
+			uint32_t hdr2[2] = { s_wave_lo, s_wave_hi - s_wave_lo };
+			mzgl::ring_push2(5, hdr2, 8,
+				(const uint8_t *)m_waveram.get() + s_wave_lo, hdr2[1]);
+			s_wave_lo = ~0u;
+			s_wave_hi = 0;
+		}
+		mzgl::ring_push2(6, &m_zeusbase[0x38], 4, nullptr, 0);
+	}
+#endif
 	if (s_cap_state == -2)
 	{
 		const char *dir = std::getenv("MIDZ_CAPTURE");
@@ -295,13 +1237,15 @@ void zeus2_device::midz_screen_hook()
 void zeus2_device::midz_cap_quad(int numverts, const void *verts,
 		const zeus2_poly_extra_data &extra, uint32_t texdata)
 {
-	if (!midz_cap || !s_cap_rec)
+	if (!(midz_cap && s_cap_rec) && !midz_live)
 		return;
-	++s_cap_recq;
-	if (!s_cap_pal_valid || memcmp(s_cap_pal, m_pal_table, sizeof(s_cap_pal)) != 0)
+	if (midz_cap)
+		++s_cap_recq;
+	if (s_pal_dirty || !s_cap_pal_valid)
 	{
 		memcpy(s_cap_pal, m_pal_table, sizeof(s_cap_pal));
 		s_cap_pal_valid = true;
+		s_pal_dirty = false;
 		midz_rec(2, s_cap_pal, sizeof(s_cap_pal));
 	}
 	auto const *v = reinterpret_cast<const z2_poly_vertex *>(verts);
@@ -338,7 +1282,7 @@ void zeus2_device::midz_cap_quad(int numverts, const void *verts,
 
 void zeus2_device::midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t color, int32_t depth)
 {
-	if (!midz_cap || !s_cap_rec)
+	if (!(midz_cap && s_cap_rec) && !midz_live)
 		return;
 	uint32_t p[4] = { addr, numPixels, color, uint32_t(depth) };
 	midz_rec(3, p, sizeof(p));
@@ -346,7 +1290,7 @@ void zeus2_device::midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t co
 
 void zeus2_device::midz_capture_framewrite()
 {
-	if (!s_cap_rec)
+	if (!s_cap_rec && !midz_live)
 		return;
 	uint32_t p[6] = { frame_addr_from_phys_addr(m_zeusbase[0x51]),
 		m_zeusbase[0x57], m_zeusbase[0x58], m_zeusbase[0x59],
@@ -354,8 +1298,20 @@ void zeus2_device::midz_capture_framewrite()
 	midz_rec(4, p, sizeof(p));
 }
 
+void zeus2_device::midz_wave_dirty(uint32_t addr41)
+{
+	uint32_t const block = (addr41 % WAVERAM0_WIDTH)
+		+ ((addr41 >> 16) % WAVERAM0_HEIGHT) * WAVERAM0_WIDTH;
+	uint32_t const off = block * 8;
+	if (off < s_wave_lo) s_wave_lo = off;
+	if (off + 8 > s_wave_hi) s_wave_hi = off + 8;
+}
+
 void zeus2_device::device_stop()
 {
+#ifdef _WIN32
+	mzgl::stop();
+#endif
 #if DUMP_WAVE_RAM
 	std::string fileName = "waveram_";
 	fileName += machine().system().name;
@@ -755,6 +1711,13 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 		screen().update_partial(screen().vpos());
 		log_fifo = machine().input().code_pressed(KEYCODE_L) | ALWAYS_LOG_FIFO;
 		m_zeusbase[0x38] = temp;
+#ifdef _WIN32
+		// live overlay: the display-base flip must land IN ORDER with the
+		// quad/clear stream - a once-per-frame sample lets the overlay keep
+		// presenting a page the game is already clearing (seen as flashing)
+		if (midz_live)
+			mzgl::ring_push2(6, &m_zeusbase[0x38], 4, nullptr, 0);
+#endif
 	}
 	break;
 	case 0x39:
@@ -978,6 +1941,8 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 				void *dest = waveram0_ptr_from_expanded_addr(m_zeusbase[0x41]);
 				WAVERAM_WRITE32(dest, 0, m_zeusbase[0x48]);
 				WAVERAM_WRITE32(dest, 1, m_zeusbase[0x49]);
+				if (midz_live)
+					midz_wave_dirty(m_zeusbase[0x41]);
 				if (logit)
 					logerror("\t[41]=%08X [4E]=%08X", m_zeusbase[0x41], m_zeusbase[0x4e]);
 
@@ -1060,7 +2025,7 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 					logerror(" -- Clearing buffer: numPixels: %08X addr: %08X reg51: %08X", numPixels, addr, m_zeusbase[0x51]);
 				// A depth clear of 0 (nearest) rejects all later depth-tested geometry; reset to far instead.
 				int32_t clearDepth = (m_fill_depth == 0) ? 0xffffff : m_fill_depth;
-				if (midz_cap)
+				if (midz_cap || midz_live)
 					midz_cap_clear(addr, numPixels, m_fill_color, clearDepth);
 				for (int count = 0; count < numPixels; count++) {
 					// Crusn wraps the frame buffer during fill so need to mask address
@@ -1192,6 +2157,7 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 *************************************/
 void zeus2_device::load_pal_table(void *wavePtr, uint32_t ctrl, int type, int logit)
 {
+	s_pal_dirty = true;   // capture/live: pal record before the next quad
 	int count = ctrl & 0xffff;
 	m_palSize = (count + 1) * 4;
 	uint32_t addr = (ctrl >> 24) << 1;

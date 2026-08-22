@@ -134,11 +134,13 @@ public:
 	// for the renderer-replacement arc. Env-gated; midz_cap stays false
 	// (zero cost) unless a capture is armed. Definitions in zeus2.cpp.
 	bool midz_cap = false;
+	bool midz_live = false;   // MIDZ_GL=1: in-process GL renderer active
 	void midz_screen_hook();
 	void midz_cap_quad(int numverts, const void *verts,
 			const zeus2_poly_extra_data &extra, uint32_t texdata);
 	void midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t color, int32_t depth);
 	void midz_capture_framewrite();
+	void midz_wave_dirty(uint32_t addr41);
 
 	uint32_t m_zeusbase[0x80];
 	uint32_t m_renderRegs[0x50];
@@ -293,7 +295,7 @@ public:
 	// Write to frame buffer
 	inline void frame_write()
 	{
-		if (midz_cap)
+		if (midz_cap || midz_live)
 			midz_capture_framewrite();
 		uint32_t addr = frame_addr_from_phys_addr(m_zeusbase[0x51]);
 		if (m_zeusbase[0x57] & 0x1)
