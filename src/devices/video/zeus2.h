@@ -128,6 +128,18 @@ public:
 	void set_float_mode(int mode) { m_atlantis = mode; }
 	int m_atlantis; // Used to switch to using IEEE754 floating point format for atlantis
 
+	// POC offline capture (MIDZ_CAPTURE=<dir> + MIDZ_CAPTURE_FRAME=<n>):
+	// one frame span of everything that mutates the frame buffer, in
+	// submission order, bracketed by full color+depth dumps - the oracle
+	// for the renderer-replacement arc. Env-gated; midz_cap stays false
+	// (zero cost) unless a capture is armed. Definitions in zeus2.cpp.
+	bool midz_cap = false;
+	void midz_screen_hook();
+	void midz_cap_quad(int numverts, const void *verts,
+			const zeus2_poly_extra_data &extra, uint32_t texdata);
+	void midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t color, int32_t depth);
+	void midz_capture_framewrite();
+
 	uint32_t m_zeusbase[0x80];
 	uint32_t m_renderRegs[0x50];
 
@@ -281,6 +293,8 @@ public:
 	// Write to frame buffer
 	inline void frame_write()
 	{
+		if (midz_cap)
+			midz_capture_framewrite();
 		uint32_t addr = frame_addr_from_phys_addr(m_zeusbase[0x51]);
 		if (m_zeusbase[0x57] & 0x1)
 			m_frameColor[addr] = m_zeusbase[0x58];

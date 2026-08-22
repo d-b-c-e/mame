@@ -169,6 +169,191 @@ void zeus2_device::device_reset()
 static int s_mz_stats = -1;
 static unsigned s_mz_quads = 0, s_mz_frames = 0, s_mz_qmax = 0;
 
+// ---- POC offline capture (MIDZ_CAPTURE=<dir>, MIDZ_CAPTURE_FRAME=<n>) ----
+// records.bin stream: (u32 type, u32 bytes, payload). type 1 = quad
+// (midz_quad_rec: clipped verts + full raster state), 2 = pal_table
+// (256*u32, emitted when it changed), 3 = fast clear, 4 = frame_write
+// register snapshot. pre/post color+depth dumps bracket the stream;
+// waveram + regs dumped at close. Submission order == FB mutation order
+// (poly->wait precedes the direct-write paths).
+static int s_cap_state = -2;      // -2 env unread, -1 off, 0 armed, 1 recording, 2 done
+static uint32_t s_cap_frame = 2400;
+static uint32_t s_cap_minq = 0;   // MIDZ_CAPTURE_MINQUADS: with it set, arm on
+                                  // the first >=minq-quad frame past the frame
+                                  // floor and record until minq quads landed
+                                  // (frame numbers drift between boots and 3D
+                                  // scenes render every other frame)
+static uint32_t s_cap_fq = 0;     // quads submitted since last screen_update
+static uint32_t s_cap_recq = 0;   // quads recorded so far
+static uint32_t s_cap_frames_rec = 0;
+static FILE *s_cap_rec = nullptr;
+static char s_cap_dir[400];
+static uint32_t s_cap_pal[256];
+static bool s_cap_pal_valid = false;
+
+struct midz_quad_rec
+{
+	uint32_t frame, numverts, texdata, tex_src;
+	uint32_t texwidth, solidcolor, transcolor, srcAlpha, dstAlpha, flags;
+	int32_t zbuf_min;
+	uint32_t rr04, yscale;
+	int32_t clip[4];
+	float verts[8][6];    // x, y, p0(z 12.12), p1(u/z), p2(v/z), p3(1/z)
+};
+
+static void midz_dump(const char *dir, const char *name, const void *data, size_t bytes)
+{
+	char path[512];
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	FILE *f = fopen(path, "wb");
+	if (f)
+	{
+		fwrite(data, 1, bytes, f);
+		fclose(f);
+	}
+}
+
+static void midz_rec(uint32_t type, const void *payload, uint32_t bytes)
+{
+	if (!s_cap_rec)
+		return;
+	fwrite(&type, 4, 1, s_cap_rec);
+	fwrite(&bytes, 4, 1, s_cap_rec);
+	fwrite(payload, 1, bytes, s_cap_rec);
+}
+
+void zeus2_device::midz_screen_hook()
+{
+	if (s_cap_state == -2)
+	{
+		const char *dir = std::getenv("MIDZ_CAPTURE");
+		if (!dir)
+		{
+			s_cap_state = -1;
+			return;
+		}
+		strncpy(s_cap_dir, dir, sizeof(s_cap_dir) - 1);
+		if (const char *f = std::getenv("MIDZ_CAPTURE_FRAME"))
+			s_cap_frame = strtoul(f, nullptr, 10);
+		if (const char *q = std::getenv("MIDZ_CAPTURE_MINQUADS"))
+			s_cap_minq = strtoul(q, nullptr, 10);
+		s_cap_state = 0;
+	}
+	if (s_cap_state < 0 || s_cap_state == 2)
+		return;
+	uint32_t const frame = uint32_t(screen().frame_number());
+	uint32_t const fq = s_cap_fq;
+	s_cap_fq = 0;
+	size_t const fbcount = WAVERAM1_WIDTH * WAVERAM1_HEIGHT * 2;
+	if (s_cap_state == 0 && frame >= s_cap_frame - 1
+		&& (s_cap_minq == 0 || fq >= s_cap_minq))
+	{
+		poly->wait("MIDZ_CAP_PRE");
+		midz_dump(s_cap_dir, "pre_color.bin", m_frameColor.get(), fbcount * 4);
+		midz_dump(s_cap_dir, "pre_depth.bin", m_frameDepth.get(), fbcount * 4);
+		char path[512];
+		snprintf(path, sizeof(path), "%s/records.bin", s_cap_dir);
+		s_cap_rec = fopen(path, "wb");
+		s_cap_pal_valid = false;
+		midz_cap = true;
+		s_cap_state = 1;
+		fprintf(stderr, "MIDZ capture: recording frames %u..%u\n", frame, s_cap_frame);
+	}
+	else if (s_cap_state == 1
+		&& ((s_cap_minq == 0) ? (frame >= s_cap_frame)
+			: (s_cap_recq >= s_cap_minq || ++s_cap_frames_rec > 10)))
+	{
+		poly->wait("MIDZ_CAP_POST");
+		midz_cap = false;
+		midz_dump(s_cap_dir, "post_color.bin", m_frameColor.get(), fbcount * 4);
+		midz_dump(s_cap_dir, "post_depth.bin", m_frameDepth.get(), fbcount * 4);
+		midz_dump(s_cap_dir, "waveram.bin", m_waveram.get(), WAVERAM0_WIDTH * WAVERAM0_HEIGHT * 8);
+		midz_dump(s_cap_dir, "pal_table.bin", m_pal_table, sizeof(m_pal_table));
+		if (s_cap_rec)
+		{
+			fclose(s_cap_rec);
+			s_cap_rec = nullptr;
+		}
+		char path[512];
+		snprintf(path, sizeof(path), "%s/regs.txt", s_cap_dir);
+		if (FILE *f = fopen(path, "w"))
+		{
+			fprintf(f, "yScale %d\npalSize %d\ncliprect %d %d %d %d\nsystem %d\n",
+				m_yScale, m_palSize, zeus_cliprect.min_x, zeus_cliprect.min_y,
+				zeus_cliprect.max_x, zeus_cliprect.max_y, m_system);
+			for (int i = 0; i < 0x80; i++)
+				fprintf(f, "zb%02x %08X\n", i, m_zeusbase[i]);
+			for (int i = 0; i < 0x50; i++)
+				fprintf(f, "rr%02x %08X\n", i, m_renderRegs[i]);
+			fclose(f);
+		}
+		s_cap_state = 2;
+		fprintf(stderr, "MIDZ capture complete in %s\n", s_cap_dir);
+	}
+}
+
+void zeus2_device::midz_cap_quad(int numverts, const void *verts,
+		const zeus2_poly_extra_data &extra, uint32_t texdata)
+{
+	if (!midz_cap || !s_cap_rec)
+		return;
+	++s_cap_recq;
+	if (!s_cap_pal_valid || memcmp(s_cap_pal, m_pal_table, sizeof(s_cap_pal)) != 0)
+	{
+		memcpy(s_cap_pal, m_pal_table, sizeof(s_cap_pal));
+		s_cap_pal_valid = true;
+		midz_rec(2, s_cap_pal, sizeof(s_cap_pal));
+	}
+	auto const *v = reinterpret_cast<const z2_poly_vertex *>(verts);
+	midz_quad_rec r = {};
+	r.frame = uint32_t(screen().frame_number());
+	r.numverts = numverts;
+	r.texdata = texdata;
+	r.tex_src = extra.tex_src;
+	r.texwidth = extra.texwidth;
+	r.solidcolor = extra.solidcolor;
+	r.transcolor = extra.transcolor;
+	r.srcAlpha = extra.srcAlpha;
+	r.dstAlpha = extra.dstAlpha;
+	r.flags = (extra.solid_enable ? 1 : 0) | (extra.blend_enable ? 2 : 0)
+		| (extra.depth_min_enable ? 4 : 0) | (extra.depth_test_enable ? 8 : 0)
+		| (extra.depth_write_enable ? 16 : 0) | (extra.depth_clear_enable ? 32 : 0)
+		| (extra.texture_alpha ? 64 : 0) | (extra.texture_rgb555 ? 128 : 0);
+	r.zbuf_min = extra.zbuf_min;
+	r.rr04 = m_renderRegs[0x4];
+	r.yscale = uint32_t(m_yScale);
+	r.clip[0] = zeus_cliprect.min_x;
+	r.clip[1] = zeus_cliprect.min_y;
+	r.clip[2] = zeus_cliprect.max_x;
+	r.clip[3] = zeus_cliprect.max_y;
+	for (int i = 0; i < numverts && i < 8; i++)
+	{
+		r.verts[i][0] = v[i].x;
+		r.verts[i][1] = v[i].y;
+		for (int p = 0; p < 4; p++)
+			r.verts[i][2 + p] = v[i].p[p];
+	}
+	midz_rec(1, &r, sizeof(r));
+}
+
+void zeus2_device::midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t color, int32_t depth)
+{
+	if (!midz_cap || !s_cap_rec)
+		return;
+	uint32_t p[4] = { addr, numPixels, color, uint32_t(depth) };
+	midz_rec(3, p, sizeof(p));
+}
+
+void zeus2_device::midz_capture_framewrite()
+{
+	if (!s_cap_rec)
+		return;
+	uint32_t p[6] = { frame_addr_from_phys_addr(m_zeusbase[0x51]),
+		m_zeusbase[0x57], m_zeusbase[0x58], m_zeusbase[0x59],
+		m_zeusbase[0x5a], m_zeusbase[0x5e] };
+	midz_rec(4, p, sizeof(p));
+}
+
 void zeus2_device::device_stop()
 {
 #if DUMP_WAVE_RAM
@@ -231,6 +416,8 @@ uint32_t zeus2_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap
 	// Wait until configuration is completed before transfering anything
 	if (!(m_zeusbase[0x10] & 0x20))
 		return 0;
+
+	midz_screen_hook();
 
 	// POC scoping stats (MIDZ_STATS=1): quads/frame profile to stderr
 	if (s_mz_stats > 0)
@@ -873,6 +1060,8 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 					logerror(" -- Clearing buffer: numPixels: %08X addr: %08X reg51: %08X", numPixels, addr, m_zeusbase[0x51]);
 				// A depth clear of 0 (nearest) rejects all later depth-tested geometry; reset to far instead.
 				int32_t clearDepth = (m_fill_depth == 0) ? 0xffffff : m_fill_depth;
+				if (midz_cap)
+					midz_cap_clear(addr, numPixels, m_fill_color, clearDepth);
 				for (int count = 0; count < numPixels; count++) {
 					// Crusn wraps the frame buffer during fill so need to mask address
 					m_frameColor[(addr + count) & (WAVERAM1_WIDTH * WAVERAM1_HEIGHT * 2 - 1)] = m_fill_color;
@@ -1575,6 +1764,8 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		s_mz_stats = std::getenv("MIDZ_STATS") ? 1 : 0;
 	if (s_mz_stats)
 		++s_mz_quads;
+	if (s_cap_state >= 0)
+		++s_cap_fq;   // per-frame count for the min-quads capture trigger
 
 	if (logit) {
 		m_state->logerror("quad %d", m_state->zeus_quad_size);
@@ -1831,6 +2022,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		break;
 	}
 
+	m_state->midz_cap_quad(numverts, clipvert, extra, texdata);
 	render_triangle_fan<4>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
 }
 
