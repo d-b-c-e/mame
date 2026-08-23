@@ -3879,13 +3879,38 @@ void analog_field::frame_update(running_machine &machine)
 			// only update if analog value changed
 			m_previousanalog = rawvalue;
 
+			// POC (env-gated, inert unset): steering response curve for
+			// PADDLE-class fields. MIDV_STEER_CURVE is a percent exponent
+			// applied to the normalized wheel deflection: below 100 boosts
+			// response near center (compensates the Cruis'n games' own
+			// lazy-center/sharp-edge mapping), above 100 softens the
+			// center, 100 = linear/off.
+			s32 curvedvalue = rawvalue;
+			if (m_field.type() == IPT_PADDLE)
+			{
+				static int s_curve = -1;
+				if (s_curve < 0)
+				{
+					const char *e = std::getenv("MIDV_STEER_CURVE");
+					s_curve = e ? atoi(e) : 100;
+					if (s_curve < 25 || s_curve > 400)
+						s_curve = 100;
+				}
+				if (s_curve != 100)
+				{
+					double const n = double(rawvalue) / double(osd::input_device::ABSOLUTE_MAX);
+					double const c = std::copysign(std::pow(std::abs(n), double(s_curve) / 100.0), n);
+					curvedvalue = s32(c * double(osd::input_device::ABSOLUTE_MAX));
+				}
+			}
+
 			// apply the inverse of the sensitivity to the raw value so that
 			// it will still cover the full min->max range requested after
 			// we apply the sensitivity adjustment
 			if (m_absolute || m_field.analog_reset())
 			{
 				// if port is absolute, then just return the absolute data supplied
-				m_accum = apply_inverse_sensitivity(rawvalue);
+				m_accum = apply_inverse_sensitivity(curvedvalue);
 			}
 			else
 			{
