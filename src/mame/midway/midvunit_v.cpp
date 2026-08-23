@@ -442,7 +442,16 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 		}
 		uint32_t pixdata = dma[1];
 		bool const textured = (dma[0] & 0x300) == 0x100;
-		uint32_t const dither = (dma[0] & 0x2000) ? 1 : 0;
+		// dither bit0; bit1 flags backdrop (sky/horizon, texbase low byte
+		// 0x7f AND full-width - excludes incidental small 0x7f quads) so
+		// the shader can suppress it in the 16:9 margins
+		int16_t const bx0 = int16_t(dma[2]), bx1 = int16_t(dma[4]),
+			bx2 = int16_t(dma[6]), bx3 = int16_t(dma[8]);
+		int const bxmin = std::min(std::min(bx0, bx1), std::min(bx2, bx3));
+		int const bxmax = std::max(std::max(bx0, bx1), std::max(bx2, bx3));
+		bool const backdrop = (dma[14] & 0xff) == 0x7f && (bxmax - bxmin) > 200;
+		uint32_t const dither = ((dma[0] & 0x2000) ? 1u : 0u)
+			| (backdrop ? 2u : 0u);
 		uint32_t mode = 0;
 		if (!textured)
 			pixdata = (pixdata + (dma[0] & 0xff)) & 0xffff;
@@ -723,6 +732,17 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipRight"), WIDE - 1);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "texram"), 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "texMask"), (8 << 20) - 1);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "uDbgQuadId"), 0);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipW"), WIDE);
+	// suppress the sky/horizon backdrop inside the 16:9 margins (leaves it
+	// for the margin-extend to fill from the 4:3 boundary - sky above,
+	// terrain below - covering the "water through the ground" reveal).
+	// Shares the crack/margin-fill gate; MIDV_GL_CRACKFILL=0 or
+	// MIDV_GL_MARGINFILL=0 disables it.
+	bool const bg_gate =
+		!(std::getenv("MIDV_GL_CRACKFILL") && atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0)
+		&& !(std::getenv("MIDV_GL_MARGINFILL") && atoi(std::getenv("MIDV_GL_MARGINFILL")) == 0);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "uBgMargin"), bg_gate ? MARGIN : 0);
 	gl.UseProgram(pal);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "palTex"), 2);
@@ -1482,8 +1502,23 @@ void midvunit_renderer::make_vertices_inclusive(vertex_t *vert)
 }
 
 
+// per-frame DMA quad count (emu thread), for the MINQUADS statedump trigger
+static uint32_t s_last_scene_quads = 0;
+static uint32_t s_cur_frame_quads = 0, s_cur_frame_no = 0xffffffff;
+
 void midvunit_renderer::process_dma_queue()
 {
+	{
+		uint32_t const fr = uint32_t(m_state.m_screen->frame_number());
+		if (fr != s_cur_frame_no)
+		{
+			s_last_scene_quads = s_cur_frame_quads;
+			s_cur_frame_quads = 0;
+			s_cur_frame_no = fr;
+		}
+		++s_cur_frame_quads;
+	}
+
 	// POC: log the raw quad before any processing, tagged with frame + page
 	static FILE *s_quadlog = quadlog_open();
 	if (s_quadlog)
@@ -1849,8 +1884,16 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		static bool s_dumped = false;
 		static const char *s_dir = std::getenv("MIDV_STATEDUMP_DIR");
 		static const char *s_frame = std::getenv("MIDV_STATEDUMP_FRAME");
-		if (!s_dumped && s_dir && s_frame
-			&& screen.frame_number() >= strtoul(s_frame, nullptr, 10))
+		// MIDV_STATEDUMP_MINQUADS: arm on the first frame past the floor
+		// whose last scene had >= N quads (a dense 3D driving scene), so a
+		// specific scene can be captured without frame-number guessing -
+		// mirrors the Zeus MIDZ_CAPTURE_MINQUADS trigger.
+		static const char *s_minq = std::getenv("MIDV_STATEDUMP_MINQUADS");
+		bool trigger = s_frame
+			&& screen.frame_number() >= strtoul(s_frame, nullptr, 10);
+		if (s_minq)
+			trigger = trigger && s_last_scene_quads >= atoi(s_minq);
+		if (!s_dumped && s_dir && trigger)
 		{
 			s_dumped = true;
 			auto dump = [&](const char *name, const void *data, size_t bytes)
