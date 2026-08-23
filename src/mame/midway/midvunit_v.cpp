@@ -211,9 +211,23 @@ static void telem_notify(const char *outname, s32 value, void *)
 // acceleration (results/ramhunt; see RESULTS.md). 0 = not yet hunted.
 // crusnusa 0x0F22D CONFIRMED (0->~295 monotone accel, resets per demo lap).
 struct SpeedAddr { const char *game; uint32_t addr; };
+// Only parent romsets are listed - each address was hunted against that
+// specific build's RAM; clone versions can lay out DSP RAM differently, so
+// they intentionally fall through to 0 (telemetry off) rather than mirror an
+// unverified offset. The rig runs the parents.
 static const SpeedAddr s_speed_addr[] = {
-	{ "crusnusa", 0x0F22D }, { "crusnu40", 0x0F22D }, { "crusnu21", 0x0F22D },
-	{ "crusnwld", 0 }, { "offroadc", 0 },   // hunt pending
+	{ "crusnusa", 0x0F22D },
+	// crusnwld 0x0DDDC: differential RAM-hunt of the demo (results/ramhunt-wld)
+	// found a 10-field player physics cluster (stride 0xB0), each 0->~285
+	// monotone with a matching odometer partner (corr 0.998, same signature
+	// that isolated crusnusa 0x0F22D). Peak matches USA's unit. NEEDS ONE
+	// WHEEL CHECK to confirm this field == the on-screen speedometer (vs a
+	// wheel-speed / velocity-component sibling in the same cluster).
+	{ "crusnwld", 0x0DDDC },
+	// offroadc: attract demo shows no clean accelerate-from-0 speed curve
+	// (candidates spike-and-drop or read as signed velocity components);
+	// needs an on-screen-MPH correlation pass at the wheel to pick the slot.
+	{ "offroadc", 0 },
 	{ nullptr, 0 },
 };
 static uint32_t s_speed_word = 0;   // resolved at telem_init
