@@ -42,6 +42,9 @@ The Grid         v1.2   10/18/2000
 
 #include "speaker.h"
 
+#include <map>
+#include <string>
+
 #include "crusnexo.lh"
 
 // table in the code indicates an offset of 20 with a beam height of 7
@@ -219,6 +222,47 @@ void midzeus_state::machine_start()
 
 	save_item(NAME(m_disk_asic_jr));
 	save_item(NAME(m_cmos_protected));
+
+	// MIDZ_RINGTAP=<file>: histogram game PCs that write 0x24xxxxxx
+	// (draw-model headers) into RAM — locates the queue-model routine for
+	// the widescreen (FOV) tuning work. Diagnostics only, inert when unset.
+	if (const char *rt_path = std::getenv("MIDZ_RINGTAP"))
+	{
+		static std::map<uint64_t, uint64_t> rt_counts;
+		static uint64_t rt_total = 0;
+		std::string path_copy(rt_path);
+		auto tap = [this, path_copy](offs_t offset, u32 &data, u32 mem_mask)
+		{
+			if ((data >> 24) == 0x24)
+			{
+				rt_counts[(uint64_t(m_maincpu->pcbase()) << 24) | (offset & 0xffffff)]++;
+				if ((++rt_total & 0xff) == 0)
+				{
+					FILE *f = fopen(path_copy.c_str(), "w");
+					if (f)
+					{
+						std::map<uint32_t, uint64_t> bypc;
+						for (auto &kv : rt_counts)
+							bypc[uint32_t(kv.first >> 24)] += kv.second;
+						for (auto &kv : bypc)
+							fprintf(f, "pc %05x  n %llu\n", kv.first, (unsigned long long)kv.second);
+						fprintf(f, "--- pc/addr pairs (first 64) ---\n");
+						int n = 0;
+						for (auto &kv : rt_counts)
+						{
+							if (n++ >= 64) break;
+							fprintf(f, "pc %05x addr %06x n %llu\n",
+								uint32_t(kv.first >> 24), uint32_t(kv.first & 0xffffff),
+								(unsigned long long)kv.second);
+						}
+						fclose(f);
+					}
+				}
+			}
+		};
+		m_maincpu->space(AS_PROGRAM).install_write_tap(0x000000, 0x03ffff, "midz_ringtap_lo", tap);
+		m_maincpu->space(AS_PROGRAM).install_write_tap(0x400000, 0x43ffff, "midz_ringtap_hi", tap);
+	}
 }
 
 void invasnab_state::machine_start()
@@ -235,10 +279,62 @@ void invasnab_state::machine_start()
 }
 
 
+// ── POC code patcher (env-gated, ROM files untouched) ───────────────────
+// Mirrors the V-Unit MIDV_PATCH: the TMS32032 program is copied maindata
+// ROM -> program RAM at each reset; word patches overlay the RAM copy.
+// MIDZ_PATCH=<file>, lines "WORDADDR OLD NEW" hex (OLD verified or "*").
+// Purpose: the Zeus FOV/cull-widening experiment (see cruisn-collection
+// docs/widescreen-research.md + ROADMAP A2/Zeus).
+static void midz_apply_patches(uint32_t *ram)
+{
+	const char *path = std::getenv("MIDZ_PATCH");
+	if (!path)
+		return;
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	char line[256];
+	int applied = 0, skipped = 0;
+	while (fgets(line, sizeof(line), f))
+	{
+		if (line[0] == '#' || line[0] == '\n')
+			continue;
+		char oldtok[64] = {};
+		unsigned addr = 0, newval = 0;
+		if (sscanf(line, "%x %63s %x", &addr, oldtok, &newval) != 3)
+			continue;
+		if (addr >= 0x40000)
+			continue;
+		if (strcmp(oldtok, "*") != 0)
+		{
+			unsigned oldval = strtoul(oldtok, nullptr, 16);
+			if (ram[addr] != oldval)
+			{
+				skipped++;
+				continue;
+			}
+		}
+		ram[addr] = newval;
+		applied++;
+	}
+	fclose(f);
+	if (applied || skipped)
+	{
+		FILE *lg = fopen("midz_patch.log", "w");
+		if (lg)
+		{
+			fprintf(lg, "MIDZ_PATCH %s: %d applied, %d skipped\n",
+				path, applied, skipped);
+			fclose(lg);
+		}
+	}
+}
+
 void midzeus_state::machine_reset()
 {
 	memcpy(m_ram_base, memregion("maindata")->base(), 0x40000*4);
 	*m_ram_base <<= 1;
+	midz_apply_patches(m_ram_base);
 	m_maincpu->reset();
 
 	m_cmos_protected = true;

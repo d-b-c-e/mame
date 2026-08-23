@@ -11,6 +11,8 @@
 #include "screen.h"
 
 #include <algorithm>
+#include <map>
+#include <cstdlib>
 
 // MIDZ_GL in-process renderer (Windows-only, env-gated; see mzgl below)
 #ifdef _WIN32
@@ -962,17 +964,24 @@ void thread_main()
 				// only clears its 512-wide region, so clear the 16:9 margins
 				// too (else they accumulate garbage from degenerate
 				// near-plane-clipped quads). Flush prior geometry first.
+				// Scope the clear to the rows of the page being cleared —
+				// the canvas holds BOTH page-flip buffers, and a full-height
+				// clear wipes the DISPLAYED page's margins the moment the
+				// game starts the next frame (margins showed black on every
+				// present; the game really does render past 4:3).
 				if (MARGIN > 0 && p[1] > uint32_t(CW * 4))
 				{
+					uint32_t const row0 = (p[0] & (CW * CH - 1)) / CW;
+					uint32_t const nrows = std::min(p[1] / CW, uint32_t(CH) - row0);
 					flush();
 					gl.BindFramebuffer(FRAMEBUFFER, fbo);
 					gl.Viewport(0, 0, fw, fh);
 					gl.Enable(GLSCISSOR_TEST);
 					gl.ClearColor(0, 0, 0, 1);
 					gl.ClearDepth(1.0);
-					gl.Scissor(0, 0, MARGIN * S, fh);
+					gl.Scissor(0, int(row0 * S), MARGIN * S, int(nrows * S));
 					gl.Clear(0x4100);
-					gl.Scissor(fw - MARGIN * S, 0, MARGIN * S, fh);
+					gl.Scissor(fw - MARGIN * S, int(row0 * S), MARGIN * S, int(nrows * S));
 					gl.Clear(0x4100);
 					gl.Disable(GLSCISSOR_TEST);
 					gl.BindFramebuffer(FRAMEBUFFER, 0);
@@ -2422,6 +2431,32 @@ if (subregdata_count[which] < 256)
  *  Process the FIFO
  *************************************/
 
+// MIDZ_PCLOG=<file>: histogram of game-CPU PCs that submit FIFO commands
+// (keyed by command byte). Locates the game routine that sends geometry so
+// the widescreen work can trace its callers. Inert when unset.
+static void midz_pclog(running_machine &machine, int cmd)
+{
+	static const char *path = std::getenv("MIDZ_PCLOG");
+	if (!path)
+		return;
+	static std::map<uint64_t, uint64_t> counts;
+	static uint64_t total = 0;
+	auto *cpu = dynamic_cast<cpu_device *>(machine.root_device().subdevice("maincpu"));
+	if (!cpu)
+		return;
+	counts[(uint64_t(cmd) << 32) | uint32_t(cpu->pcbase())]++;
+	if ((++total & 0x3ff) == 0)
+	{
+		FILE *f = fopen(path, "w");
+		if (f)
+		{
+			for (auto &kv : counts)
+				fprintf(f, "%02x %05x %llu\n", int(kv.first >> 32), unsigned(kv.first & 0xffffffff), (unsigned long long)kv.second);
+			fclose(f);
+		}
+	}
+}
+
 bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 {
 	int dataoffs = 0;
@@ -2571,6 +2606,7 @@ bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 				return false;
 			if (log_fifo)
 				log_fifo_command(data, numwords, "");
+			midz_pclog(machine(), data[0] >> 24);
 			zeus2_draw_model(data[1], data[0] & 0xffff, log_fifo);
 			break;
 
