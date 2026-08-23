@@ -442,14 +442,17 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 		}
 		uint32_t pixdata = dma[1];
 		bool const textured = (dma[0] & 0x300) == 0x100;
-		// dither bit0; bit1 flags backdrop (sky/horizon, texbase low byte
-		// 0x7f AND full-width - excludes incidental small 0x7f quads) so
-		// the shader can suppress it in the 16:9 margins
+		// dither bit0; bit1 flags backdrop (sky/horizon band) so the shader
+		// can suppress it in the 16:9 margins. Per-game texbase low byte
+		// (offroadc 0x7f, crusnusa 0x56, crusnwld 0xc5) AND full-width -
+		// excludes incidental small quads; verified no terrain false hits.
 		int16_t const bx0 = int16_t(dma[2]), bx1 = int16_t(dma[4]),
 			bx2 = int16_t(dma[6]), bx3 = int16_t(dma[8]);
 		int const bxmin = std::min(std::min(bx0, bx1), std::min(bx2, bx3));
 		int const bxmax = std::max(std::max(bx0, bx1), std::max(bx2, bx3));
-		bool const backdrop = (dma[14] & 0xff) == 0x7f && (bxmax - bxmin) > 200;
+		uint32_t const blo = dma[14] & 0xff;
+		bool const backdrop = (blo == 0x7f || blo == 0x56 || blo == 0xc5)
+			&& (bxmax - bxmin) > 200;
 		uint32_t const dither = ((dma[0] & 0x2000) ? 1u : 0u)
 			| (backdrop ? 2u : 0u);
 		uint32_t mode = 0;
