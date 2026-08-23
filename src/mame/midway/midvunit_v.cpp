@@ -1827,20 +1827,21 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 
 	m_poly->wait("Refresh Time");
 
-	// Esc options menu pauses the machine while open. The request comes
-	// from the GL thread; pause/resume must run on the emu thread, and we
-	// act only on transitions so a manual pause is never fought.
+	// Esc options menu pause: block the emu thread here while the menu is
+	// open (freezes emulation + sound). The GL thread clears s_menu_pause
+	// on Resume/Exit so this always exits. machine().pause() was unreliable
+	// - its resume needed screen_update to run again while paused, which
+	// MAME does not do, leaving the menu stuck paused. Pump messages so the
+	// window stays responsive (Exit clears the flag before its WM_CLOSE).
+	while (mvgl::s_menu_pause.load())
 	{
-		static int s_prev_req = 0;
-		int const req = mvgl::s_menu_pause.load();
-		if (req != s_prev_req)
+		MSG msg;
+		while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
 		{
-			s_prev_req = req;
-			if (req && !machine().paused())
-				machine().pause();
-			else if (!req && machine().paused())
-				machine().resume();
+			TranslateMessage(&msg);
+			DispatchMessageA(&msg);
 		}
+		Sleep(15);
 	}
 
 	// Telemetry Phase B: mirror the car speed (MPH) as a UDP datagram each

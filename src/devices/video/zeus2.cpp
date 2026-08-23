@@ -1142,17 +1142,23 @@ void zeus2_device::midz_screen_hook()
 #ifdef _WIN32
 	if (midz_live)
 	{
-		// Esc-menu pause sync for the live overlay (emu thread; act only
-		// on transitions so a manual pause is never fought)
-		static int s_zprev = 0;
-		int const req = mzgl::s_zpause.load();
-		if (req != s_zprev)
+		// Esc-menu pause: block the emu thread here while the menu is open,
+		// which freezes emulation and sound. The overlay thread keeps
+		// drawing the menu and clears s_zpause on Resume/Exit, so this
+		// loop always exits. (machine().pause() was unreliable: its resume
+		// relied on screen_update being called again while paused, which
+		// MAME does not do - the menu got stuck paused.) Pump messages so
+		// the window stays responsive; Exit clears s_zpause before its
+		// WM_CLOSE, so we fall through and the close is handled.
+		while (mzgl::s_zpause.load())
 		{
-			s_zprev = req;
-			if (req && !machine().paused())
-				machine().pause();
-			else if (!req && machine().paused())
-				machine().resume();
+			MSG msg;
+			while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+			{
+				TranslateMessage(&msg);
+				DispatchMessageA(&msg);
+			}
+			Sleep(15);
 		}
 		// flush the waveram dirty span, then the per-frame display tick
 		if (s_wave_hi > s_wave_lo)
