@@ -1665,7 +1665,10 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 			m_yScale = (((m_zeusbase[0x39] >> 16) & 0xfff) < 0x100) ? 0 : 1;
 			int hor = ((m_zeusbase[0x34] & 0xffff) - (m_zeusbase[0x33] >> 16)) << m_yScale;
 			int ver = ((m_zeusbase[0x35] & 0xffff) + 1) << m_yScale;
-			popmessage("reg[30]: %08X Screen: %dH X %dV yScale: %d", m_zeusbase[0x30], hor, ver, m_yScale);
+			// POC: stock MAME debug popmessage - flashes "reg[30]: ...
+			// Screen: 512H X 400V" at the bottom on every boot. Silenced
+			// for the collection (kept as logerror for diagnostics).
+			logerror("reg[30]: %08X Screen: %dH X %dV yScale: %d\n", m_zeusbase[0x30], hor, ver, m_yScale);
 			int vtotal = (m_zeusbase[0x37] & 0xffff) << m_yScale;
 			int htotal = (m_zeusbase[0x34] >> 16) << m_yScale;
 			//rectangle visarea((m_zeusbase[0x33] >> 16) << m_yScale, htotal - 1, 0, (m_zeusbase[0x35] & 0xffff) << m_yScale);
