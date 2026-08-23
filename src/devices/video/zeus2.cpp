@@ -529,7 +529,13 @@ void thread_main()
 	// halve texture memory/traffic vs the full 2048-row address space, and
 	// the masks below wrap the (never-observed) high addresses harmlessly
 	constexpr int CW = 512, CH = 1024, DISPH = 400;
-	int const fw = CW * S, fh = CH * S;
+	// 16:9 widescreen: render into a wider canvas (all geometry shifted by
+	// MARGIN via the VS) and present 3D scenes at 16:9, 2D screens cropped
+	// to 4:3. MIDZ_GL_MARGIN=0 (or MIDV_GL_MARGIN=0) forces 4:3.
+	int MARGIN = envi("MIDZ_GL_MARGIN", "MIDV_GL_MARGIN", 88);
+	MARGIN = std::max(0, std::min(120, MARGIN));
+	int const CWW = CW + 2 * MARGIN;
+	int const fw = CWW * S, fh = CH * S;
 
 	HWND parent = nullptr;
 	for (int i = 0; i < 100 && !parent; i++) { Sleep(100); parent = find_mame_window(); }
@@ -678,7 +684,8 @@ void thread_main()
 		}
 	}
 	gl.UseProgram(prog);
-	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(CW), float(CH));
+	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(CWW), float(CH));
+	gl.Uniform1f(gl.GetUniformLocation(prog, "uMargin"), float(MARGIN));
 	gl.Uniform1i(gl.GetUniformLocation(prog, "waveram"), 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "palTex"), 1);
 	gl.UseProgram(present);
@@ -785,8 +792,10 @@ void thread_main()
 			gl.DepthFunc(b.dtest ? GLLEQUAL : GLALWAYS);
 			gl.DepthMask(b.dwrite ? 1 : 0);
 			gl.ColorMask(b.cmask, b.cmask, b.cmask, b.cmask);
-			gl.Scissor(b.clip[0] * S, (b.rowbase + b.clip[1]) * S,
-				(b.clip[2] - b.clip[0] + 1) * S,
+			// widescreen: allow the full canvas width (margins) but keep
+			// the cliprect's vertical bounds. The game's horizontal clip
+			// (0..511) shifted by MARGIN would cut the margins off.
+			gl.Scissor(0, (b.rowbase + b.clip[1]) * S, fw,
 				(b.clip[3] - b.clip[1] + 1) * S);
 			gl.DrawArrays(0x0004, b.first, b.count);
 		}
@@ -799,9 +808,11 @@ void thread_main()
 		udata.clear();
 		batches.clear();
 	};
+	bool had_quads_iter = false, had_writes_iter = false, wide_mode = false;
 	auto add_quad = [&](const midz_quad_rec &r)
 	{
 		++n_quads;
+		had_quads_iter = true;
 		bool const blend = (r.flags & 2) != 0;
 		bool const dtest = (r.flags & 8) != 0;
 		bool const dwrite = ((r.flags & 16) != 0) && !(r.flags & 128);
@@ -838,6 +849,8 @@ void thread_main()
 	auto add_span = [&](uint32_t addr, uint32_t n, uint32_t rgb24,
 			int32_t depth, bool dwrite, bool cmask)
 	{
+		if (cmask)
+			had_writes_iter = true;   // 2D screen signal (frame writes)
 		while (n)
 		{
 			uint32_t const row = addr / CW, x = addr % CW;
@@ -945,6 +958,25 @@ void thread_main()
 			case 3:
 			{
 				uint32_t const *p = (const uint32_t *)rec.data();
+				// a frame-sized fast clear is the frame boundary: the game
+				// only clears its 512-wide region, so clear the 16:9 margins
+				// too (else they accumulate garbage from degenerate
+				// near-plane-clipped quads). Flush prior geometry first.
+				if (MARGIN > 0 && p[1] > uint32_t(CW * 4))
+				{
+					flush();
+					gl.BindFramebuffer(FRAMEBUFFER, fbo);
+					gl.Viewport(0, 0, fw, fh);
+					gl.Enable(GLSCISSOR_TEST);
+					gl.ClearColor(0, 0, 0, 1);
+					gl.ClearDepth(1.0);
+					gl.Scissor(0, 0, MARGIN * S, fh);
+					gl.Clear(0x4100);
+					gl.Scissor(fw - MARGIN * S, 0, MARGIN * S, fh);
+					gl.Clear(0x4100);
+					gl.Disable(GLSCISSOR_TEST);
+					gl.BindFramebuffer(FRAMEBUFFER, 0);
+				}
 				add_span(p[0] & (CW * CH - 1), std::min(p[1], uint32_t(CW * CH)),
 					p[2] & 0xffffff, int32_t(p[3]), true, true);
 				break;
@@ -997,7 +1029,15 @@ void thread_main()
 		s_rr.store(r, std::memory_order_release);
 		flush();
 
-		// ---- present (letterboxed 4:3) ----
+		// ---- present ----
+		// 3D scenes present 16:9 (full wide canvas); 2D screens (menus,
+		// high scores - drawn via frame writes) present 4:3, cropped to the
+		// center 512. Latch the mode on positive evidence so a paused 3D
+		// scene (no new geometry) doesn't flip to 4:3.
+		if (had_quads_iter) wide_mode = (MARGIN > 0);
+		else if (had_writes_iter) wide_mode = false;
+		had_quads_iter = had_writes_iter = false;
+
 		int const cw = rc.right - rc.left, ch = rc.bottom - rc.top;
 		gl.BindFramebuffer(FRAMEBUFFER, 0);
 		gl.Disable(GLDEPTH_TEST);
@@ -1005,12 +1045,17 @@ void thread_main()
 		gl.Viewport(0, 0, cw, ch);
 		gl.ClearColor(0, 0, 0, 1);
 		gl.Clear(0x4000);
-		float const aspect = 4.0f / 3.0f;
+		// PAR ~1.0: 512x400 4:3-ish; 16:9 spans the full CWW canvas
+		float const aspect = wide_mode ? (16.0f / 9.0f) : (4.0f / 3.0f);
 		int vw = cw, vh = int(cw / aspect + 0.5f);
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
 		gl.UseProgram(present);
 		gl.Uniform1i(uBaseRow, int((zb38 >> 16) & (CH - 1)));
 		gl.Uniform1i(uCrt, crt ? 1 : 0);
+		gl.Uniform1f(gl.GetUniformLocation(present, "uSampW"),
+			wide_mode ? float(CWW) : 512.0f);
+		gl.Uniform1f(gl.GetUniformLocation(present, "uSampX0"),
+			wide_mode ? 0.0f : float(MARGIN));
 		gl.ActiveTexture(TEXTURE0 + 3);
 		gl.BindTexture(0x0DE1, fbTex);
 		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
