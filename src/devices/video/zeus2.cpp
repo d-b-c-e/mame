@@ -1301,7 +1301,10 @@ void zeus2_device::midz_cap_quad(int numverts, const void *verts,
 	}
 	auto const *v = reinterpret_cast<const z2_poly_vertex *>(verts);
 	midz_quad_rec r = {};
-	r.frame = uint32_t(screen().frame_number());
+	// frame number matters only to the offline capture; the live overlay
+	// ignores it, and screen().frame_number() per quad (~6.5k/frame) is a
+	// measurable emu-thread cost
+	r.frame = midz_cap ? uint32_t(screen().frame_number()) : 0;
 	r.numverts = numverts;
 	r.texdata = texdata;
 	r.tex_src = extra.tex_src;
