@@ -1032,10 +1032,18 @@ void thread_main()
 		// ---- present ----
 		// 3D scenes present 16:9 (full wide canvas); 2D screens (menus,
 		// high scores - drawn via frame writes) present 4:3, cropped to the
-		// center 512. Latch the mode on positive evidence so a paused 3D
-		// scene (no new geometry) doesn't flip to 4:3.
-		if (had_quads_iter) wide_mode = (MARGIN > 0);
-		else if (had_writes_iter) wide_mode = false;
+		// center 512. Hysteresis: quads flip to wide IMMEDIATELY, but
+		// dropping to 4:3 needs a sustained run of quad-free write
+		// iterations - a mid-frame iteration catching only HUD frame
+		// writes otherwise flickered the aspect (seen as width "wobble").
+		static int s_no_quad_writes = 0;
+		if (had_quads_iter)
+		{
+			wide_mode = (MARGIN > 0);
+			s_no_quad_writes = 0;
+		}
+		else if (had_writes_iter && ++s_no_quad_writes >= 30)
+			wide_mode = false;
 		had_quads_iter = had_writes_iter = false;
 
 		int const cw = rc.right - rc.left, ch = rc.bottom - rc.top;
