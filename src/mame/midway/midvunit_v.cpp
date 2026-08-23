@@ -206,8 +206,36 @@ static void telem_notify(const char *outname, s32 value, void *)
 			(const sockaddr *)&s_telem_addr, sizeof(s_telem_addr));
 }
 
+// Telemetry Phase B: per-game DSP-RAM word address of the car speed (MPH,
+// TMS320C3x float), found by differential RAM-hunt over a demo-race
+// acceleration (results/ramhunt; see RESULTS.md). 0 = not yet hunted.
+// crusnusa 0x0F22D CONFIRMED (0->~295 monotone accel, resets per demo lap).
+struct SpeedAddr { const char *game; uint32_t addr; };
+static const SpeedAddr s_speed_addr[] = {
+	{ "crusnusa", 0x0F22D }, { "crusnu40", 0x0F22D }, { "crusnu21", 0x0F22D },
+	{ "crusnwld", 0 }, { "offroadc", 0 },   // hunt pending
+	{ nullptr, 0 },
+};
+static uint32_t s_speed_word = 0;   // resolved at telem_init
+
+// TMS320C3x 32-bit float -> host float: [exp 8b two's-comp][sign][frac 23b]
+static float c3x_to_float(uint32_t w)
+{
+	int e = (w >> 24) & 0xff;
+	int s = (w >> 23) & 1;
+	float frac = float(w & 0x7fffff) / float(1 << 23);
+	if (e == 0 && s == 0 && frac == 0.0f)
+		return 0.0f;
+	int exp = (e < 0x80) ? e : e - 256;
+	return ((s ? -2.0f : 1.0f) + frac) * std::ldexp(1.0f, exp);
+}
+
 static void telem_init(const char *spec, const char *game)
 {
+	s_speed_word = 0;
+	for (const SpeedAddr *p = s_speed_addr; p->game; ++p)
+		if (!strcmp(p->game, game)) { s_speed_word = p->addr; break; }
+
 	char host[64] = "127.0.0.1";
 	int port = 20777;
 	if (spec && *spec)
@@ -1777,6 +1805,16 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		}
 	}
 
+	// Telemetry Phase B: mirror the car speed (MPH) as a UDP datagram each
+	// frame, alongside the Phase-A output mirror. Only when telemetry is on
+	// and this game's speed word has been hunted.
+	if (s_telem_sock != INVALID_SOCKET && s_speed_word)
+	{
+		float mph = c3x_to_float(m_ram_base[s_speed_word]);
+		if (mph >= 0.0f && mph < 1000.0f)
+			telem_notify("speed", s32(mph + 0.5f), nullptr);
+	}
+
 	// live bridge: palette/texture must flow even before any quad is drawn -
 	// boot and test screens are CPU-drawn, and without this the palette never
 	// reaches the renderer until the first 3D scene (boot showed black).
@@ -1784,6 +1822,26 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		live().sync_state(uint32_t(screen.frame_number()),
 			m_paletteram.target(), uint32_t(m_paletteram.bytes()),
 			m_textureram.target(), uint32_t(m_textureram.bytes()));
+
+	// POC telemetry Phase B RAM hunt: dump the DSP work RAM every N frames
+	// (MIDV_RAMDUMP_DIR + MIDV_RAMDUMP_EVERY, default 30) so a demo-race
+	// acceleration can be differential-searched offline for speed/RPM.
+	{
+		static const char *s_rdir = std::getenv("MIDV_RAMDUMP_DIR");
+		static int s_every = std::getenv("MIDV_RAMDUMP_EVERY")
+			? atoi(std::getenv("MIDV_RAMDUMP_EVERY")) : 30;
+		if (s_rdir && (screen.frame_number() % std::max(1, s_every)) == 0)
+		{
+			char path[512];
+			snprintf(path, sizeof(path), "%s/ram_%06u.bin", s_rdir,
+				uint32_t(screen.frame_number()));
+			if (FILE *f = std::fopen(path, "wb"))
+			{
+				std::fwrite(m_ram_base.target(), 1, 0x20000 * 4, f);
+				std::fclose(f);
+			}
+		}
+	}
 
 	// POC: one-shot memory dump so the quad stream can be re-rasterized and
 	// verified offline. Runs after the poly wait, so all quads have landed.
