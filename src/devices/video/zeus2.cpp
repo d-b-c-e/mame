@@ -2993,7 +2993,17 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 			return;
 	}
 
-	zeus2_poly_extra_data& extra = this->object_data().next();
+	// live overlay: our GL renderer draws every quad itself, so MAME's CPU
+	// rasterization would render the whole game a second time into a
+	// framebuffer nobody displays. When live, fill a LOCAL raster-state
+	// struct for the capture (never touching poly_manager's object ring)
+	// and skip render_triangle_fan below - recovers the emu-thread margin
+	// that pushed crusnexo under 100% beside ambient load. The offline
+	// capture path (midz_cap without live) still rasterizes: the oracle
+	// diffs against the CPU framebuffer.
+	zeus2_poly_extra_data local_extra;
+	zeus2_poly_extra_data& extra = m_state->midz_live
+		? local_extra : this->object_data().next();
 
 	extra.ucode_src = m_state->m_curUCodeSrc;
 	extra.tex_src = m_state->zeus_texbase;
@@ -3046,6 +3056,8 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	}
 
 	m_state->midz_cap_quad(numverts, clipvert, extra, texdata);
+	if (m_state->midz_live)
+		return;   // see local_extra above - GL overlay renders this quad
 	render_triangle_fan<4>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
 }
 
