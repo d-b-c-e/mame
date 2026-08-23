@@ -106,12 +106,66 @@ void midvplus_state::machine_start()
 }
 
 
+// ── POC code patcher (env-gated, ROM files untouched) ───────────────────
+// The whole TMS320C31 program is copied maindata ROM -> program RAM at each
+// reset; we overlay word patches on that RAM copy, so nothing on disk is
+// modified (GPL/legal bright line intact). MIDV_PATCH=<file>, one patch per
+// line: "WORDADDR OLD NEW" in hex (WORDADDR is a program-RAM word index
+// 0..0x1ffff; OLD is verified before writing, or "*" to skip the check).
+// Lines starting with # are comments. Used for the ground-culling widen
+// experiment - see cruisn-collection results/RESULTS.md.
+static void midv_apply_patches(uint32_t *ram)
+{
+	const char *path = std::getenv("MIDV_PATCH");
+	if (!path)
+		return;
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	char line[256];
+	int applied = 0, skipped = 0;
+	while (fgets(line, sizeof(line), f))
+	{
+		if (line[0] == '#' || line[0] == '\n')
+			continue;
+		char oldtok[64] = {};
+		unsigned addr = 0, newval = 0;
+		if (sscanf(line, "%x %63s %x", &addr, oldtok, &newval) != 3)
+			continue;
+		if (addr >= 0x20000)
+			continue;
+		if (strcmp(oldtok, "*") != 0)
+		{
+			unsigned oldval = strtoul(oldtok, nullptr, 16);
+			if (ram[addr] != oldval)
+			{
+				skipped++;
+				continue;   // guard: game version / address mismatch
+			}
+		}
+		ram[addr] = newval;
+		applied++;
+	}
+	fclose(f);
+	if (std::getenv("MIDV_GL_LOG"))
+	{
+		FILE *lg = fopen("midv_gl.log", "a");
+		if (lg)
+		{
+			fprintf(lg, "MIDV_PATCH %s: %d applied, %d skipped\n",
+				path, applied, skipped);
+			fclose(lg);
+		}
+	}
+}
+
 void midvunit_base_state::machine_reset()
 {
 	m_dcs->reset_w(0);
 	m_dcs->reset_w(1);
 
 	memcpy(m_ram_base, memregion("maindata")->base(), 0x20000*4);
+	midv_apply_patches(m_ram_base);
 	m_maincpu->reset();
 }
 

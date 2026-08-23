@@ -459,7 +459,7 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 // ---- the render thread ----
 // HEIGHT is the default coarse height; offroadc runs a 512x401 mode, so
 // the launcher passes MIDV_GL_HEIGHT=401 and statics size for MAXH
-constexpr int MARGIN = 86, WIDE = 512 + 2 * MARGIN, HEIGHT = 400, MAXH = 401;
+constexpr int MARGIN_DEFAULT = 86, HEIGHT = 400, MAXH = 401;
 constexpr float PAR = 1.0417f;
 
 static FILE *s_log;
@@ -540,6 +540,14 @@ void thread_main()
 	int H = std::getenv("MIDV_GL_HEIGHT") ? atoi(std::getenv("MIDV_GL_HEIGHT")) : HEIGHT;
 	if (H < HEIGHT || H > MAXH)
 		H = HEIGHT;
+	// 16:9 margin width per side, runtime (MIDV_GL_MARGIN). 86 = full
+	// widescreen; a smaller value trims the outer margin where a game's
+	// backdrop/water plane is legitimately drawn but reads as an artifact
+	// (offroadc's canyon-edge water in the bottom corners). 0 = pure 4:3.
+	int const MARGIN = std::getenv("MIDV_GL_MARGIN")
+		? std::max(0, std::min(86, atoi(std::getenv("MIDV_GL_MARGIN"))))
+		: MARGIN_DEFAULT;
+	int const WIDE = 512 + 2 * MARGIN;
 	int const fw = WIDE * S, fh = H * S;
 
 	// wait for MAME's window
