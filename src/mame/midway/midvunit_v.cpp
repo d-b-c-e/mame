@@ -1907,18 +1907,44 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// Telemetry Phase B: mirror the car speed (MPH) as a UDP datagram each
 	// frame, alongside the Phase-A output mirror. Only when telemetry is on
 	// and this game's speed word has been hunted.
+	// Gating (found live on the rig): OUTSIDE races the DSP words hold
+	// unrelated data - the "speed" word spiked to ~990 in menus/transitions
+	// (pegging SimHub gauges at full scale) and the rpm word parks on a
+	// constant junk value (~541) in menus. Two-layer gate:
+	//  1. plausibility: speed 0..400 (real max ~301), rpm 0..1400 (redline
+	//     ~912, transient spikes ~1371); out-of-range -> 0.
+	//  2. rpm freshness: when the car is stationary AND the rpm word's raw
+	//     bits have been frozen for ~3s it's a parked menu value -> 0.
+	//     (Only while stationary: at real top-speed cruise or start-line
+	//     revving the engine sim wobbles the bits, and speed>0 bypasses it.)
+	float telem_mph = 0.0f, telem_rpm = 0.0f;
+	if (s_speed_word)
+	{
+		float v = c3x_to_float(m_ram_base[s_speed_word]);
+		if (v >= 0.0f && v < 400.0f)
+			telem_mph = v;
+	}
+	if (s_rpm_word)
+	{
+		static uint32_t s_rpm_bits = 0;
+		static int s_rpm_still = 0;
+		uint32_t bits = m_ram_base[s_rpm_word];
+		if (bits == s_rpm_bits)
+			s_rpm_still += (s_rpm_still < 10000);
+		else
+		{
+			s_rpm_bits = bits;
+			s_rpm_still = 0;
+		}
+		float v = c3x_to_float(bits);
+		bool const parked = (telem_mph < 0.5f && s_rpm_still >= 180);
+		if (v >= 0.0f && v < 1400.0f && !parked)
+			telem_rpm = v;
+	}
 	if (s_telem_sock != INVALID_SOCKET && s_speed_word)
-	{
-		float mph = c3x_to_float(m_ram_base[s_speed_word]);
-		if (mph >= 0.0f && mph < 1000.0f)
-			telem_notify("speed", s32(mph + 0.5f), nullptr);
-	}
+		telem_notify("speed", s32(telem_mph + 0.5f), nullptr);
 	if (s_telem_sock != INVALID_SOCKET && s_rpm_word)
-	{
-		float rpm = c3x_to_float(m_ram_base[s_rpm_word]);
-		if (rpm >= 0.0f && rpm < 20000.0f)
-			telem_notify("rpm", s32(rpm + 0.5f), nullptr);
-	}
+		telem_notify("rpm", s32(telem_rpm + 0.5f), nullptr);
 
 	// Telemetry Phase C: Forza Horizon 4/5 "Data Out" packet (324 bytes),
 	// so SimHub / dash apps consume us as Forza with stock profiles.
@@ -1928,10 +1954,8 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// needle in a believable 0-7300 band under EngineMaxRpm 7500.
 	if (s_forza_on && s_telem_sock != INVALID_SOCKET)
 	{
-		float mph = s_speed_word ? c3x_to_float(m_ram_base[s_speed_word]) : 0.0f;
-		float rpm = s_rpm_word ? c3x_to_float(m_ram_base[s_rpm_word]) : 0.0f;
-		if (!(mph >= 0.0f && mph < 1000.0f)) mph = 0.0f;
-		if (!(rpm >= 0.0f && rpm < 20000.0f)) rpm = 0.0f;
+		float const mph = telem_mph;   // gated above
+		float const rpm = telem_rpm;
 		uint8_t pkt[324] = { 0 };
 		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
 		const int32_t one = 1;
