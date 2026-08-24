@@ -200,8 +200,10 @@ static bool s_telem_json = false;   // JSON stream requested (MIDV_TELEM_UDP)
 // Horizon 4/5 "Data Out" 324-byte binary packet each frame, with our hunted
 // speed (m/s) and RPM filled in. SimHub / dash apps / bass-shaker profiles
 // then treat the game as Forza Horizon with zero custom configuration.
-static sockaddr_in s_forza_addr;
-static bool s_forza_on = false;
+// comma-separated targets ("127.0.0.1:8000,127.0.0.1:8001") so SimHub and
+// the forza_probe diagnostic can watch the same stream simultaneously
+static sockaddr_in s_forza_addr[4];
+static int s_forza_n = 0;
 static uint32_t s_forza_ms = 0;
 
 // "host:port" / "port" / null -> sockaddr (defaults preserved on null)
@@ -315,8 +317,14 @@ static void telem_init(const char *spec, const char *game)
 	telem_parse_addr(spec, s_telem_addr, "127.0.0.1", 20777);
 	if (const char *fz = std::getenv("MIDV_TELEM_FORZA"))
 	{
-		telem_parse_addr(fz, s_forza_addr, "127.0.0.1", 5300);
-		s_forza_on = true;
+		char buf[256];
+		strncpy(buf, fz, sizeof(buf) - 1);
+		buf[sizeof(buf) - 1] = 0;
+		char *save = nullptr;
+		for (char *tok = strtok_s(buf, ",", &save);
+				tok && s_forza_n < 4;
+				tok = strtok_s(nullptr, ",", &save))
+			telem_parse_addr(tok, s_forza_addr[s_forza_n++], "127.0.0.1", 5300);
 	}
 	strncpy(s_telem_game, game, sizeof(s_telem_game) - 1);
 	s_telem_sock = s;
@@ -1952,7 +1960,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// We fill IsRaceOn, timestamp, RPM trio, forward velocity, Speed, gear.
 	// Game RPM is internal tach units (crusnusa redline ~912): x8 puts the
 	// needle in a believable 0-7300 band under EngineMaxRpm 7500.
-	if (s_forza_on && s_telem_sock != INVALID_SOCKET)
+	if (s_forza_n > 0 && s_telem_sock != INVALID_SOCKET)
 	{
 		float const mph = telem_mph;   // gated above
 		float const rpm = telem_rpm;
@@ -1986,8 +1994,9 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 				default: break;
 			}
 		pkt[319] = gear;
-		sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
-				(const sockaddr *)&s_forza_addr, sizeof(s_forza_addr));
+		for (int fi = 0; fi < s_forza_n; fi++)
+			sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
+					(const sockaddr *)&s_forza_addr[fi], sizeof(s_forza_addr[fi]));
 	}
 
 	// live bridge: palette/texture must flow even before any quad is drawn -
