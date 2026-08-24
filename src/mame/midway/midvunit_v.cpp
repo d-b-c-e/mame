@@ -2038,6 +2038,23 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 					std::fclose(f);
 				}
 			}
+			// C31 on-chip internal RAM (2K words at 0x809800): the last
+			// unexplored memory - neither external bank correlates with the
+			// on-screen MPH under any decoding, so the hot player state
+			// must live here
+			{
+				address_space &sp = m_maincpu->space(AS_PROGRAM);
+				static uint32_t buf[0x800];
+				for (int i = 0; i < 0x800; i++)
+					buf[i] = sp.read_dword(0x809800 + i);
+				snprintf(path, sizeof(path), "%s/ram3_%06u.bin", s_rdir,
+					uint32_t(screen.frame_number()));
+				if (FILE *f = std::fopen(path, "wb"))
+				{
+					std::fwrite(buf, 4, 0x800, f);
+					std::fclose(f);
+				}
+			}
 			// HUD ground truth: bottom quarter of the VISIBLE page (rows
 			// 300-399) - the on-screen MPH digits + gear digit, OCR'd
 			// offline and correlated against every RAM word to locate the
