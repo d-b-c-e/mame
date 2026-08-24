@@ -193,10 +193,47 @@ midv_live &live();
 static SOCKET s_telem_sock = INVALID_SOCKET;
 static sockaddr_in s_telem_addr;
 static char s_telem_game[16];
+static bool s_telem_json = false;   // JSON stream requested (MIDV_TELEM_UDP)
+
+// ---- Forza-compatible telemetry (Phase C) ---------------------------------
+// MIDV_TELEM_FORZA=host:port (default 127.0.0.1:5300): emit the Forza
+// Horizon 4/5 "Data Out" 324-byte binary packet each frame, with our hunted
+// speed (m/s) and RPM filled in. SimHub / dash apps / bass-shaker profiles
+// then treat the game as Forza Horizon with zero custom configuration.
+static sockaddr_in s_forza_addr;
+static bool s_forza_on = false;
+static uint32_t s_forza_ms = 0;
+
+// "host:port" / "port" / null -> sockaddr (defaults preserved on null)
+static void telem_parse_addr(const char *spec, sockaddr_in &out,
+		const char *def_host, int def_port)
+{
+	char host[64];
+	strncpy(host, def_host, sizeof(host) - 1);
+	host[sizeof(host) - 1] = 0;
+	int port = def_port;
+	if (spec && *spec)
+	{
+		const char *c = strchr(spec, ':');
+		if (c)
+		{
+			size_t n = std::min(size_t(c - spec), sizeof(host) - 1);
+			memcpy(host, spec, n);
+			host[n] = 0;
+			port = atoi(c + 1);
+		}
+		else if (atoi(spec) > 0)
+			port = atoi(spec);
+	}
+	memset(&out, 0, sizeof(out));
+	out.sin_family = AF_INET;
+	out.sin_port = htons(uint16_t(port));
+	out.sin_addr.s_addr = inet_addr(host);
+}
 
 static void telem_notify(const char *outname, s32 value, void *)
 {
-	if (s_telem_sock == INVALID_SOCKET)
+	if (s_telem_sock == INVALID_SOCKET || !s_telem_json)
 		return;
 	char buf[160];
 	int n = snprintf(buf, sizeof(buf),
@@ -268,31 +305,19 @@ static void telem_init(const char *spec, const char *game)
 	for (const RpmAddr *p = s_rpm_addr; p->game; ++p)
 		if (!strcmp(p->game, game)) { s_rpm_word = p->addr; break; }
 
-	char host[64] = "127.0.0.1";
-	int port = 20777;
-	if (spec && *spec)
-	{
-		const char *c = strchr(spec, ':');
-		if (c)
-		{
-			size_t n = std::min(size_t(c - spec), sizeof(host) - 1);
-			memcpy(host, spec, n);
-			host[n] = 0;
-			port = atoi(c + 1);
-		}
-		else if (atoi(spec) > 0)
-			port = atoi(spec);
-	}
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
 		return;
 	SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
 	if (s == INVALID_SOCKET)
 		return;
-	memset(&s_telem_addr, 0, sizeof(s_telem_addr));
-	s_telem_addr.sin_family = AF_INET;
-	s_telem_addr.sin_port = htons(uint16_t(port));
-	s_telem_addr.sin_addr.s_addr = inet_addr(host);
+	s_telem_json = (spec != nullptr);
+	telem_parse_addr(spec, s_telem_addr, "127.0.0.1", 20777);
+	if (const char *fz = std::getenv("MIDV_TELEM_FORZA"))
+	{
+		telem_parse_addr(fz, s_forza_addr, "127.0.0.1", 5300);
+		s_forza_on = true;
+	}
 	strncpy(s_telem_game, game, sizeof(s_telem_game) - 1);
 	s_telem_sock = s;
 }
@@ -1311,10 +1336,13 @@ void midvunit_base_state::video_start()
 
 	// POC: UDP telemetry (Phase A) - mirror every output change (wheel
 	// force, lamps) to a UDP consumer. Env-gated, inert unset.
-	if (const char *spec = std::getenv("MIDV_TELEM_UDP"))
+	// MIDV_TELEM_FORZA alone also works (Forza packets, no JSON stream).
+	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
+	if (telem_spec || std::getenv("MIDV_TELEM_FORZA"))
 	{
-		telem_init(spec, machine().system().name);
-		machine().output().set_global_notifier(&telem_notify, nullptr);
+		telem_init(telem_spec, machine().system().name);
+		if (telem_spec)
+			machine().output().set_global_notifier(&telem_notify, nullptr);
 	}
 
 	m_scanline_timer = timer_alloc(FUNC(midvunit_base_state::scanline_timer_cb), this);
@@ -1890,6 +1918,39 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		float rpm = c3x_to_float(m_ram_base[s_rpm_word]);
 		if (rpm >= 0.0f && rpm < 20000.0f)
 			telem_notify("rpm", s32(rpm + 0.5f), nullptr);
+	}
+
+	// Telemetry Phase C: Forza Horizon 4/5 "Data Out" packet (324 bytes),
+	// so SimHub / dash apps consume us as Forza with stock profiles.
+	// Layout: FM7 sled (0-231) + 12-byte Horizon block + dash section.
+	// We fill IsRaceOn, timestamp, RPM trio, forward velocity, Speed, gear.
+	// Game RPM is internal tach units (crusnusa redline ~912): x8 puts the
+	// needle in a believable 0-7300 band under EngineMaxRpm 7500.
+	if (s_forza_on && s_telem_sock != INVALID_SOCKET)
+	{
+		float mph = s_speed_word ? c3x_to_float(m_ram_base[s_speed_word]) : 0.0f;
+		float rpm = s_rpm_word ? c3x_to_float(m_ram_base[s_rpm_word]) : 0.0f;
+		if (!(mph >= 0.0f && mph < 1000.0f)) mph = 0.0f;
+		if (!(rpm >= 0.0f && rpm < 20000.0f)) rpm = 0.0f;
+		uint8_t pkt[324] = { 0 };
+		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
+		const int32_t one = 1;
+		const float maxrpm = 7500.0f, idlerpm = 700.0f;
+		// clamp: transient junk (attract resets) briefly reads above real
+		// redline (~912*8) and would peg a dash gauge
+		const float currpm = std::min(rpm * 8.0f, maxrpm);
+		const float spd_ms = mph * 0.44704f;
+		s_forza_ms += 17;
+		put32(0, &one);              // IsRaceOn
+		put32(4, &s_forza_ms);       // TimestampMS
+		put32(8, &maxrpm);           // EngineMaxRpm
+		put32(12, &idlerpm);         // EngineIdleRpm
+		put32(16, &currpm);          // EngineCurrentRpm
+		put32(40, &spd_ms);          // VelocityZ (forward, m/s)
+		put32(256, &spd_ms);         // Speed (m/s, FH dash offset)
+		pkt[319] = 1;                // Gear (cosmetic)
+		sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
+				(const sockaddr *)&s_forza_addr, sizeof(s_forza_addr));
 	}
 
 	// live bridge: palette/texture must flow even before any quad is drawn -
