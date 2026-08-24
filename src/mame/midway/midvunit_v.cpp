@@ -8,6 +8,7 @@
 
 #include "emu.h"
 #include "midvunit.h"
+#include "midvunit_hud_ocr.h"
 
 #include "williamssound.h"
 
@@ -245,6 +246,117 @@ static void telem_notify(const char *outname, s32 value, void *)
 			(const sockaddr *)&s_telem_addr, sizeof(s_telem_addr));
 }
 
+// ---- HUD OCR speed (Phase B final form) -----------------------------------
+// The player's displayed speed exists in NO memory (see RESULTS.md saga);
+// the HUD digits are CPU-blitted into videoram. So read them back: decode
+// the MPH box glyphs from the visible page each frame against the baked
+// templates (validated offline: 822/823 agreement with the calibration
+// OCR). Correct by construction - it reads exactly what the player reads.
+// Per-game box coords (absolute videoram rows/cols); 0-width = not
+// calibrated yet (speed stays 0 for that game).
+struct HudBox { const char *game; int x0, x1, y0, y1; };
+static const HudBox s_hud_box[] = {
+	{ "crusnusa", 30, 72, 347, 370 },
+	{ nullptr, 0, 0, 0, 0 },
+};
+static const HudBox *s_hud = nullptr;   // resolved at telem_init
+static float s_hud_last = 0.0f;
+static float s_hud_pending = -1.0f;
+
+static int hud_ocr_digit(const float *cell, int ch, int cw)
+{
+	// bilinear resample to 12x18, L2-match the baked templates
+	float g[18][12];
+	for (int oy = 0; oy < 18; oy++)
+	{
+		float fy = (oy + 0.5f) * ch / 18.0f - 0.5f;
+		int y0 = int(std::floor(fy));
+		float ty = fy - y0;
+		int y0c = std::min(std::max(y0, 0), ch - 1), y1c = std::min(y0c + 1, ch - 1);
+		for (int ox = 0; ox < 12; ox++)
+		{
+			float fx = (ox + 0.5f) * cw / 12.0f - 0.5f;
+			int x0 = int(std::floor(fx));
+			float tx = fx - x0;
+			int x0c = std::min(std::max(x0, 0), cw - 1), x1c = std::min(x0c + 1, cw - 1);
+			g[oy][ox] = (1 - ty) * ((1 - tx) * cell[y0c * cw + x0c] + tx * cell[y0c * cw + x1c])
+			          + ty * ((1 - tx) * cell[y1c * cw + x0c] + tx * cell[y1c * cw + x1c]);
+		}
+	}
+	int bestk = -1;
+	float bestd = 1e9f;
+	for (int k = 0; k < 10; k++)
+	{
+		float acc = 0;
+		for (int r = 0; r < 18; r++)
+			for (int c = 0; c < 12; c++)
+			{
+				float dd = g[r][c] / 255.0f - s_hud_digit_tmpl[k][r][c] / 255.0f;
+				acc += dd * dd;
+			}
+		acc /= 18 * 12;
+		if (acc < bestd) { bestd = acc; bestk = k; }
+	}
+	return (bestd <= 0.035f) ? bestk : -1;
+}
+
+// returns displayed MPH, or -1 when the box is absent/unreadable
+static int hud_ocr_mph(const uint16_t *videoram, uint16_t page_control,
+		const HudBox *box)
+{
+	uint32_t const base = (page_control & 1) ? 0x40000 : 0x00000;
+	int const W = box->x1 - box->x0, H = box->y1 - box->y0;
+	if (W <= 0 || W > 64 || H <= 0 || H > 32)
+		return -1;
+	float win[32][64];
+	bool coloncol[64];
+	for (int x = 0; x < W; x++) coloncol[x] = false;
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+		{
+			float v = float(videoram[base + (box->y0 + y) * 512 + box->x0 + x] & 0xff);
+			win[y][x] = v;
+			if (v > 110.0f) coloncol[x] = true;
+		}
+	// segment cells: lit column runs, gaps >=2 split, min width 2
+	int cells[4][2];
+	int ncell = 0, s0 = -1, gap = 0;
+	for (int x = 0; x < W && ncell < 4; x++)
+	{
+		if (coloncol[x]) { if (s0 < 0) s0 = x; gap = 0; }
+		else if (s0 >= 0 && ++gap >= 2)
+		{
+			if (x - gap - s0 + 1 >= 2) { cells[ncell][0] = s0; cells[ncell][1] = x - gap + 1; ncell++; }
+			s0 = -1; gap = 0;
+		}
+	}
+	if (s0 >= 0 && W - s0 >= 2 && ncell < 4) { cells[ncell][0] = s0; cells[ncell][1] = W; ncell++; }
+	if (ncell < 1 || ncell > 3)
+		return -1;
+	int value = 0;
+	for (int ci = 0; ci < ncell; ci++)
+	{
+		int a = cells[ci][0], b = cells[ci][1];
+		// row bounds of lit pixels
+		int r0 = -1, r1 = -1;
+		for (int y = 0; y < H; y++)
+			for (int x = a; x < b; x++)
+				if (win[y][x] > 110.0f) { if (r0 < 0) r0 = y; r1 = y; }
+		if (r0 < 0 || r1 - r0 + 1 < 12)
+			return -1;
+		int const ch = r1 - r0 + 1, cw = b - a;
+		float cell[32 * 64];
+		for (int y = 0; y < ch; y++)
+			for (int x = 0; x < cw; x++)
+				cell[y * cw + x] = win[r0 + y][a + x];
+		int d = hud_ocr_digit(cell, ch, cw);
+		if (d < 0)
+			return -1;
+		value = value * 10 + d;
+	}
+	return value;
+}
+
 // Telemetry Phase B: per-game DSP-RAM word address of the car speed (MPH,
 // TMS320C3x float), found by differential RAM-hunt over a demo-race
 // acceleration (results/ramhunt; see RESULTS.md). 0 = not yet hunted.
@@ -303,6 +415,9 @@ static void telem_init(const char *spec, const char *game)
 	s_speed_word = 0;
 	for (const SpeedAddr *p = s_speed_addr; p->game; ++p)
 		if (!strcmp(p->game, game)) { s_speed_word = p->addr; break; }
+	s_hud = nullptr;
+	for (const HudBox *p = s_hud_box; p->game; ++p)
+		if (!strcmp(p->game, game)) { s_hud = p; break; }
 	s_rpm_word = 0;
 	for (const RpmAddr *p = s_rpm_addr; p->game; ++p)
 		if (!strcmp(p->game, game))
@@ -1938,6 +2053,36 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		float v = c3x_to_float(m_ram_base[s_speed_word]);
 		if (v >= 0.0f && v < 320.0f)   // real max ~301; menu junk seen at 373/990
 			telem_mph = v;
+	}
+	else if (s_hud)
+	{
+		// HUD OCR path: read the displayed MPH straight off the frame.
+		// A lone-frame misread (rare 4/9 confusion) must persist a second
+		// frame before a jump >25 mph is accepted.
+		int const mph = hud_ocr_mph(&m_videoram[0], m_page_control, s_hud);
+		if (mph >= 0 && mph < 400)
+		{
+			float const f = float(mph);
+			if (std::fabs(f - s_hud_last) <= 25.0f)
+			{
+				s_hud_last = f;
+				s_hud_pending = -1.0f;
+			}
+			else if (s_hud_pending >= 0.0f && std::fabs(f - s_hud_pending) <= 25.0f)
+			{
+				s_hud_last = f;
+				s_hud_pending = -1.0f;
+			}
+			else
+				s_hud_pending = f;
+		}
+		// box absent (menus): decay to 0 rather than freeze
+		else if (mph < 0)
+		{
+			static int s_absent = 0;
+			if (++s_absent >= 60) { s_hud_last = 0.0f; s_absent = 0; }
+		}
+		telem_mph = s_hud_last;
 	}
 	if (s_rpm_word)
 	{
