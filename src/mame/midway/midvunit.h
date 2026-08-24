@@ -76,6 +76,7 @@ protected:
 		, m_dcs(*this, "dcs")
 		, m_paletteram(*this, "paletteram")
 		, m_ram_base(*this, "ram_base")
+		, m_fastram(*this, "fastram")
 		, m_tms320c31_control(*this, "320c31_control")
 	{ }
 
@@ -121,6 +122,9 @@ public:
 	required_shared_ptr<uint32_t> m_paletteram;
 protected:
 	required_shared_ptr<uint32_t> m_ram_base;
+	// POC: second work-RAM bank (0x400000) - exposed for the telemetry RAM
+	// hunts; the live player physics does not live in m_ram_base
+	optional_shared_ptr<uint32_t> m_fastram;
 	required_shared_ptr<uint32_t> m_tms320c31_control;
 
 	uint8_t m_cmos_protected = 0;

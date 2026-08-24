@@ -723,7 +723,7 @@ void midvplus_state::midvplus_xf1_w(uint8_t data)
 void midvunit_state::midvunit_map(address_map &map)
 {
 	map(0x000000, 0x01ffff).ram().share(m_ram_base);
-	map(0x400000, 0x41ffff).ram();
+	map(0x400000, 0x41ffff).ram().share(m_fastram);
 	map(0x600000, 0x600000).w(FUNC(midvunit_state::dma_queue_w));
 	map(0x808000, 0x80807f).rw(FUNC(midvunit_state::tms320c31_control_r), FUNC(midvunit_state::tms320c31_control_w)).share(m_tms320c31_control);
 	map(0x900000, 0x97ffff).rw(FUNC(midvunit_state::videoram_r), FUNC(midvunit_state::videoram_w));

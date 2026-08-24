@@ -2025,6 +2025,19 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 				std::fwrite(m_ram_base.target(), 1, 0x20000 * 4, f);
 				std::fclose(f);
 			}
+			// second work-RAM bank (0x400000): the live player physics was
+			// proven NOT to be in m_ram_base (no word matched a 5x
+			// accelerate-to-full-stop fingerprint) - it must be here
+			if (m_fastram.found())
+			{
+				snprintf(path, sizeof(path), "%s/ram2_%06u.bin", s_rdir,
+					uint32_t(screen.frame_number()));
+				if (FILE *f = std::fopen(path, "wb"))
+				{
+					std::fwrite(m_fastram.target(), 1, 0x20000 * 4, f);
+					std::fclose(f);
+				}
+			}
 		}
 	}
 
