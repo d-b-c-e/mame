@@ -232,6 +232,21 @@ static const SpeedAddr s_speed_addr[] = {
 };
 static uint32_t s_speed_word = 0;   // resolved at telem_init
 
+// Telemetry Phase B: engine RPM (tach) DSP-RAM word, game internal units.
+// crusnusa 0x0DC20 CONFIRMED from a real driving capture (results/
+// drive-capture-crusnusa-*): tracks speed*~2.85 while accelerating but
+// DROPS sharply at the Hi/Lo gear shift while speed stays flat - the tach
+// signature speed never shows. Observed 0..912 (redline ~900). World /
+// Off Road need their own driving capture (RAM layouts differ). 0 = off.
+struct RpmAddr { const char *game; uint32_t addr; };
+static const RpmAddr s_rpm_addr[] = {
+	{ "crusnusa", 0x0DC20 },
+	{ "crusnwld", 0 },
+	{ "offroadc", 0 },
+	{ nullptr, 0 },
+};
+static uint32_t s_rpm_word = 0;   // resolved at telem_init
+
 // TMS320C3x 32-bit float -> host float: [exp 8b two's-comp][sign][frac 23b]
 static float c3x_to_float(uint32_t w)
 {
@@ -249,6 +264,9 @@ static void telem_init(const char *spec, const char *game)
 	s_speed_word = 0;
 	for (const SpeedAddr *p = s_speed_addr; p->game; ++p)
 		if (!strcmp(p->game, game)) { s_speed_word = p->addr; break; }
+	s_rpm_word = 0;
+	for (const RpmAddr *p = s_rpm_addr; p->game; ++p)
+		if (!strcmp(p->game, game)) { s_rpm_word = p->addr; break; }
 
 	char host[64] = "127.0.0.1";
 	int port = 20777;
@@ -1866,6 +1884,12 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		float mph = c3x_to_float(m_ram_base[s_speed_word]);
 		if (mph >= 0.0f && mph < 1000.0f)
 			telem_notify("speed", s32(mph + 0.5f), nullptr);
+	}
+	if (s_telem_sock != INVALID_SOCKET && s_rpm_word)
+	{
+		float rpm = c3x_to_float(m_ram_base[s_rpm_word]);
+		if (rpm >= 0.0f && rpm < 20000.0f)
+			telem_notify("rpm", s32(rpm + 0.5f), nullptr);
 	}
 
 	// live bridge: palette/texture must flow even before any quad is drawn -
