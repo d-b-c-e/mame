@@ -1920,7 +1920,8 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// (pegging SimHub gauges at full scale) and the rpm word parks on a
 	// constant junk value (~541) in menus. Two-layer gate:
 	//  1. plausibility: speed 0..400 (real max ~301), rpm 0..1400 (redline
-	//     ~912, transient spikes ~1371); out-of-range -> 0.
+	//     ~912, transient spikes ~1371); out-of-range -> 0. (speed junk
+	//     observed at 373 and 990 - the bound must sit under 373.)
 	//  2. rpm freshness: when the car is stationary AND the rpm word's raw
 	//     bits have been frozen for ~3s it's a parked menu value -> 0.
 	//     (Only while stationary: at real top-speed cruise or start-line
@@ -1929,7 +1930,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	if (s_speed_word)
 	{
 		float v = c3x_to_float(m_ram_base[s_speed_word]);
-		if (v >= 0.0f && v < 400.0f)
+		if (v >= 0.0f && v < 320.0f)   // real max ~301; menu junk seen at 373/990
 			telem_mph = v;
 	}
 	if (s_rpm_word)
