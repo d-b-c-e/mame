@@ -2038,6 +2038,20 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 					std::fclose(f);
 				}
 			}
+			// HUD ground truth: bottom quarter of the VISIBLE page (rows
+			// 300-399) - the on-screen MPH digits + gear digit, OCR'd
+			// offline and correlated against every RAM word to locate the
+			// true player state (shape-hunting kept finding drones)
+			{
+				uint32_t base = (m_page_control & 1) ? 0x40000 : 0x00000;
+				snprintf(path, sizeof(path), "%s/hud_%06u.bin", s_rdir,
+					uint32_t(screen.frame_number()));
+				if (FILE *f = std::fopen(path, "wb"))
+				{
+					std::fwrite(&m_videoram[base + 300 * 512], 2, 100 * 512, f);
+					std::fclose(f);
+				}
+			}
 		}
 	}
 
