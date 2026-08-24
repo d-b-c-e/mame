@@ -1948,7 +1948,20 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		put32(16, &currpm);          // EngineCurrentRpm
 		put32(40, &spd_ms);          // VelocityZ (forward, m/s)
 		put32(256, &spd_ms);         // Speed (m/s, FH dash offset)
-		pkt[319] = 1;                // Gear (cosmetic)
+		// Gear: mirror the REAL latched shifter (driver-maintained state,
+		// fed by both the 4-position shifter and the sequential buttons).
+		// Neutral shows 1st - Forza has no neutral code and 0 means reverse.
+		uint8_t gear = 1;
+		if (auto *mvs = dynamic_cast<midvunit_state *>(this))
+			switch (mvs->shifter_state())
+			{
+				case 0x2000: gear = 1; break;
+				case 0x1000: gear = 2; break;
+				case 0x0800: gear = 3; break;
+				case 0x0400: gear = 4; break;
+				default: break;
+			}
+		pkt[319] = gear;
 		sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
 				(const sockaddr *)&s_forza_addr, sizeof(s_forza_addr));
 	}

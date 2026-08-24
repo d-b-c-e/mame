@@ -142,6 +142,10 @@ public:
 	DECLARE_INPUT_CHANGED_MEMBER(gear_button);
 	DECLARE_INPUT_CHANGED_MEMBER(shift_button);
 
+	// POC telemetry: current latched shifter bitmask (0x2000=1st .. 0x0400=4th,
+	// 0=neutral) - the Forza-packet gear byte mirrors the real shifter
+	uint16_t shifter_state() const { return m_shifter_state; }
+
 protected:
 	midvunit_state(const machine_config &mconfig, device_type type, const char *tag)
 		: midvunit_base_state(mconfig, type, tag)
