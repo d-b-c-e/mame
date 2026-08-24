@@ -250,41 +250,41 @@ static void telem_notify(const char *outname, s32 value, void *)
 // acceleration (results/ramhunt; see RESULTS.md). 0 = not yet hunted.
 // crusnusa 0x0F22D CONFIRMED (0->~295 monotone accel, resets per demo lap).
 struct SpeedAddr { const char *game; uint32_t addr; };
-// Only parent romsets are listed - each address was hunted against that
-// specific build's RAM; clone versions can lay out DSP RAM differently, so
-// they intentionally fall through to 0 (telemetry off) rather than mirror an
-// unverified offset. The rig runs the parents.
+// SPEED IS CURRENTLY OFF FOR ALL GAMES (all zero): the HUD-OCR ground-truth
+// investigation (2026-08-23, RESULTS.md) proved the earlier attract-hunted
+// addresses (crusnusa 0x0F22D, crusnwld 0x0DDDC) track DRONE cars, not the
+// player - attract demos are drone-driven, so shape-hunting them lies. The
+// player's displayed speed is computed transiently (it lives in NO dumped
+// memory: both external banks + C31 internal RAM, all decodings, r<0.55).
+// The replacement is the HUD-quad DMA tap (reads the MPH digits at the
+// source); until it lands, emitting 0 beats emitting another car.
 static const SpeedAddr s_speed_addr[] = {
-	{ "crusnusa", 0x0F22D },
-	// crusnwld 0x0DDDC: differential RAM-hunt of the demo (results/ramhunt-wld)
-	// found a 10-field player physics cluster (stride 0xB0), each 0->~285
-	// monotone with a matching odometer partner (corr 0.998, same signature
-	// that isolated crusnusa 0x0F22D). Peak matches USA's unit. NEEDS ONE
-	// WHEEL CHECK to confirm this field == the on-screen speedometer (vs a
-	// wheel-speed / velocity-component sibling in the same cluster).
-	{ "crusnwld", 0x0DDDC },
-	// offroadc: attract demo shows no clean accelerate-from-0 speed curve
-	// (candidates spike-and-drop or read as signed velocity components);
-	// needs an on-screen-MPH correlation pass at the wheel to pick the slot.
+	{ "crusnusa", 0 },
+	{ "crusnwld", 0 },
 	{ "offroadc", 0 },
 	{ nullptr, 0 },
 };
 static uint32_t s_speed_word = 0;   // resolved at telem_init
 
-// Telemetry Phase B: engine RPM (tach) DSP-RAM word, game internal units.
-// crusnusa 0x0DC20 CONFIRMED from a real driving capture (results/
-// drive-capture-crusnusa-*): tracks speed*~2.85 while accelerating but
-// DROPS sharply at the Hi/Lo gear shift while speed stays flat - the tach
-// signature speed never shows. Observed 0..912 (redline ~900). World /
-// Off Road need their own driving capture (RAM layouts differ). 0 = off.
-struct RpmAddr { const char *game; uint32_t addr; };
+// Telemetry Phase B: engine RPM (tach). Formats differ per game:
+//   RPM_C3X  = whole word is a TMS320C3x float
+//   RPM_LO16 = low 16 bits, unsigned integer (high half is another field)
+// crusnusa 0x0E632.lo16 CONFIRMED against the ON-SCREEN TACH: the HUD RPM
+// gauge's fill-pixel count correlates r=+0.91 with this field over a real
+// drive (results/drive-capture-crusnusa-20260823-214142) - gauge
+// quantization is the only miss. Range ~0..14650 (redline ~14.6k game
+// units). The earlier 0x0DC20 was a drone's engine (same investigation).
+enum { RPM_C3X = 0, RPM_LO16 = 1 };
+struct RpmAddr { const char *game; uint32_t addr; int kind; float forza_scale; };
 static const RpmAddr s_rpm_addr[] = {
-	{ "crusnusa", 0x0DC20 },
-	{ "crusnwld", 0 },
-	{ "offroadc", 0 },
-	{ nullptr, 0 },
+	{ "crusnusa", 0x0E632, RPM_LO16, 0.5f },   // 14.6k raw -> ~7300 on the dash
+	{ "crusnwld", 0, RPM_C3X, 1.0f },
+	{ "offroadc", 0, RPM_C3X, 1.0f },
+	{ nullptr, 0, 0, 0.0f },
 };
 static uint32_t s_rpm_word = 0;   // resolved at telem_init
+static int s_rpm_kind = RPM_C3X;
+static float s_rpm_fscale = 1.0f;
 
 // TMS320C3x 32-bit float -> host float: [exp 8b two's-comp][sign][frac 23b]
 static float c3x_to_float(uint32_t w)
@@ -305,7 +305,13 @@ static void telem_init(const char *spec, const char *game)
 		if (!strcmp(p->game, game)) { s_speed_word = p->addr; break; }
 	s_rpm_word = 0;
 	for (const RpmAddr *p = s_rpm_addr; p->game; ++p)
-		if (!strcmp(p->game, game)) { s_rpm_word = p->addr; break; }
+		if (!strcmp(p->game, game))
+		{
+			s_rpm_word = p->addr;
+			s_rpm_kind = p->kind;
+			s_rpm_fscale = p->forza_scale;
+			break;
+		}
 
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
@@ -1945,9 +1951,21 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 			s_rpm_bits = bits;
 			s_rpm_still = 0;
 		}
-		float v = c3x_to_float(bits);
+		float v;
+		float vmax;
+		if (s_rpm_kind == RPM_LO16)
+		{
+			uint32_t lo = bits & 0xffff;
+			v = (lo < 0x8000) ? float(lo) : 0.0f;   // 0xFFFF = invalid marker
+			vmax = 20000.0f;
+		}
+		else
+		{
+			v = c3x_to_float(bits);
+			vmax = 1400.0f;
+		}
 		bool const parked = (telem_mph < 0.5f && s_rpm_still >= 180);
-		if (v >= 0.0f && v < 1400.0f && !parked)
+		if (v >= 0.0f && v < vmax && !parked)
 			telem_rpm = v;
 	}
 	if (s_telem_sock != INVALID_SOCKET && s_speed_word)
@@ -1969,9 +1987,9 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
 		const int32_t one = 1;
 		const float maxrpm = 7500.0f, idlerpm = 700.0f;
-		// clamp: transient junk (attract resets) briefly reads above real
-		// redline (~912*8) and would peg a dash gauge
-		const float currpm = std::min(rpm * 8.0f, maxrpm);
+		// per-game scale maps raw tach units into the 0..7500 dash band;
+		// clamp so transient junk never pegs the gauge
+		const float currpm = std::min(rpm * s_rpm_fscale, maxrpm);
 		const float spd_ms = mph * 0.44704f;
 		s_forza_ms += 17;
 		put32(0, &one);              // IsRaceOn
