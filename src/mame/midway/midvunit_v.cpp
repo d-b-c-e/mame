@@ -639,8 +639,26 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 		uint32_t const blo = dma[14] & 0xff;
 		bool const backdrop = (blo == 0x7f || blo == 0x56 || blo == 0xc5)
 			&& (bxmax - bxmin) > 200;
+		// bit2: parked screen-space UI - untextured panels the game slides
+		// in from past the 4:3 edge (crusnwld radio) PARK fully off-screen
+		// where the hardware raster crop hid them; the shader never draws
+		// the parked position (wide builds only: xoff > 0). Sliding or
+		// deployed quads straddle x=511 and render normally.
+		bool parked = false;
+		if (xoff > 0.0f && !textured && bxmin >= 512)
+		{
+			int16_t const by0 = int16_t(dma[3]), by1 = int16_t(dma[5]),
+				by2 = int16_t(dma[7]), by3 = int16_t(dma[9]);
+			int const bymin = std::min(std::min(by0, by1), std::min(by2, by3));
+			int const bymax = std::max(std::max(by0, by1), std::max(by2, by3));
+			// dithered panel or tiny indicator dot only - moving untextured
+			// margin objects (USA traffic shadows/LOD, ~20px) must stay
+			bool const small = (bxmax - bxmin) <= 8 && (bymax - bymin) <= 8;
+			parked = bymin >= 60 && bymax <= 260
+				&& (((dma[0] & 0x2000) != 0) || small);
+		}
 		uint32_t const dither = ((dma[0] & 0x2000) ? 1u : 0u)
-			| (backdrop ? 2u : 0u);
+			| (backdrop ? 2u : 0u) | (parked ? 4u : 0u);
 		uint32_t mode = 0;
 		if (!textured)
 			pixdata = (pixdata + (dma[0] & 0xff)) & 0xffff;

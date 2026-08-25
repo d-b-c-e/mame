@@ -245,6 +245,18 @@ int main(int argc, char *argv[])
 		osd_output::pop(&winerror);
 	}
 
+	// POC (env-gated): skip static destructors and DLL_PROCESS_DETACH on the
+	// way out. The FFB Arcade Plugin's dinput8.dll teardown races our exit
+	// and access-violates AFTER a fully clean shutdown (cfg/nvram already
+	// written) - every quit then lands an Application Error + WER pass whose
+	// notification "ding" plays over the next launch. All state that matters
+	// is flushed by here; end the process before the wreck can happen.
+	if (std::getenv("MIDV_FAST_EXIT"))
+	{
+		fflush(nullptr);
+		TerminateProcess(GetCurrentProcess(), result);
+	}
+
 	return result;
 }
 
