@@ -923,18 +923,14 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(prog, "texMask"), (8 << 20) - 1);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uDbgQuadId"), 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipW"), WIDE);
-	// Cover the sky/horizon backdrop band inside the 16:9 margins. Without
-	// it the backdrop shows THROUGH gaps in the margin terrain - the user
-	// sees sky/water through the ground on the left while driving (the
-	// right side is covered by the game-code widescreen patch's real
-	// geometry, which is why the artifact looked one-sided).
-	// This is now INDEPENDENT of MIDV_GL_MARGINFILL: the fill's
-	// clamp-stretch is the smear-prone part and defaults off, but covering
-	// the revealed backdrop must stay on or driving shows the artifact.
-	// MIDV_GL_BGCOVER=0 disables it explicitly.
+	// suppress the sky/horizon backdrop inside the 16:9 margins (leaves it
+	// for the margin-extend to fill from the 4:3 boundary - sky above,
+	// terrain below - covering the "water through the ground" reveal).
+	// Shares the crack/margin-fill gate; MIDV_GL_CRACKFILL=0 or
+	// MIDV_GL_MARGINFILL=0 disables it.
 	bool const bg_gate =
 		!(std::getenv("MIDV_GL_CRACKFILL") && atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0)
-		&& !(std::getenv("MIDV_GL_BGCOVER") && atoi(std::getenv("MIDV_GL_BGCOVER")) == 0);
+		&& !(std::getenv("MIDV_GL_MARGINFILL") && atoi(std::getenv("MIDV_GL_MARGINFILL")) == 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uBgMargin"), bg_gate ? MARGIN : 0);
 	gl.UseProgram(pal);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
