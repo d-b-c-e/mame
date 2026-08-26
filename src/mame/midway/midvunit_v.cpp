@@ -30,6 +30,7 @@
 #include <cstdarg>
 #include <algorithm>
 #include <thread>
+#include <set>
 #include <vector>
 #include <string>
 #ifdef _WIN32
@@ -1861,7 +1862,24 @@ void midvunit_base_state::dma_queue_w(uint32_t data)
 	if (machine().input().code_pressed(KEYCODE_L))
 		LOGMASKED(LOG_DMA, "%06X:queue(%X) = %08X\n", m_maincpu->pc(), m_dma_data_index, data);
 	if (m_dma_data_index < 16)
+	{
+		// POC (env-gated): log each unique DSP PC that writes the quad DMA
+		// port - locates a game's poly-emit loops in one full-speed run
+		// (the debugger-watchpoint route runs at ~0.03x and crawls).
+		if (const char *pclog = std::getenv("MIDV_DMA_PCLOG"))
+		{
+			static std::set<uint32_t> s_seen;
+			uint32_t const pc = m_maincpu->pc();
+			if (s_seen.insert(pc).second)
+				if (FILE *f = fopen(pclog, "a"))
+				{
+					fprintf(f, "%05X", pc);
+					fputc(10, f);
+					fclose(f);
+				}
+		}
 		m_dma_data[m_dma_data_index++] = data;
+	}
 }
 
 
