@@ -257,6 +257,16 @@ static void telem_notify(const char *outname, s32 value, void *)
 struct HudBox { const char *game; int x0, x1, y0, y1; };
 static const HudBox s_hud_box[] = {
 	{ "crusnusa", 30, 72, 347, 370 },
+	// crusnwld: calibrated offline from the 2026-08-25 drive captures -
+	// same digit font as crusnusa (USA templates read the World digits
+	// as-is; validated trace 0->97 with clean accel/decel runs)
+	{ "crusnwld", 14, 76, 342, 368 },
+	// offroadc: PROVISIONAL - the MPH box sits at the TOP of the screen
+	// (outside the old dump window), coords derived from the user's
+	// 4x driving screenshot geometry; the OCR rejects unreadable frames
+	// so a miss emits 0, never garbage. Validate from the next drive
+	// capture (the dumper below now grabs rows 0-99 for this game).
+	{ "offroadc", 228, 270, 22, 52 },
 	{ nullptr, 0, 0, 0, 0 },
 };
 static const HudBox *s_hud = nullptr;   // resolved at telem_init
@@ -1261,10 +1271,14 @@ void thread_main()
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
 		gl.UseProgram(pal);
 		gl.Uniform1i(uCrop, (quad_fresh[visible] && !wide3d) ? MARGIN * S : 0);
-		// fill only live 3D scenes (2D screens and the CPU-shadow path have
-		// no meaningful mask; persistence there may be intentional)
+		// fill radius: live 3D scenes get the full crack fill; 2D screens
+		// (menus, track select) get a tight 1-px pass only - their bitmap
+		// tiles leave hairline unwritten seams (offroadc track select's
+		// vertical lines, rig bug G4) that read as black scratches at 4x,
+		// while anything wider on a 2D screen may be intentional
 		gl.Uniform1i(uFillR,
-			(fill_on && quad_fresh[visible] && !crop2d[visible]) ? 4 * S : 0);
+			(fill_on && quad_fresh[visible])
+				? (crop2d[visible] ? 1 * S : 4 * S) : 0);
 		gl.ActiveTexture(TEXTURE0 + 3);
 		gl.BindTexture(0x0DE1, maskTex[visible]);
 		gl.ActiveTexture(TEXTURE0 + 1);
@@ -2242,11 +2256,17 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 			// true player state (shape-hunting kept finding drones)
 			{
 				uint32_t base = (m_page_control & 1) ? 0x40000 : 0x00000;
+				// per-game window: offroadc draws its MPH box at the TOP
+				// of the screen; everyone else at the bottom
+				static int s_hud_row0 = -1;
+				if (s_hud_row0 < 0)
+					s_hud_row0 = strcmp(machine().system().name, "offroadc") == 0
+						? 0 : 300;
 				snprintf(path, sizeof(path), "%s/hud_%06u.bin", s_rdir,
 					uint32_t(screen.frame_number()));
 				if (FILE *f = std::fopen(path, "wb"))
 				{
-					std::fwrite(&m_videoram[base + 300 * 512], 2, 100 * 512, f);
+					std::fwrite(&m_videoram[base + s_hud_row0 * 512], 2, 100 * 512, f);
 					std::fclose(f);
 				}
 			}
