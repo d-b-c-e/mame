@@ -1866,7 +1866,8 @@ void midvunit_base_state::dma_queue_w(uint32_t data)
 		// POC (env-gated): log each unique DSP PC that writes the quad DMA
 		// port - locates a game's poly-emit loops in one full-speed run
 		// (the debugger-watchpoint route runs at ~0.03x and crawls).
-		if (const char *pclog = std::getenv("MIDV_DMA_PCLOG"))
+		static const char *const s_pclog = std::getenv("MIDV_DMA_PCLOG");
+		if (const char *pclog = s_pclog)
 		{
 			static std::set<uint32_t> s_seen;
 			uint32_t const pc = m_maincpu->pc();
