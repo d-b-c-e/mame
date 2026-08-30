@@ -423,15 +423,21 @@ static float c3x_to_float(uint32_t w)
 
 static void telem_init(const char *spec, const char *game)
 {
+	// clone-tolerant match: crusnwld24 (the shifter rev) etc. share the
+	// parent's screen-space HUD box; RAM-address rows are all 0 for World
+	// so nothing rev-specific can misapply.
+	auto game_match = [game](const char *entry) {
+		return strncmp(entry, game, strlen(entry)) == 0;
+	};
 	s_speed_word = 0;
 	for (const SpeedAddr *p = s_speed_addr; p->game; ++p)
-		if (!strcmp(p->game, game)) { s_speed_word = p->addr; break; }
+		if (game_match(p->game)) { s_speed_word = p->addr; break; }
 	s_hud = nullptr;
 	for (const HudBox *p = s_hud_box; p->game; ++p)
-		if (!strcmp(p->game, game)) { s_hud = p; break; }
+		if (game_match(p->game)) { s_hud = p; break; }
 	s_rpm_word = 0;
 	for (const RpmAddr *p = s_rpm_addr; p->game; ++p)
-		if (!strcmp(p->game, game))
+		if (game_match(p->game))
 		{
 			s_rpm_word = p->addr;
 			s_rpm_kind = p->kind;
