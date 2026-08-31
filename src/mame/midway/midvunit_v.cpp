@@ -629,6 +629,39 @@ static void make_inclusive(float *vx, float *vy)
 	}
 }
 
+// Half-pixel outward dilation for strict axis-aligned rectangles (port of
+// renderer.py _dilate_rect - keep in sync). Quality mode's continuous
+// coverage ends at the vertex CENTERS, so adjacent 2D tiles each
+// half-cover their shared boundary columns and the layer underneath
+// grooves through the seam (crusnusa continue-map vertical line;
+// offroadc track-select lines, G4). The hardware DDA fills endpoint
+// pixels inclusively; expanding each side to the pixel's OUTER edge
+// (0.5 + 0.001 tie guard) reproduces that span exactly - adjacent tiles
+// then partition the fine pixels with no gap and no overlap.
+static void dilate_rect(float *vx, float *vy, const int16_t *ix, const int16_t *iy)
+{
+	constexpr float E = 0.501f;
+	int sx[2][2], sy[2][2];
+	if (ix[0] == ix[1] && ix[2] == ix[3] && iy[1] == iy[2] && iy[3] == iy[0])
+	{
+		sx[0][0] = 0; sx[0][1] = 1; sx[1][0] = 2; sx[1][1] = 3;
+		sy[0][0] = 1; sy[0][1] = 2; sy[1][0] = 3; sy[1][1] = 0;
+	}
+	else if (iy[0] == iy[1] && iy[2] == iy[3] && ix[1] == ix[2] && ix[3] == ix[0])
+	{
+		sx[0][0] = 3; sx[0][1] = 0; sx[1][0] = 1; sx[1][1] = 2;
+		sy[0][0] = 0; sy[0][1] = 1; sy[1][0] = 2; sy[1][1] = 3;
+	}
+	else
+		return;
+	float ex = (ix[sx[0][0]] <= ix[sx[1][0]]) ? E : -E;
+	vx[sx[0][0]] -= ex; vx[sx[0][1]] -= ex;
+	vx[sx[1][0]] += ex; vx[sx[1][1]] += ex;
+	float ey = (iy[sy[0][0]] <= iy[sy[1][0]]) ? E : -E;
+	vy[sy[0][0]] -= ey; vy[sy[0][1]] -= ey;
+	vy[sy[1][0]] += ey; vy[sy[1][1]] += ey;
+}
+
 static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 	std::vector<float> &fdata, std::vector<uint32_t> &udata)
 {
@@ -695,6 +728,15 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			}
 		}
 		make_inclusive(vx, vy);
+		{
+			// the live overlay is always quality mode; exact/DDA replay
+			// (renderer.py) applies this only outside exact mode
+			int16_t const ix[4] = { int16_t(dma[2]), int16_t(dma[4]),
+				int16_t(dma[6]), int16_t(dma[8]) };
+			int16_t const iy[4] = { int16_t(dma[3]), int16_t(dma[5]),
+				int16_t(dma[7]), int16_t(dma[9]) };
+			dilate_rect(vx, vy, ix, iy);
+		}
 		float x0 = vx[0], x1 = vx[0], y0 = vy[0], y1 = vy[0];
 		for (int i = 1; i < 4; i++)
 		{
@@ -1063,9 +1105,25 @@ void thread_main()
 		if (logged_runs < 30)
 			logf("run: pc=%u quads=%zu", run_pc, run.size()), ++logged_runs;
 		int pg = (run_pc & 4) ? 1 : 0;
-		pend[pg].swap(run);
-		pend_pc[pg] = run_pc;
-		pend_valid[pg] = true;
+		if (pend_valid[pg] && pend_pc[pg] == run_pc)
+		{
+			// same pc, same page, previous half not drawn yet: these are
+			// PARTS of one scene, not a stale scene to skip. 2D screens
+			// write page_control every frame but change it every TWO
+			// (base+tiles one frame, text the next); replacing the undrawn
+			// first half here dropped the map background forever and left
+			// the 129/130 tile seam showing entry-stale page pixels - the
+			// crusnusa continue-screen vertical line. Merging keeps
+			// skip-to-latest semantics harmless: a genuinely newer scene
+			// just overdraws the older quads in one call.
+			pend[pg].insert(pend[pg].end(), run.begin(), run.end());
+		}
+		else
+		{
+			pend[pg].swap(run);
+			pend_pc[pg] = run_pc;
+			pend_valid[pg] = true;
+		}
 		run.clear();
 	};
 
