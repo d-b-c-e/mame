@@ -2131,6 +2131,11 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 
 	m_poly->wait("Refresh Time");
 
+	// POC: the games' startup code re-copies the low program words from
+	// ROM after machine_reset applied MIDV_PATCH - re-assert reverted
+	// entries once per frame (no-op without MIDV_PATCH)
+	midv_patches_tick(m_ram_base);
+
 	// Esc options menu pause: block the emu thread here while the menu is
 	// open (freezes emulation + sound). The GL thread clears s_menu_pause
 	// on Resume/Exit so this always exits. machine().pause() was unreliable

@@ -114,11 +114,15 @@ void midvplus_state::machine_start()
 // 0..0x1ffff; OLD is verified before writing, or "*" to skip the check).
 // Lines starting with # are comments. Used for the ground-culling widen
 // experiment - see cruisn-collection results/RESULTS.md.
+struct midv_patch_entry { uint32_t addr, oldval, newval; bool guarded; };
+static std::vector<midv_patch_entry> s_midv_patches;
+
 static void midv_apply_patches(uint32_t *ram)
 {
 	const char *path = std::getenv("MIDV_PATCH");
 	if (!path)
 		return;
+	s_midv_patches.clear();
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return;
@@ -134,9 +138,11 @@ static void midv_apply_patches(uint32_t *ram)
 			continue;
 		if (addr >= 0x20000)
 			continue;
-		if (strcmp(oldtok, "*") != 0)
+		bool const guarded = (strcmp(oldtok, "*") != 0);
+		unsigned oldval = 0;
+		if (guarded)
 		{
-			unsigned oldval = strtoul(oldtok, nullptr, 16);
+			oldval = strtoul(oldtok, nullptr, 16);
 			if (ram[addr] != oldval)
 			{
 				skipped++;
@@ -145,6 +151,7 @@ static void midv_apply_patches(uint32_t *ram)
 		}
 		ram[addr] = newval;
 		applied++;
+		s_midv_patches.push_back({ addr, oldval, newval, guarded });
 	}
 	fclose(f);
 	if (std::getenv("MIDV_GL_LOG"))
@@ -157,6 +164,22 @@ static void midv_apply_patches(uint32_t *ram)
 			fclose(lg);
 		}
 	}
+}
+
+// The games' own startup code re-copies the low words of the program
+// image from the maindata ROM AFTER machine_reset ran the patcher
+// (crusnusa 0x4B48: 0x10000 words from 0xC00040 -> RAM 0x40), silently
+// reverting any patch below that window - discovered when draw-distance
+// words at 0x55/0x727E refused to budge while widescreen patches above
+// 0x10040 stick. Called once per frame from screen_update: re-assert
+// only entries whose word reads the verified OLD value again; anything
+// the game legitimately rewrote is left alone. Unguarded ("*") entries
+// cannot re-verify and are applied at reset only.
+void midv_patches_tick(uint32_t *ram)
+{
+	for (auto const &p : s_midv_patches)
+		if (p.guarded && ram[p.addr] == p.oldval)
+			ram[p.addr] = p.newval;
 }
 
 void midvunit_base_state::machine_reset()

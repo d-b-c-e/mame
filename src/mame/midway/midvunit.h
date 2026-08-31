@@ -32,6 +32,10 @@ struct midvunit_object_data
 	uint8_t       dither = 0;
 };
 
+// POC: re-assert MIDV_PATCH entries the game's own startup ROM re-copy
+// reverted (defined in midvunit.cpp, called from screen_update)
+void midv_patches_tick(uint32_t *ram);
+
 class midvunit_base_state;
 
 class midvunit_renderer : public poly_manager<float, midvunit_object_data, 2>
