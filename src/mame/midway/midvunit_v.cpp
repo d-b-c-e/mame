@@ -78,6 +78,7 @@ FILE *quadlog_open()
 
 struct midv_live
 {
+	volatile float speed_pct = 0.0f;   // MAME speed %, for the overlay stats
 	static constexpr uint32_t RING_SIZE = 128u << 20;
 	static constexpr uint32_t HDR_SIZE = 64;
 
@@ -1459,13 +1460,13 @@ void thread_main()
 		++presents;
 		if (s_log && (presents % 300) == 0)
 			logf("t=%llu quads=%llu scenes=%llu pal=%llu tex=%llu vram=%llu "
-				"flips=%llu backlog=%llu vis=%d fresh=%d cnt=%d err=%u",
+				"flips=%llu backlog=%llu vis=%d fresh=%d cnt=%d err=%u speed=%.0f%%",
 				(unsigned long long)presents, (unsigned long long)n_quads,
 				(unsigned long long)n_scenes, (unsigned long long)n_pal,
 				(unsigned long long)n_tex, (unsigned long long)n_vram,
 				(unsigned long long)n_flips,
 				(unsigned long long)(*lv.wpos - *lv.rpos), visible,
-				int(quad_fresh[visible]), quad_count[visible], gl.GetError());
+				int(quad_fresh[visible]), quad_count[visible], gl.GetError(), double(lv.speed_pct));
 		if (snapdir && (presents % 150) == 0)
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
@@ -1540,6 +1541,7 @@ midv_live &live()
 #else
 struct midv_live
 {
+	volatile float speed_pct = 0.0f;   // MAME speed %, for the overlay stats
 	bool enabled = false;
 	bool tex_dirty = false, pal_dirty = false;
 	uint32_t last_frame = 0;
@@ -2198,6 +2200,8 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// ROM after machine_reset applied MIDV_PATCH - re-assert reverted
 	// entries once per frame (no-op without MIDV_PATCH)
 	midv_patches_tick(m_ram_base);
+	if (live().enabled)
+		live().speed_pct = float(machine().video().speed_percent() * 100.0);
 
 	// Esc options menu pause: block the emu thread here while the menu is
 	// open (freezes emulation + sound). The GL thread clears s_menu_pause
