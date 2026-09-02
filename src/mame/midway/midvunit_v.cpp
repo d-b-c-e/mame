@@ -7,6 +7,7 @@
 **************************************************************************/
 
 #include "emu.h"
+#include <chrono>
 #include "midvunit.h"
 #include "midvunit_hud_ocr.h"
 
@@ -235,8 +236,25 @@ static void telem_parse_addr(const char *spec, sockaddr_in &out,
 	out.sin_addr.s_addr = inet_addr(host);
 }
 
+// FFB diagnostics: MIDV_FFB_TRACE=<file> appends every output change the
+// game makes (wheel force, lamps) with a millisecond timestamp - the
+// discriminator for "force feedback comes and goes": a continuous stream
+// of changing wheel values while the wheel is quiet points at the plugin/
+// driver side (FFBlog.txt, Logging=1); gaps in the stream point at the
+// emulation/output side. Env-gated; inert unset.
+static FILE *s_ffb_trace = nullptr;
+static std::chrono::steady_clock::time_point s_ffb_trace_t0;
+
 static void telem_notify(const char *outname, s32 value, void *)
 {
+	if (s_ffb_trace)
+	{
+		auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - s_ffb_trace_t0).count();
+		fprintf(s_ffb_trace, "%lld,%s,%d\n", (long long)ms,
+				outname ? outname : "", int(value));
+		fflush(s_ffb_trace);
+	}
 	if (s_telem_sock == INVALID_SOCKET || !s_telem_json)
 		return;
 	char buf[160];
@@ -1600,11 +1618,21 @@ void midvunit_base_state::video_start()
 	// MIDV_TELEM_FORZA alone also works (Forza packets, no JSON stream).
 	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
 	if (telem_spec || std::getenv("MIDV_TELEM_FORZA"))
-	{
 		telem_init(telem_spec, machine().system().name);
-		if (telem_spec)
-			machine().output().set_global_notifier(&telem_notify, nullptr);
+	if (const char *tr = std::getenv("MIDV_FFB_TRACE"))
+	{
+		s_ffb_trace = fopen(tr, "w");
+		if (s_ffb_trace)
+		{
+			s_ffb_trace_t0 = std::chrono::steady_clock::now();
+			fprintf(s_ffb_trace, "ms,output,value\n# game %s\n",
+					machine().system().name);
+			fflush(s_ffb_trace);
+		}
 	}
+	// one global notifier serves both the JSON telemetry and the trace
+	if (telem_spec || s_ffb_trace)
+		machine().output().set_global_notifier(&telem_notify, nullptr);
 
 	m_scanline_timer = timer_alloc(FUNC(midvunit_base_state::scanline_timer_cb), this);
 	m_eoi_timer = timer_alloc(FUNC(midvunit_base_state::eoi_timer_cb), this);
