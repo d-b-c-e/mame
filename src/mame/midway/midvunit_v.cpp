@@ -638,26 +638,49 @@ static void make_inclusive(float *vx, float *vy)
 // pixels inclusively; expanding each side to the pixel's OUTER edge
 // (0.5 + 0.001 tie guard) reproduces that span exactly - adjacent tiles
 // then partition the fine pixels with no gap and no overlap.
-static void dilate_rect(float *vx, float *vy, const int16_t *ix, const int16_t *iy)
+// us/vs: the texture params are extrapolated along each axis by the
+// same amount so du/dx, dv/dy - and thus which texel every fine pixel
+// samples - stay the hardware's (moving vertices alone squeezed each
+// tile's texture inward by up to half a texel: review 2026-08-30).
+static void dilate_rect(float *vx, float *vy, const int16_t *ix, const int16_t *iy,
+	float *us, float *vs)
 {
 	constexpr float E = 0.501f;
-	int sx[2][2], sy[2][2];
+	int sx[2][2], sy[2][2], px[2][2], py[2][2];   // sides, same-row pairs
 	if (ix[0] == ix[1] && ix[2] == ix[3] && iy[1] == iy[2] && iy[3] == iy[0])
 	{
 		sx[0][0] = 0; sx[0][1] = 1; sx[1][0] = 2; sx[1][1] = 3;
 		sy[0][0] = 1; sy[0][1] = 2; sy[1][0] = 3; sy[1][1] = 0;
+		px[0][0] = 0; px[0][1] = 3; px[1][0] = 1; px[1][1] = 2;
+		py[0][0] = 1; py[0][1] = 0; py[1][0] = 2; py[1][1] = 3;
 	}
 	else if (iy[0] == iy[1] && iy[2] == iy[3] && ix[1] == ix[2] && ix[3] == ix[0])
 	{
 		sx[0][0] = 3; sx[0][1] = 0; sx[1][0] = 1; sx[1][1] = 2;
 		sy[0][0] = 0; sy[0][1] = 1; sy[1][0] = 2; sy[1][1] = 3;
+		px[0][0] = 0; px[0][1] = 1; px[1][0] = 3; px[1][1] = 2;
+		py[0][0] = 0; py[0][1] = 3; py[1][0] = 1; py[1][1] = 2;
 	}
 	else
 		return;
+	auto extrap = [&](float *v, int (*pairs)[2], float e)
+	{
+		for (int k = 0; k < 2; k++)
+		{
+			int const p = pairs[k][0], q = pairs[k][1];   // p moves -e, q +e
+			float const span = v[q] - v[p];
+			if (span == 0.0f) continue;
+			float const gu = (us[q] - us[p]) / span, gv = (vs[q] - vs[p]) / span;
+			us[p] -= e * gu; us[q] += e * gu;
+			vs[p] -= e * gv; vs[q] += e * gv;
+		}
+	};
 	float ex = (ix[sx[0][0]] <= ix[sx[1][0]]) ? E : -E;
+	extrap(vx, px, ex);
 	vx[sx[0][0]] -= ex; vx[sx[0][1]] -= ex;
 	vx[sx[1][0]] += ex; vx[sx[1][1]] += ex;
 	float ey = (iy[sy[0][0]] <= iy[sy[1][0]]) ? E : -E;
+	extrap(vy, py, ey);
 	vy[sy[0][0]] -= ey; vy[sy[0][1]] -= ey;
 	vy[sy[1][0]] += ey; vy[sy[1][1]] += ey;
 }
@@ -735,7 +758,7 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 				int16_t(dma[6]), int16_t(dma[8]) };
 			int16_t const iy[4] = { int16_t(dma[3]), int16_t(dma[5]),
 				int16_t(dma[7]), int16_t(dma[9]) };
-			dilate_rect(vx, vy, ix, iy);
+			dilate_rect(vx, vy, ix, iy, us, vs);
 		}
 		float x0 = vx[0], x1 = vx[0], y0 = vy[0], y1 = vy[0];
 		for (int i = 1; i < 4; i++)
@@ -1105,7 +1128,13 @@ void thread_main()
 		if (logged_runs < 30)
 			logf("run: pc=%u quads=%zu", run_pc, run.size()), ++logged_runs;
 		int pg = (run_pc & 4) ? 1 : 0;
-		if (pend_valid[pg] && pend_pc[pg] == run_pc)
+		// merge cap: a stalled GL thread would otherwise accumulate every
+		// same-pc scene into one ever-growing draw (positive feedback on
+		// a slow GPU). Past this, fall back to skip-to-latest - one
+		// possibly-partial frame beats a runaway backlog.
+		constexpr size_t MERGE_CAP = 16384;
+		if (pend_valid[pg] && pend_pc[pg] == run_pc
+			&& pend[pg].size() + run.size() <= MERGE_CAP)
 		{
 			// same pc, same page, previous half not drawn yet: these are
 			// PARTS of one scene, not a stale scene to skip. 2D screens
@@ -1422,6 +1451,12 @@ void thread_main()
 		if (snapdir && (presents % 150) == 0)
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
+			// tight rows: the default GL_PACK_ALIGNMENT of 4 pads each row
+			// whenever cw*3 isn't a multiple of 4, overrunning px (heap
+			// corruption -> crash at the first snap on any window width
+			// like 2350; every earlier run happened to be 2352 wide).
+			// The BMP writer below does its own 4-byte row padding.
+			gl.PixelStorei(0x0D05 /*GL_PACK_ALIGNMENT*/, 1);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0 /*BGR*/, 0x1401, px.data());
 			char path[512];
 			snprintf(path, sizeof(path), "%s\\mvgl_%03d.bmp", snapdir, snap_n++);
