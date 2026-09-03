@@ -396,7 +396,11 @@ static uint8_t *s_ringbuf = nullptr;
 static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
 static std::atomic<int> s_zpause{0};
+static std::atomic<double> s_secs{0.0};   // machine time, published by screen_update for the GL thread
 static std::thread s_thread;
+
+static std::atomic<uint32_t> s_drops_quad{0}, s_drops_state{0};   // ring overflow accounting (midz_gl.log)
+static std::atomic<bool> s_wave_resync{false};   // a waveram span was lost: re-emit the FULL waveram at the next flush
 
 static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 		const void *p2, uint32_t n2)
@@ -405,10 +409,36 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 		return;
 	uint32_t const bytes = n1 + n2;
 	uint64_t w = s_rw.load(std::memory_order_relaxed);
-	uint64_t const r = s_rr.load(std::memory_order_acquire);
+	uint64_t r = s_rr.load(std::memory_order_acquire);
 	uint64_t const need = 8 + ((uint64_t(bytes) + 7) & ~7ull);
 	if (w - r + need > RING)
-		return;   // full: drop (the overlay just misses a beat)
+	{
+		// Full. A dropped quad is a one-frame blip; a dropped waveram span
+		// (5) or palette (2) or display tick (6) leaves the GL mirror stale
+		// until the game happens to rewrite that region - the Amazon bushes
+		// drawn from wrong texture bytes. Wait (bounded) for the consumer
+		// to drain; if it still does not fit, remember to resync the whole
+		// texture memory at the next flush.
+		bool const essential = (type == 5 || type == 2 || type == 6);
+		if (essential)
+		{
+			for (int i = 0; i < 400 && (w - r + need > RING); i++)
+			{
+				Sleep(1);
+				r = s_rr.load(std::memory_order_acquire);
+			}
+		}
+		if (w - r + need > RING)
+		{
+			if (type == 5)
+				s_wave_resync.store(true);
+			if (essential)
+				s_drops_state.fetch_add(1);
+			else
+				s_drops_quad.fetch_add(1);
+			return;
+		}
+	}
 	auto put = [&](const void *src, uint32_t n)
 	{
 		uint32_t const o = uint32_t(w % RING);
@@ -1120,7 +1150,36 @@ void thread_main()
 		}
 
 		++presents;
-		if (snapdir && (presents % 150) == 0)
+		// MIDZ_GL_SNAP_EVERY=<n> presents between snapshots (default 150; 1 =
+		// every present, for flicker / partial-frame hunts)
+		static int s_snap_every = -1;
+		if (s_snap_every < 0)
+		{
+			const char *e = std::getenv("MIDZ_GL_SNAP_EVERY");
+			s_snap_every = (e && atoi(e) > 0) ? atoi(e) : 150;
+		}
+		static long s_snap_from = -1;   // MIDZ_GL_SNAP_FROM=<present>: start snapshots there
+		if (s_snap_from < 0)
+		{
+			const char *e = std::getenv("MIDZ_GL_SNAP_FROM");
+			s_snap_from = e ? atol(e) : 0;
+		}
+		static int s_snap_max = -1;     // MIDZ_GL_SNAP_MAX=<n>: stop after n snapshots (dense runs)
+		if (s_snap_max < 0)
+		{
+			const char *e = std::getenv("MIDZ_GL_SNAP_MAX");
+			s_snap_max = (e && atoi(e) > 0) ? atoi(e) : 1000000;
+		}
+		static double s_snap_from_sec = -1.0;   // MIDZ_GL_SNAP_FROM_SEC=<machine seconds>: present cadence varies run to run, game time does not
+		if (s_snap_from_sec < 0)
+		{
+			const char *e = std::getenv("MIDZ_GL_SNAP_FROM_SEC");
+			s_snap_from_sec = e ? atof(e) : 0.0;
+		}
+		static long s_snap_base = -1;
+		if (s_snap_base < 0 && s_secs.load() >= s_snap_from_sec)
+			s_snap_base = presents;
+		if (snapdir && s_snap_base >= 0 && presents >= s_snap_from && ((presents - s_snap_base) % s_snap_every) == 0 && snap_n < s_snap_max)
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0, 0x1401, px.data());
@@ -1165,6 +1224,7 @@ void thread_main()
 		}
 	}
 	s_zpause.store(0);
+	zlogf("ring drops: quads %u, state(spans/pal/tick) %u", s_drops_quad.load(), s_drops_state.load());
 	zlogf("exit after %llu presents, %llu quads",
 		(unsigned long long)presents, (unsigned long long)n_quads);
 	gl.MakeCurrent(nullptr, nullptr);
@@ -1223,6 +1283,11 @@ void zeus2_device::midz_screen_hook()
 			Sleep(15);
 		}
 		// flush the waveram dirty span, then the per-frame display tick
+		if (mzgl::s_wave_resync.exchange(false))
+		{
+			s_wave_lo = 0;               // a span was lost to a full ring: resend everything
+			s_wave_hi = 16u << 20;
+		}
 		if (s_wave_hi > s_wave_lo)
 		{
 			uint32_t hdr2[2] = { s_wave_lo, s_wave_hi - s_wave_lo };
@@ -1440,6 +1505,7 @@ void zeus2_device::device_stop()
 
 uint32_t zeus2_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
+	mzgl::s_secs.store(machine().time().as_double());   // POC: game time for the overlay's snapshot trigger
 	// Wait until configuration is completed before transfering anything
 	if (!(m_zeusbase[0x10] & 0x20))
 		return 0;
