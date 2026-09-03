@@ -589,13 +589,27 @@ void midvunit_state::wheel_board_w(uint32_t data)
 							if (s_clamp < 0 || s_clamp > 127)
 								s_clamp = 0;
 						}
-						uint8_t out = arg;
-						if (s_clamp > 0)
+						// MIDV_FFB_SLEW=N (of 127): cap how far the force may move per
+						// game update. The games' kicks reverse instantly and the
+						// plugin applies them instantly (a constant force + a rumble
+						// burst per update); a slew cap turns the slam into a swell
+						// without adding lag to small changes. 0 = off.
+						static int s_slew = -1;
+						static int s_prev = 0;
+						if (s_slew < 0)
 						{
-							int const f = int8_t(arg);
-							out = uint8_t(int8_t(std::clamp(f, -s_clamp, s_clamp)));
+							const char *e = std::getenv("MIDV_FFB_SLEW");
+							s_slew = e ? atoi(e) : 0;
+							if (s_slew < 0 || s_slew > 127)
+								s_slew = 0;
 						}
-						m_wheel_motor = out;
+						int f = int(int8_t(arg));
+						if (s_slew > 0)
+							f = s_prev + std::clamp(f - s_prev, -s_slew, s_slew);
+						if (s_clamp > 0)
+							f = std::clamp(f, -s_clamp, s_clamp);
+						s_prev = f;
+						m_wheel_motor = uint8_t(int8_t(f));
 					}
 					//LOGINPUT("Wheel board (U4 74HC574; Motor) = %02X\n", arg);
 					break;

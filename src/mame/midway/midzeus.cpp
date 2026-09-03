@@ -726,11 +726,23 @@ void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 				if (s_gain < 25 || s_gain > 800)
 					s_gain = 100;
 			}
+			static int s_slew = -1;   // MIDV_FFB_SLEW: see midvunit.cpp
+			static int s_prev = 0;
+			if (s_slew < 0)
+			{
+				const char *e = std::getenv("MIDV_FFB_SLEW");
+				s_slew = e ? atoi(e) : 0;
+				if (s_slew < 0 || s_slew > 127)
+					s_slew = 0;
+			}
 			int f = int(int8_t(data & 0xff));
 			if (s_gain != 100)
 				f = std::clamp((f * s_gain) / 100, -127, 127);
+			if (s_slew > 0)
+				f = s_prev + std::clamp(f - s_prev, -s_slew, s_slew);
 			if (s_clamp > 0)
 				f = std::clamp(f, -s_clamp, s_clamp);
+			s_prev = f;
 			m_wheel_motor = uint8_t(int8_t(f));
 			break;
 		}
