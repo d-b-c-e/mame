@@ -1597,6 +1597,37 @@ TIMER_CALLBACK_MEMBER(midvunit_base_state::eoi_timer_cb)
 	m_maincpu->set_input_line(0, CLEAR_LINE);
 }
 
+
+// POC: UDP telemetry (Phase A) + FFB trace - mirror every output change
+// (wheel force, lamps) to a UDP consumer and/or a CSV. Env-gated, inert
+// unset. MIDV_TELEM_FORZA alone also works (Forza packets, no JSON
+// stream). Shared by the V-Unit games (video_start) and Exotica
+// (midzeus machine_start) - both emit the "wheel" output now.
+void midv_telemetry_start(running_machine &machine)
+{
+	static bool s_started = false;
+	if (s_started)
+		return;
+	s_started = true;
+	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
+	if (telem_spec || std::getenv("MIDV_TELEM_FORZA"))
+		telem_init(telem_spec, machine.system().name);
+	if (const char *tr = std::getenv("MIDV_FFB_TRACE"))
+	{
+		s_ffb_trace = fopen(tr, "w");
+		if (s_ffb_trace)
+		{
+			s_ffb_trace_t0 = std::chrono::steady_clock::now();
+			fprintf(s_ffb_trace, "ms,output,value\n# game %s\n",
+					machine.system().name);
+			fflush(s_ffb_trace);
+		}
+	}
+	// one global notifier serves both the JSON telemetry and the trace
+	if (telem_spec || s_ffb_trace)
+		machine.output().set_global_notifier(&telem_notify, nullptr);
+}
+
 void midvunit_base_state::mvgl_exit()
 {
 	// POC: a detached GL thread that outlives the machine races teardown
@@ -1615,26 +1646,7 @@ void midvunit_base_state::video_start()
 		machine().add_notifier(MACHINE_NOTIFY_EXIT,
 			machine_notify_delegate(&midvunit_base_state::mvgl_exit, this));
 
-	// POC: UDP telemetry (Phase A) - mirror every output change (wheel
-	// force, lamps) to a UDP consumer. Env-gated, inert unset.
-	// MIDV_TELEM_FORZA alone also works (Forza packets, no JSON stream).
-	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
-	if (telem_spec || std::getenv("MIDV_TELEM_FORZA"))
-		telem_init(telem_spec, machine().system().name);
-	if (const char *tr = std::getenv("MIDV_FFB_TRACE"))
-	{
-		s_ffb_trace = fopen(tr, "w");
-		if (s_ffb_trace)
-		{
-			s_ffb_trace_t0 = std::chrono::steady_clock::now();
-			fprintf(s_ffb_trace, "ms,output,value\n# game %s\n",
-					machine().system().name);
-			fflush(s_ffb_trace);
-		}
-	}
-	// one global notifier serves both the JSON telemetry and the trace
-	if (telem_spec || s_ffb_trace)
-		machine().output().set_global_notifier(&telem_notify, nullptr);
+	midv_telemetry_start(machine());
 
 	m_scanline_timer = timer_alloc(FUNC(midvunit_base_state::scanline_timer_cb), this);
 	m_eoi_timer = timer_alloc(FUNC(midvunit_base_state::eoi_timer_cb), this);

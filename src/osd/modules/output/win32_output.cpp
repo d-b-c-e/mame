@@ -19,6 +19,7 @@
 
 // MAME headers
 #include "emu.h"
+#include <cstdlib>
 
 // standard windows headers
 #include <windows.h>
@@ -328,8 +329,13 @@ LRESULT output_win32::send_id_string(HWND hwnd, LPARAM id)
 	int datalen;
 
 	// id 0 is the name of the game
+	// POC (env-gated, inert unset): MIDV_OUTPUT_NAME=<name> reports another
+	// game name to output clients - the FFB Arcade Plugin picks its handler
+	// by this string and has none for crusnexo; reporting "crusnusa" lets
+	// its Cruis'n handler drive Exotica's (newly emulated) "wheel" output.
+	static const char *s_spoof = std::getenv("MIDV_OUTPUT_NAME");
 	if (id == 0)
-		name = machine().system().name;
+		name = (s_spoof && *s_spoof) ? s_spoof : machine().system().name;
 	else
 		name = machine().output().id_to_name(id);
 

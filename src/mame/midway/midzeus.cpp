@@ -28,6 +28,8 @@ The Grid         v1.2   10/18/2000
 
 #include "emu.h"
 
+#include <algorithm>
+
 #include "midzeus.h"
 
 #include "dcs.h"
@@ -139,6 +141,7 @@ public:
 		, m_digits(*this, "digit%u", 0U)
 		, m_leds(*this, "led%u", 0U)
 		, m_lamps(*this, "lamp%u", 0U)
+		, m_wheel_motor(*this, "wheel")
 		, m_io_analog(*this, "ANALOG%u", 0U)
 	{ }
 
@@ -154,6 +157,7 @@ protected:
 		m_digits.resolve();
 		m_leds.resolve();
 		m_lamps.resolve();
+	m_wheel_motor.resolve();
 
 		save_item(NAME(m_keypad_select));
 		save_item(NAME(m_crusnexo_leds_select));
@@ -174,6 +178,7 @@ private:
 	output_finder<7> m_digits;
 	output_finder<32> m_leds;
 	output_finder<8> m_lamps;
+	output_finder<> m_wheel_motor;   // POC: "wheel" - the force byte the game writes to the LED/lamp board (offset 0)
 	required_ioport_array<4> m_io_analog;
 };
 
@@ -213,8 +218,11 @@ private:
  *
  *************************************/
 
+void midv_telemetry_start(running_machine &machine);   // midvunit_v.cpp (POC)
+
 void midzeus_state::machine_start()
 {
+	midv_telemetry_start(machine());   // POC: FFB trace / UDP telemetry for Exotica
 	m_timer[0] = machine().scheduler().timer_alloc(timer_expired_delegate());
 	m_timer[1] = machine().scheduler().timer_alloc(timer_expired_delegate());
 
@@ -485,8 +493,32 @@ uint32_t midzeus2_state::disk_asic_r(offs_t offset)
 }
 
 
+
+// POC (env-gated, inert unset): MIDZ_IOLOG=<file> logs candidate output
+// writes (LED/lamp board, analog board, disk ASICs) with machine time, to
+// find where Cruis'n Exotica drives its wheel motor (MAME has no output
+// for it yet).
+static FILE *s_midz_iolog = nullptr;
+static bool s_midz_iolog_init = false;
+static void midz_iolog(running_machine &machine, const char *what, uint32_t offset, uint32_t data)
+{
+	if (!s_midz_iolog_init)
+	{
+		s_midz_iolog_init = true;
+		const char *e = std::getenv("MIDZ_IOLOG");
+		if (e && *e)
+			s_midz_iolog = fopen(e, "w");
+	}
+	if (s_midz_iolog)
+	{
+		fprintf(s_midz_iolog, "%.4f,%s,%u,%08X\n", machine.time().as_double(), what, offset, data);
+		fflush(s_midz_iolog);
+	}
+}
+
 void midzeus2_state::disk_asic_w(offs_t offset, uint32_t data)
 {
+	midz_iolog(machine(), "disk_asic_w", offset, data);
 	m_disk_asic[offset] = data;
 
 	switch (offset)
@@ -580,6 +612,7 @@ uint32_t midzeus_state::disk_asic_jr_r(offs_t offset)
 
 void midzeus_state::disk_asic_jr_w(offs_t offset, uint32_t data)
 {
+	midz_iolog(machine(), "disk_asic_jr_w", offset, data);
 	//uint32_t oldval = m_disk_asic_jr[offset];
 	m_disk_asic_jr[offset] = data;
 
@@ -658,10 +691,28 @@ uint32_t crusnexo_state::crusnexo_leds_r(offs_t offset)
 
 void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 {
+	midz_iolog(machine(), "leds", offset, data);
 	switch (offset)
 	{
-		case 0: // unknown purpose
+		case 0: // wheel motor force (POC finding, 2026-09-03): a signed byte the
+		        // game holds proportional to wheel displacement (a spring; ~-11
+		        // for +32 counts), plus race effects. Exposed as output "wheel"
+		        // like the V-Unit games; MIDV_FFB_CLAMP caps it the same way.
+		{
+			static int s_clamp = -1;
+			if (s_clamp < 0)
+			{
+				const char *e = std::getenv("MIDV_FFB_CLAMP");
+				s_clamp = e ? atoi(e) : 0;
+				if (s_clamp < 0 || s_clamp > 127)
+					s_clamp = 0;
+			}
+			uint8_t out = data & 0xff;
+			if (s_clamp > 0)
+				out = uint8_t(int8_t(std::clamp(int(int8_t(out)), -s_clamp, s_clamp)));
+			m_wheel_motor = out;
 			break;
+		}
 
 		case 1: // controls lamps
 			for (int bit = 0; bit < 8; bit++)
@@ -774,6 +825,7 @@ ioport_value thegrid_state::custom_49way_r()
 
 void crusnexo_state::keypad_select_w(offs_t offset, uint32_t data)
 {
+	midz_iolog(machine(), "keypad_sel", offset, data);
 	if (offset == 1)
 		m_keypad_select = data;
 }
@@ -827,6 +879,7 @@ uint32_t crusnexo_state::analog_r(offs_t offset)
 void crusnexo_state::analog_w(uint32_t data)
 {
 	// 16 writes to the location before a read
+	midz_iolog(machine(), "analog", 0, data);
 }
 
 
