@@ -37,6 +37,12 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
+#include <mutex>
+#include <condition_variable>
+// POC built-in force feedback: SDL2 haptics, types only - SDL2.dll is loaded
+// at run time (see mvffb below), vunit.exe carries no import of it
+#include <SDL2/SDL_haptic.h>
+#include <SDL2/SDL_joystick.h>
 #include "midvunit_gl_shaders.h"
 #include "midvunit_menu_assets.h"
 #endif
@@ -1623,12 +1629,414 @@ void midv_trace_wheelpos(running_machine &machine, const char *tag)
 	fprintf(s_ffb_trace, "%lld,wheelpos,%d\n", (long long)ms, v);
 }
 
+
+// ---- POC: built-in force feedback (2026-09-03, replaces the FFB Arcade Plugin)
+// The games' wheel-motor byte (V-Unit WHLCTLZ, Exotica LED-board offset 0 -
+// after the driver's gain/slew/clamp) becomes ONE signed constant-force level
+// on the wheel's steering axis through SDL2 haptics, the way Cannonball DX
+// (Endprodukt) and Flycast drive wheels: SDL_HAPTIC_STEERING_AXIS, infinite
+// length, level updated in place, run after every update. SDL2.dll is loaded
+// at run time, so without it FFB is simply off and everything else runs.
+// The byte's interpretation is the FFB Arcade Plugin's Cruis'n handler
+// (RacingFullValueActive2): 0 = no force, 1..127 = one way at v/126,
+// 0x81..0xFF = the other way at (256-v)/126, 0x80 = no force, clamped to 1.
+// Env (all inert unset):
+//   MIDV_FFB=1            on
+//   MIDV_FFB_STRENGTH=N   0..100 % of the wheel's full constant force (100)
+//   MIDV_FFB_DEVICE=S     pick the wheel: name substring (case-insensitive)
+//                         or vid:pid hex; else the first wheel-type haptic
+//                         device, else the first haptic device that can do
+//                         a constant force
+//   MIDV_FFB_INVERT=1     flip the direction (bases differ in axis sign; the
+//                         default is right for a Moza R12 - see midv_ffb_write)
+//   MIDV_FFB_HOLD_MS=N    release the force when the game has not written the
+//                         motor for N ms (500; 0 = hold forever like the
+//                         arcade board - a paused direct-drive base holding
+//                         torque is a hazard, so it is on by default)
+//   MIDV_FFB_TEST=L       apply level L (-100..100 %) for 1.5 s at start,
+//                         then 0 - sign calibration with a wheel-position probe
+//   MIDV_FFB_LOG=2        also log every motor write (1 = init/device lines
+//                         only, the default when MIDV_FFB is on)
+// Log: midv_ffb.log in the working directory (the support bundle ships it).
+namespace mvffb {
+
+#define MVFFB_SDL_FUNCS(X) \
+	X(int, SDL_Init, (Uint32)) \
+	X(void, SDL_Quit, (void)) \
+	X(SDL_bool, SDL_SetHint, (const char *, const char *)) \
+	X(const char *, SDL_GetError, (void)) \
+	X(int, SDL_NumJoysticks, (void)) \
+	X(void, SDL_JoystickUpdate, (void)) \
+	X(SDL_Joystick *, SDL_JoystickOpen, (int)) \
+	X(void, SDL_JoystickClose, (SDL_Joystick *)) \
+	X(const char *, SDL_JoystickName, (SDL_Joystick *)) \
+	X(SDL_JoystickType, SDL_JoystickGetType, (SDL_Joystick *)) \
+	X(Uint16, SDL_JoystickGetVendor, (SDL_Joystick *)) \
+	X(Uint16, SDL_JoystickGetProduct, (SDL_Joystick *)) \
+	X(SDL_Haptic *, SDL_HapticOpenFromJoystick, (SDL_Joystick *)) \
+	X(void, SDL_HapticClose, (SDL_Haptic *)) \
+	X(unsigned int, SDL_HapticQuery, (SDL_Haptic *)) \
+	X(int, SDL_HapticSetAutocenter, (SDL_Haptic *, int)) \
+	X(int, SDL_HapticSetGain, (SDL_Haptic *, int)) \
+	X(int, SDL_HapticNewEffect, (SDL_Haptic *, SDL_HapticEffect *)) \
+	X(int, SDL_HapticUpdateEffect, (SDL_Haptic *, int, SDL_HapticEffect *)) \
+	X(int, SDL_HapticRunEffect, (SDL_Haptic *, int, Uint32)) \
+	X(int, SDL_HapticStopEffect, (SDL_Haptic *, int)) \
+	X(int, SDL_HapticDestroyEffect, (SDL_Haptic *, int))
+
+#define MVFFB_DECL(ret, name, args) static ret (*p_##name) args = nullptr;
+MVFFB_SDL_FUNCS(MVFFB_DECL)
+#undef MVFFB_DECL
+
+static std::atomic<bool> s_running{false};     // worker up and a device in hand
+static std::atomic<bool> s_stop{false};
+static std::atomic<int> s_level{0};            // requested signed level (-32767..32767)
+static std::atomic<long long> s_last_write{0}; // ms clock of the last motor write
+static std::mutex s_mtx;
+static std::condition_variable s_cv;
+static bool s_dirty = false;
+static std::thread s_thread;
+static int s_strength = 100;
+static bool s_invert = false;
+static int s_hold_ms = 500;
+static int s_loglevel = 1;
+static FILE *s_log = nullptr;
+static std::mutex s_logmtx;
+static std::chrono::steady_clock::time_point s_t0;
+
+static long long now_ms()
+{
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - s_t0).count();
+}
+
+static void flog(const char *fmt, ...)
+{
+	std::lock_guard<std::mutex> lk(s_logmtx);
+	if (!s_log)
+		return;
+	fprintf(s_log, "%8lld  ", now_ms());
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(s_log, fmt, ap);
+	va_end(ap);
+	fputc('\n', s_log);
+	fflush(s_log);
+}
+
+static bool load_sdl()
+{
+	HMODULE h = LoadLibraryA("SDL2.dll");
+	if (!h)
+	{
+		flog("SDL2.dll not found beside the emulator - force feedback off");
+		return false;
+	}
+	bool ok = true;
+#define MVFFB_LOAD(ret, name, args) \
+	p_##name = reinterpret_cast<ret (*) args>(GetProcAddress(h, #name)); \
+	if (!p_##name) { flog("SDL2.dll lacks %s", #name); ok = false; }
+	MVFFB_SDL_FUNCS(MVFFB_LOAD)
+#undef MVFFB_LOAD
+	return ok;
+}
+
+static bool icontains(const char *hay, const char *needle)
+{
+	if (!hay || !needle || !*needle)
+		return false;
+	std::string h(hay), n(needle);
+	for (auto &c : h) c = char(tolower((unsigned char)c));
+	for (auto &c : n) c = char(tolower((unsigned char)c));
+	return h.find(n) != std::string::npos;
+}
+
+struct Device
+{
+	SDL_Joystick *js = nullptr;
+	SDL_Haptic *hp = nullptr;
+	unsigned caps = 0;
+	bool is_wheel = false;
+	int effect = -1;
+	std::string name;
+};
+
+// Cannonball DX's selection order, trimmed to what we know: the device the
+// launcher names (wizard steering device) is authoritative; else a wheel-type
+// device with a constant-force actuator; else any constant-force device.
+static bool select_device(Device &d)
+{
+	const char *want = std::getenv("MIDV_FFB_DEVICE");
+	unsigned wvid = 0, wpid = 0;
+	bool const want_vidpid = want && sscanf(want, "%x:%x", &wvid, &wpid) == 2;
+	bool const want_name = want && *want && !want_vidpid;
+	int const n = p_SDL_NumJoysticks();
+	flog("%d joystick(s) via SDL %s", n, want ? want : "(no MIDV_FFB_DEVICE: first wheel)");
+	for (int pass = 0; pass < 3; pass++)
+	{
+		if (pass == 0 && !want_vidpid && !want_name)
+			continue;
+		for (int i = 0; i < n; i++)
+		{
+			SDL_Joystick *js = p_SDL_JoystickOpen(i);
+			if (!js)
+				continue;
+			const char *name = p_SDL_JoystickName(js);
+			unsigned const vid = p_SDL_JoystickGetVendor(js), pid = p_SDL_JoystickGetProduct(js);
+			bool const wheel = (p_SDL_JoystickGetType(js) == SDL_JOYSTICK_TYPE_WHEEL);
+			if (pass == 0)
+				flog("  [%d] \"%s\" vid %04x pid %04x%s", i, name ? name : "?", vid, pid, wheel ? " (wheel)" : "");
+			bool match = true;
+			if (pass == 0)
+				match = want_vidpid ? (vid == wvid && pid == wpid) : icontains(name, want);
+			else if (pass == 1)
+				match = wheel;
+			if (!match)
+			{
+				p_SDL_JoystickClose(js);
+				continue;
+			}
+			SDL_Haptic *hp = p_SDL_HapticOpenFromJoystick(js);
+			if (!hp)
+			{
+				if (pass == 0)
+					flog("  [%d] matches but has no haptics: %s", i, p_SDL_GetError());
+				p_SDL_JoystickClose(js);
+				if (pass == 0)
+					return false;   // the named device cannot do it: never push another wheel
+				continue;
+			}
+			unsigned const caps = p_SDL_HapticQuery(hp);
+			if (!(caps & SDL_HAPTIC_CONSTANT))
+			{
+				flog("  [%d] haptic but no constant force (caps 0x%x)", i, caps);
+				p_SDL_HapticClose(hp);
+				p_SDL_JoystickClose(js);
+				if (pass == 0)
+					return false;
+				continue;
+			}
+			d.js = js; d.hp = hp; d.caps = caps; d.is_wheel = wheel;
+			d.name = name ? name : "?";
+			flog("using [%d] \"%s\" (pass %d, caps 0x%x%s)", i, d.name.c_str(), pass, caps,
+					wheel ? ", steering axis" : ", cartesian");
+			return true;
+		}
+		if (pass == 0)
+		{
+			flog("MIDV_FFB_DEVICE \"%s\" matched nothing - force feedback off", want);
+			return false;
+		}
+	}
+	flog("no constant-force device found - force feedback off");
+	return false;
+}
+
+static void apply(Device &d, int level, bool &running, int &applied)
+{
+	SDL_HapticEffect e;
+	memset(&e, 0, sizeof(e));
+	e.type = SDL_HAPTIC_CONSTANT;
+	e.constant.length = SDL_HAPTIC_INFINITY;
+	e.constant.delay = 0;
+	if (d.is_wheel)
+	{
+		e.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+		e.constant.direction.dir[0] = 1;
+		e.constant.level = Sint16(level);
+	}
+	else
+	{
+		e.constant.direction.type = SDL_HAPTIC_CARTESIAN;
+		e.constant.direction.dir[0] = (level < 0) ? -1 : 1;
+		e.constant.level = Sint16(level < 0 ? -level : level);
+	}
+	if (level == 0)
+	{
+		if (running)
+			p_SDL_HapticStopEffect(d.hp, d.effect);
+		running = false;
+		applied = 0;
+		return;
+	}
+	if (p_SDL_HapticUpdateEffect(d.hp, d.effect, &e) < 0)
+	{
+		static bool s_said = false;
+		if (!s_said) { flog("update failed: %s", p_SDL_GetError()); s_said = true; }
+		return;
+	}
+	if (p_SDL_HapticRunEffect(d.hp, d.effect, 1) < 0)
+	{
+		static bool s_said = false;
+		if (!s_said) { flog("run failed: %s", p_SDL_GetError()); s_said = true; }
+		return;
+	}
+	running = true;
+	applied = level;
+}
+
+static void worker()
+{
+	Device d;
+	p_SDL_SetHint("SDL_JOYSTICK_RAWINPUT", "0");   // DirectInput enumeration (the plugin did the same)
+	if (p_SDL_Init(0x00000200u /*JOYSTICK*/ | 0x00001000u /*HAPTIC*/) < 0)   // SDL.h flags, header not included
+	{
+		flog("SDL_Init failed: %s", p_SDL_GetError());
+		s_running.store(false);
+		return;
+	}
+	p_SDL_JoystickUpdate();
+	if (!select_device(d))
+	{
+		p_SDL_Quit();
+		s_running.store(false);
+		return;
+	}
+	if (d.caps & SDL_HAPTIC_AUTOCENTER)
+		p_SDL_HapticSetAutocenter(d.hp, 0);
+	if (d.caps & SDL_HAPTIC_GAIN)
+		p_SDL_HapticSetGain(d.hp, 100);
+	{
+		SDL_HapticEffect e;
+		memset(&e, 0, sizeof(e));
+		e.type = SDL_HAPTIC_CONSTANT;
+		e.constant.direction.type = d.is_wheel ? SDL_HAPTIC_STEERING_AXIS : SDL_HAPTIC_CARTESIAN;
+		e.constant.direction.dir[0] = 1;
+		e.constant.length = SDL_HAPTIC_INFINITY;
+		e.constant.level = 0;
+		d.effect = p_SDL_HapticNewEffect(d.hp, &e);
+		if (d.effect < 0)
+		{
+			flog("constant-force effect unavailable: %s - force feedback off", p_SDL_GetError());
+			p_SDL_HapticClose(d.hp);
+			p_SDL_JoystickClose(d.js);
+			p_SDL_Quit();
+			s_running.store(false);
+			return;
+		}
+	}
+	flog("ready: strength %d%%, invert %d, hold %d ms", s_strength, int(s_invert), s_hold_ms);
+
+	bool running = false;
+	int applied = 0;
+	bool hold_said = false;
+	if (const char *t = std::getenv("MIDV_FFB_TEST"))
+	{
+		int const pct = std::clamp(atoi(t), -100, 100);
+		int const lvl = pct * 32767 / 100;
+		flog("TEST: level %d (%d%%) for 1500 ms", lvl, pct);
+		apply(d, lvl, running, applied);
+		for (int i = 0; i < 150 && !s_stop.load(); i++)
+			Sleep(10);
+		apply(d, 0, running, applied);
+		flog("TEST: released");
+	}
+	while (!s_stop.load())
+	{
+		{
+			std::unique_lock<std::mutex> lk(s_mtx);
+			s_cv.wait_for(lk, std::chrono::milliseconds(20), [] { return s_stop.load() || s_dirty; });
+			s_dirty = false;
+		}
+		if (s_stop.load())
+			break;
+		int want = s_level.load();
+		if (s_hold_ms > 0 && want != 0 && now_ms() - s_last_write.load() > s_hold_ms)
+		{
+			want = 0;
+			s_level.store(0);
+			if (!hold_said) { flog("no motor write for %d ms - force released", s_hold_ms); hold_said = true; }
+		}
+		else if (want != 0)
+			hold_said = false;
+		if (want != applied)
+			apply(d, want, running, applied);
+	}
+	apply(d, 0, running, applied);
+	p_SDL_HapticDestroyEffect(d.hp, d.effect);
+	p_SDL_HapticClose(d.hp);
+	p_SDL_JoystickClose(d.js);
+	p_SDL_Quit();
+	flog("closed");
+	s_running.store(false);
+}
+
+static void shutdown()
+{
+	if (!s_thread.joinable())
+		return;
+	s_stop.store(true);
+	{ std::lock_guard<std::mutex> lk(s_mtx); s_dirty = true; }
+	s_cv.notify_all();
+	s_thread.join();
+	if (s_log) { fclose(s_log); s_log = nullptr; }
+}
+
+static void start(running_machine &machine)
+{
+	const char *on = std::getenv("MIDV_FFB");
+	if (!on || atoi(on) == 0)
+		return;
+	s_t0 = std::chrono::steady_clock::now();
+	if (const char *l = std::getenv("MIDV_FFB_LOG"))
+		s_loglevel = atoi(l);
+	s_log = fopen("midv_ffb.log", "w");
+	if (const char *s = std::getenv("MIDV_FFB_STRENGTH"))
+		s_strength = std::clamp(atoi(s), 0, 100);
+	if (const char *s = std::getenv("MIDV_FFB_INVERT"))
+		s_invert = atoi(s) != 0;
+	if (const char *s = std::getenv("MIDV_FFB_HOLD_MS"))
+		s_hold_ms = std::clamp(atoi(s), 0, 60000);
+	flog("built-in force feedback for %s", machine.system().name);
+	if (s_strength == 0)
+	{
+		flog("strength 0 - force feedback off");
+		return;
+	}
+	if (!load_sdl())
+		return;
+	s_running.store(true);
+	s_thread = std::thread(worker);
+	machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () { shutdown(); }));
+}
+
+} // namespace mvffb
+
+// Motor byte from the drivers (signed, after gain/slew/clamp). Any thread.
+void midv_ffb_write(int f)
+{
+	if (!mvffb::s_running.load())
+		return;
+	int level = 0;
+	if (f != 0 && f != -128)
+	{
+		double p = std::min(1.0, double(f < 0 ? -f : f) / 126.0);
+		level = int(p * 32767.0 * mvffb::s_strength / 100.0 + 0.5);
+		// Sign. Measured 2026-09-03 with the game's own spring (Exotica parked
+		// left of centre writes +58, right of centre -70: a positive byte
+		// pushes the wheel RIGHT) and with a raw level on the Moza R12 (a
+		// positive SDL steering-axis level turns it LEFT). So a positive byte
+		// becomes a negative level; MIDV_FFB_INVERT flips it for a base whose
+		// axis sign runs the other way (the symptom: the wheel runs away from
+		// centre in Exotica, shakes in USA).
+		if ((f > 0) != mvffb::s_invert)
+			level = -level;
+	}
+	if (mvffb::s_loglevel >= 2)
+		mvffb::flog("write %d -> level %d", f, level);
+	mvffb::s_level.store(level);
+	mvffb::s_last_write.store(mvffb::now_ms());
+	{ std::lock_guard<std::mutex> lk(mvffb::s_mtx); mvffb::s_dirty = true; }
+	mvffb::s_cv.notify_one();
+}
+
 void midv_telemetry_start(running_machine &machine)
 {
 	static bool s_started = false;
 	if (s_started)
 		return;
 	s_started = true;
+	mvffb::start(machine);   // POC built-in force feedback (MIDV_FFB=1)
 	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
 	if (telem_spec || std::getenv("MIDV_TELEM_FORZA"))
 		telem_init(telem_spec, machine.system().name);
@@ -2234,7 +2642,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	midv_patches_tick(m_ram_base);
 	if (live().enabled)
 		live().speed_pct = float(machine().video().speed_percent() * 100.0);
-		midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half
+	midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half (every frame)
 
 	// Esc options menu pause: block the emu thread here while the menu is
 	// open (freezes emulation + sound). The GL thread clears s_menu_pause

@@ -35,6 +35,9 @@ struct midvunit_object_data
 // POC: re-assert MIDV_PATCH entries the game's own startup ROM re-copy
 // reverted (defined in midvunit.cpp, called from screen_update)
 void midv_patches_tick(uint32_t *ram);
+// POC: built-in force feedback - the drivers hand over the signed motor byte
+// (see mvffb in midvunit_v.cpp); inert unless MIDV_FFB=1
+void midv_ffb_write(int f);
 
 class midvunit_base_state;
 

@@ -610,6 +610,7 @@ void midvunit_state::wheel_board_w(uint32_t data)
 							f = std::clamp(f, -s_clamp, s_clamp);
 						s_prev = f;
 						m_wheel_motor = uint8_t(int8_t(f));
+						midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)
 					}
 					//LOGINPUT("Wheel board (U4 74HC574; Motor) = %02X\n", arg);
 					break;
