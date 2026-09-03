@@ -150,7 +150,8 @@ public:
 	void crusnexo(machine_config &config);
 
 	ioport_value keypad_r();
-	ioport_value gears_r();   // POC: real H-pattern switches or the virtual sequential gear
+	ioport_value gears_r();
+	ioport_value forced_in1_r();   // POC: MIDZ_FORCE_IN1   // POC: real H-pattern switches or the virtual sequential gear
 
 protected:
 	virtual void machine_start() override
@@ -851,6 +852,18 @@ void crusnexo_state::keypad_select_w(offs_t offset, uint32_t data)
 }
 
 
+ioport_value crusnexo_state::forced_in1_r()
+{
+	static int s_force = -1;
+	if (s_force < 0)
+	{
+		const char *e = std::getenv("MIDZ_FORCE_IN1");
+		s_force = e ? int(strtoul(e, nullptr, 16)) : 0;
+	}
+	// raw active-low lines: 1 = open; forced bits read closed (0)
+	return (0xf00d & ~s_force) & 0xf00d;
+}
+
 ioport_value crusnexo_state::gears_r()
 {
 	// POC: MIDZ_SEQ_SHIFT=1 -> Shift Up / Shift Down (SEQ) move a virtual
@@ -1402,10 +1415,7 @@ static INPUT_PORTS_START( crusnexo )
 	PORT_BIT( 0x8000, IP_ACTIVE_LOW, IPT_BILL1 )
 
 	PORT_START("IN1") // Listed "names" are via the manual's "JAMMA" pinout sheet"
-	PORT_BIT( 0x0001, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
 	PORT_BIT( 0x0002, IP_ACTIVE_LOW, IPT_BUTTON6 ) PORT_NAME("Radio")    // Radio Switch
-	PORT_BIT( 0x0004, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
-	PORT_BIT( 0x0008, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
 	PORT_BIT( 0x0010, IP_ACTIVE_LOW, IPT_BUTTON7 ) PORT_NAME("View 1")   // View 1
 	PORT_BIT( 0x0020, IP_ACTIVE_LOW, IPT_BUTTON8 ) PORT_NAME("View 2")   // View 2
 	PORT_BIT( 0x0040, IP_ACTIVE_LOW, IPT_BUTTON9 ) PORT_NAME("View 3")   // View 3
@@ -1415,10 +1425,9 @@ static INPUT_PORTS_START( crusnexo )
 	// Shift Up / Shift Down buttons (SEQ) - paddles on a game that only knows
 	// an H-pattern shifter
 	PORT_BIT( 0x0f00, IP_ACTIVE_HIGH, IPT_CUSTOM ) PORT_CUSTOM_MEMBER(FUNC(crusnexo_state::gears_r))
-	PORT_BIT( 0x1000, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
-	PORT_BIT( 0x2000, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
-	PORT_BIT( 0x4000, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
-	PORT_BIT( 0x8000, IP_ACTIVE_LOW, IPT_UNKNOWN )
+	// POC: the "Not Used" lines, env-forceable (MIDZ_FORCE_IN1=<hex mask>) to
+	// hunt for where the real shifter is wired; reads as open (1) unset
+	PORT_BIT( 0xf00d, IP_ACTIVE_HIGH, IPT_CUSTOM ) PORT_CUSTOM_MEMBER(FUNC(crusnexo_state::forced_in1_r))
 
 	PORT_START("IN2")
 	PORT_BIT( 0x0007, IP_ACTIVE_HIGH, IPT_CUSTOM) PORT_CUSTOM_MEMBER(FUNC(crusnexo_state::keypad_r))
