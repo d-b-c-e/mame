@@ -142,12 +142,15 @@ public:
 		, m_leds(*this, "led%u", 0U)
 		, m_lamps(*this, "lamp%u", 0U)
 		, m_wheel_motor(*this, "wheel")
+		, m_io_gears(*this, "GEARS")
+		, m_io_seq(*this, "SEQ")
 		, m_io_analog(*this, "ANALOG%u", 0U)
 	{ }
 
 	void crusnexo(machine_config &config);
 
 	ioport_value keypad_r();
+	ioport_value gears_r();   // POC: real H-pattern switches or the virtual sequential gear
 
 protected:
 	virtual void machine_start() override
@@ -179,6 +182,10 @@ private:
 	output_finder<32> m_leds;
 	output_finder<8> m_lamps;
 	output_finder<> m_wheel_motor;   // POC: "wheel" - the force byte the game writes to the LED/lamp board (offset 0)
+	required_ioport m_io_gears;   // POC
+	required_ioport m_io_seq;     // POC
+	uint8_t m_vgear = 1;          // POC: virtual gear (MIDZ_SEQ_SHIFT)
+	uint8_t m_seq_last = 0;
 	required_ioport_array<4> m_io_analog;
 };
 
@@ -707,10 +714,23 @@ void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 				if (s_clamp < 0 || s_clamp > 127)
 					s_clamp = 0;
 			}
-			uint8_t out = data & 0xff;
+			// MIDZ_FFB_GAIN (percent, default 100): Exotica's spring peaks
+			// near 46/127 at full lock where the V-Unit games reach 100+,
+			// so the launcher scales it up to land in the same range.
+			static int s_gain = -1;
+			if (s_gain < 0)
+			{
+				const char *e = std::getenv("MIDZ_FFB_GAIN");
+				s_gain = e ? atoi(e) : 100;
+				if (s_gain < 25 || s_gain > 800)
+					s_gain = 100;
+			}
+			int f = int(int8_t(data & 0xff));
+			if (s_gain != 100)
+				f = std::clamp((f * s_gain) / 100, -127, 127);
 			if (s_clamp > 0)
-				out = uint8_t(int8_t(std::clamp(int(int8_t(out)), -s_clamp, s_clamp)));
-			m_wheel_motor = out;
+				f = std::clamp(f, -s_clamp, s_clamp);
+			m_wheel_motor = uint8_t(int8_t(f));
 			break;
 		}
 
@@ -830,6 +850,31 @@ void crusnexo_state::keypad_select_w(offs_t offset, uint32_t data)
 		m_keypad_select = data;
 }
 
+
+ioport_value crusnexo_state::gears_r()
+{
+	// POC: MIDZ_SEQ_SHIFT=1 -> Shift Up / Shift Down (SEQ) move a virtual
+	// gear 1..4 and the game sees that switch closed; unset -> the real
+	// H-pattern switches. Bits are the raw active-low switch states.
+	static int s_seq = -1;
+	if (s_seq < 0)
+	{
+		const char *e = std::getenv("MIDZ_SEQ_SHIFT");
+		s_seq = (e && atoi(e) != 0) ? 1 : 0;
+	}
+	if (!s_seq)
+		return m_io_gears->read() & 0x0f;
+	uint8_t const cur = m_io_seq->read() & 0x03;
+	uint8_t const rise = cur & ~m_seq_last;
+	m_seq_last = cur;
+	if ((rise & 0x01) && m_vgear < 4)
+		m_vgear++;
+	if ((rise & 0x02) && m_vgear > 1)
+		m_vgear--;
+	if (rise)
+		midz_iolog(machine(), "vgear", m_vgear, cur);
+	return 0x0f & ~(1 << (m_vgear - 1));
+}
 
 ioport_value crusnexo_state::keypad_r()
 {
@@ -1365,10 +1410,11 @@ static INPUT_PORTS_START( crusnexo )
 	PORT_BIT( 0x0020, IP_ACTIVE_LOW, IPT_BUTTON8 ) PORT_NAME("View 2")   // View 2
 	PORT_BIT( 0x0040, IP_ACTIVE_LOW, IPT_BUTTON9 ) PORT_NAME("View 3")   // View 3
 	PORT_BIT( 0x0080, IP_ACTIVE_LOW, IPT_BUTTON10 ) PORT_NAME("View 4")  // View 4
-	PORT_BIT( 0x0100, IP_ACTIVE_LOW, IPT_BUTTON2 ) PORT_NAME("1st Gear") // Gear 1
-	PORT_BIT( 0x0200, IP_ACTIVE_LOW, IPT_BUTTON3 ) PORT_NAME("2nd Gear") // Gear 2
-	PORT_BIT( 0x0400, IP_ACTIVE_LOW, IPT_BUTTON4 ) PORT_NAME("3rd Gear") // Gear 3
-	PORT_BIT( 0x0800, IP_ACTIVE_LOW, IPT_BUTTON5 ) PORT_NAME("4th Gear") // Gear 4
+	// POC: the four gear switches come from gears_r() - the real H-pattern
+	// buttons (GEARS) or, with MIDZ_SEQ_SHIFT=1, a virtual gear driven by the
+	// Shift Up / Shift Down buttons (SEQ) - paddles on a game that only knows
+	// an H-pattern shifter
+	PORT_BIT( 0x0f00, IP_ACTIVE_HIGH, IPT_CUSTOM ) PORT_CUSTOM_MEMBER(FUNC(crusnexo_state::gears_r))
 	PORT_BIT( 0x1000, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
 	PORT_BIT( 0x2000, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
 	PORT_BIT( 0x4000, IP_ACTIVE_LOW, IPT_UNKNOWN )                       // Not Used
@@ -1403,6 +1449,15 @@ static INPUT_PORTS_START( crusnexo )
 
 	PORT_START("ANALOG0")
 	PORT_BIT( 0xff, 0x00, IPT_UNUSED )
+	PORT_START("GEARS")   // POC: real shifter switches (read by gears_r)
+	PORT_BIT( 0x01, IP_ACTIVE_LOW, IPT_BUTTON2 ) PORT_NAME("1st Gear")
+	PORT_BIT( 0x02, IP_ACTIVE_LOW, IPT_BUTTON3 ) PORT_NAME("2nd Gear")
+	PORT_BIT( 0x04, IP_ACTIVE_LOW, IPT_BUTTON4 ) PORT_NAME("3rd Gear")
+	PORT_BIT( 0x08, IP_ACTIVE_LOW, IPT_BUTTON5 ) PORT_NAME("4th Gear")
+
+	PORT_START("SEQ")     // POC: sequential shifting (MIDZ_SEQ_SHIFT=1)
+	PORT_BIT( 0x01, IP_ACTIVE_HIGH, IPT_BUTTON11 ) PORT_NAME("Shift Up")
+	PORT_BIT( 0x02, IP_ACTIVE_HIGH, IPT_BUTTON12 ) PORT_NAME("Shift Down")
 INPUT_PORTS_END
 
 
