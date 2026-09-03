@@ -25,6 +25,7 @@
 #include "zeus2_gl_shaders.h"
 #include "../../mame/midway/midvunit_menu_assets.h"
 namespace mzgl { void start(); void stop(); }
+void midv_trace_wheelpos(running_machine &machine, const char *tag);   // midvunit_v.cpp (POC)
 #endif
 
 
@@ -1506,6 +1507,7 @@ void zeus2_device::device_stop()
 uint32_t zeus2_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
 	mzgl::s_secs.store(machine().time().as_double());   // POC: game time for the overlay's snapshot trigger
+	midv_trace_wheelpos(machine(), ":ANALOG3");   // POC: FFB trace, input half (Exotica steering)
 	// Wait until configuration is completed before transfering anything
 	if (!(m_zeusbase[0x10] & 0x20))
 		return 0;

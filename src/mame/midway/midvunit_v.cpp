@@ -1603,6 +1603,26 @@ TIMER_CALLBACK_MEMBER(midvunit_base_state::eoi_timer_cb)
 // unset. MIDV_TELEM_FORZA alone also works (Forza packets, no JSON
 // stream). Shared by the V-Unit games (video_start) and Exotica
 // (midzeus machine_start) - both emit the "wheel" output now.
+// POC: the other half of the force loop - the steering INPUT the game reads,
+// logged into the same trace ("wheelpos" rows) whenever it changes. Called
+// once per frame from screen_update (V-Unit ":WHEEL", Exotica ":ANALOG3").
+void midv_trace_wheelpos(running_machine &machine, const char *tag)
+{
+	if (!s_ffb_trace)
+		return;
+	static int s_last = -1;
+	ioport_port *port = machine.root_device().ioport(tag);
+	if (!port)
+		return;
+	int const v = int(port->read() & 0xff);
+	if (v == s_last)
+		return;
+	s_last = v;
+	auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - s_ffb_trace_t0).count();
+	fprintf(s_ffb_trace, "%lld,wheelpos,%d\n", (long long)ms, v);
+}
+
 void midv_telemetry_start(running_machine &machine)
 {
 	static bool s_started = false;
@@ -2214,6 +2234,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	midv_patches_tick(m_ram_base);
 	if (live().enabled)
 		live().speed_pct = float(machine().video().speed_percent() * 100.0);
+		midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half
 
 	// Esc options menu pause: block the emu thread here while the menu is
 	// open (freezes emulation + sound). The GL thread clears s_menu_pause
