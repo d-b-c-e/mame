@@ -3879,26 +3879,39 @@ void analog_field::frame_update(running_machine &machine)
 			// only update if analog value changed
 			m_previousanalog = rawvalue;
 
-			// POC (env-gated, inert unset): steering response curve for
-			// PADDLE-class fields. MIDV_STEER_CURVE is a percent exponent
-			// applied to the normalized wheel deflection: below 100 boosts
-			// response near center (compensates the Cruis'n games' own
-			// lazy-center/sharp-edge mapping), above 100 softens the
-			// center, 100 = linear/off.
+			// POC (env-gated, inert unset): steering feel for PADDLE-class
+			// fields on absolute devices. MAME's own "sensitivity" is applied
+			// and then exactly un-applied for absolute inputs (inverse here,
+			// forward in apply_settings, clamp bounds pre-scaled the same
+			// way), so it cannot change a real wheel's response - hence:
+			//  MIDV_STEER_GAIN  percent gain on the normalized deflection,
+			//                   clamped to full lock: 200 = full lock at half
+			//                   the wheel travel, 50 = full travel gives half
+			//                   lock; 100 = off.
+			//  MIDV_STEER_CURVE percent exponent on the (gained) deflection:
+			//                   below 100 boosts response near center
+			//                   (compensates the Cruis'n games' own
+			//                   lazy-center/sharp-edge mapping), above 100
+			//                   softens the center; 100 = linear/off.
 			s32 curvedvalue = rawvalue;
 			if (m_field.type() == IPT_PADDLE)
 			{
-				static int s_curve = -1;
+				static int s_curve = -1, s_gain = -1;
 				if (s_curve < 0)
 				{
 					const char *e = std::getenv("MIDV_STEER_CURVE");
 					s_curve = e ? atoi(e) : 100;
 					if (s_curve < 25 || s_curve > 400)
 						s_curve = 100;
+					e = std::getenv("MIDV_STEER_GAIN");
+					s_gain = e ? atoi(e) : 100;
+					if (s_gain < 25 || s_gain > 400)
+						s_gain = 100;
 				}
-				if (s_curve != 100)
+				if (s_curve != 100 || s_gain != 100)
 				{
-					double const n = double(rawvalue) / double(osd::input_device::ABSOLUTE_MAX);
+					double n = double(rawvalue) / double(osd::input_device::ABSOLUTE_MAX);
+					n = std::clamp(n * double(s_gain) / 100.0, -1.0, 1.0);
 					double const c = std::copysign(std::pow(std::abs(n), double(s_curve) / 100.0), n);
 					curvedvalue = s32(c * double(osd::input_device::ABSOLUTE_MAX));
 				}
