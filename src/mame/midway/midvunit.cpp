@@ -23,6 +23,8 @@
 **************************************************************************/
 
 #include "emu.h"
+
+#include <algorithm>
 #include "midvunit.h"
 
 #include "cpu/adsp2100/adsp2100.h"
@@ -571,7 +573,30 @@ void midvunit_state::wheel_board_w(uint32_t data)
 					LOGINPUT("Wheel board (ATODRDZ) = %02X\n", arg);
 					break;
 				case 4: // WHLCTLZ
-					m_wheel_motor = arg;
+					// POC (env-gated, inert unset): MIDV_FFB_CLAMP=N caps the
+					// signed force byte at +-N. The game's force is a kick
+					// opposite to and proportional to each wheel movement (a
+					// damper, measured: steps of 32/64/112 counts -> peaks of
+					// 30/63/100), which turns into a violent limit cycle on a
+					// strong direct-drive base; capping the peaks stabilises
+					// the loop while small road forces keep full strength.
+					{
+						static int s_clamp = -1;
+						if (s_clamp < 0)
+						{
+							const char *e = std::getenv("MIDV_FFB_CLAMP");
+							s_clamp = e ? atoi(e) : 0;
+							if (s_clamp < 0 || s_clamp > 127)
+								s_clamp = 0;
+						}
+						uint8_t out = arg;
+						if (s_clamp > 0)
+						{
+							int const f = int8_t(arg);
+							out = uint8_t(int8_t(std::clamp(f, -s_clamp, s_clamp)));
+						}
+						m_wheel_motor = out;
+					}
 					//LOGINPUT("Wheel board (U4 74HC574; Motor) = %02X\n", arg);
 					break;
 				case 5: // DRVCTLZ
