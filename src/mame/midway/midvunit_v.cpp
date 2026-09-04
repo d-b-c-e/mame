@@ -1664,6 +1664,13 @@ void midv_trace_wheelpos(running_machine &machine, const char *tag)
 //                         for the whole session (0 = off). MIDV_FFB_FRICTION=N adds
 //                         constant drag the same way. Both are condition effects
 //                         the base renders itself, independent of the game forces.
+//   MIDV_FFB_RUMBLE=N     a 100 ms vibration burst on every force update, at
+//                         |force| x N % (the FFB Arcade Plugin did exactly this;
+//                         it is what made crashes shake - Exotica's crash and
+//                         jump effects are single 17 ms full-force spikes that
+//                         a direct-drive base alone renders as a tick). 0 = off.
+//   (smoothing lets a jump of >= 60 % of full through unfiltered, so those
+//   spikes still reach the constant-force channel at full size)
 //   MIDV_FFB_HOLD_MS=N    release the force when the game has not written the
 //                         motor for N ms (500; 0 = hold forever like the
 //                         arcade board - a paused direct-drive base holding
@@ -1697,7 +1704,11 @@ namespace mvffb {
 	X(int, SDL_HapticUpdateEffect, (SDL_Haptic *, int, SDL_HapticEffect *)) \
 	X(int, SDL_HapticRunEffect, (SDL_Haptic *, int, Uint32)) \
 	X(int, SDL_HapticStopEffect, (SDL_Haptic *, int)) \
-	X(int, SDL_HapticDestroyEffect, (SDL_Haptic *, int))
+	X(int, SDL_HapticDestroyEffect, (SDL_Haptic *, int)) \
+	X(int, SDL_HapticRumbleSupported, (SDL_Haptic *)) \
+	X(int, SDL_HapticRumbleInit, (SDL_Haptic *)) \
+	X(int, SDL_HapticRumblePlay, (SDL_Haptic *, float, Uint32)) \
+	X(int, SDL_HapticRumbleStop, (SDL_Haptic *))
 
 #define MVFFB_DECL(ret, name, args) static ret (*p_##name) args = nullptr;
 MVFFB_SDL_FUNCS(MVFFB_DECL)
@@ -1717,6 +1728,7 @@ static int s_hold_ms = 500;
 static int s_smooth_ms = 0;   // MIDV_FFB_SMOOTH: first-order low-pass time constant
 static int s_damper = 0;      // MIDV_FFB_DAMPER: velocity-proportional resistance, % of full
 static int s_friction = 0;    // MIDV_FFB_FRICTION: constant drag, % of full
+static int s_rumble = 0;      // MIDV_FFB_RUMBLE: vibration burst per force update, % scale
 static int s_loglevel = 1;
 static FILE *s_log = nullptr;
 static std::mutex s_logmtx;
@@ -1933,8 +1945,19 @@ static void worker()
 			return;
 		}
 	}
-	flog("ready: strength %d%%, invert %d, hold %d ms, smooth %d ms, damper %d%%, friction %d%%",
-			s_strength, int(s_invert), s_hold_ms, s_smooth_ms, s_damper, s_friction);
+	flog("ready: strength %d%%, invert %d, hold %d ms, smooth %d ms, damper %d%%, friction %d%%, rumble %d%%",
+			s_strength, int(s_invert), s_hold_ms, s_smooth_ms, s_damper, s_friction, s_rumble);
+	bool rumble_ok = false;
+	if (s_rumble > 0)
+	{
+		if (p_SDL_HapticRumbleSupported(d.hp) == 1 && p_SDL_HapticRumbleInit(d.hp) == 0)
+		{
+			rumble_ok = true;
+			flog("rumble: %d%% - 100 ms burst per force update", s_rumble);
+		}
+		else
+			flog("rumble: not available on this device (%s)", p_SDL_GetError());
+	}
 	// static condition effects (the arcade wheel mechanism the base lacks)
 	int cond_ids[2] = { -1, -1 };
 	struct { int pct; unsigned cap; Uint16 type; const char *name; } const conds[2] = {
@@ -1981,6 +2004,8 @@ static void worker()
 	}
 	double filt = 0.0;
 	auto last_tick = std::chrono::steady_clock::now();
+	int prev_want = 0;
+	double const full = 32767.0 * s_strength / 100.0;   // level of a full-scale byte
 	while (!s_stop.load())
 	{
 		{
@@ -1999,6 +2024,22 @@ static void worker()
 		}
 		else if (want != 0)
 			hold_said = false;
+		if (want != prev_want)
+		{
+			// a new force value from the game: the plugin-style vibration burst
+			if (rumble_ok)
+			{
+				if (want == 0)
+					p_SDL_HapticRumbleStop(d.hp);
+				else
+					p_SDL_HapticRumblePlay(d.hp, float(std::min(1.0, std::abs(want) / full) * s_rumble / 100.0), 100);
+			}
+			// an impulse (a jump of >= 60 % of full in one update - crashes, jumps,
+			// World off-track) goes through the smoothing unfiltered
+			if (s_smooth_ms > 0 && std::abs(want - prev_want) >= full * 0.6)
+				filt = double(want);
+			prev_want = want;
+		}
 		int out = want;
 		if (s_smooth_ms > 0)
 		{
@@ -2020,6 +2061,8 @@ static void worker()
 			apply(d, out, running, applied);
 	}
 	apply(d, 0, running, applied);
+	if (rumble_ok)
+		p_SDL_HapticRumbleStop(d.hp);
 	for (int id : cond_ids)
 		if (id >= 0) { p_SDL_HapticStopEffect(d.hp, id); p_SDL_HapticDestroyEffect(d.hp, id); }
 	p_SDL_HapticDestroyEffect(d.hp, d.effect);
@@ -2062,6 +2105,8 @@ static void start(running_machine &machine)
 		s_damper = std::clamp(atoi(s), 0, 100);
 	if (const char *s = std::getenv("MIDV_FFB_FRICTION"))
 		s_friction = std::clamp(atoi(s), 0, 100);
+	if (const char *s = std::getenv("MIDV_FFB_RUMBLE"))
+		s_rumble = std::clamp(atoi(s), 0, 100);
 	flog("built-in force feedback for %s", machine.system().name);
 	if (s_strength == 0)
 	{
