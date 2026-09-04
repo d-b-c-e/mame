@@ -39,6 +39,7 @@
 #include <windows.h>
 #include <mutex>
 #include <condition_variable>
+#include <cmath>
 // POC built-in force feedback: SDL2 haptics, types only - SDL2.dll is loaded
 // at run time (see mvffb below), vunit.exe carries no import of it
 #include <SDL2/SDL_haptic.h>
@@ -1207,7 +1208,11 @@ void thread_main()
 				return e;
 			};
 			if (edge(VK_ESCAPE, esc_prev) && menuprog)
+			{
 				menu_open = !menu_open;
+				if (menu_open)
+					midv_ffb_write(0);   // POC: drop the wheel force the moment the menu opens
+			}
 			bool const up = edge(VK_UP, up_prev);
 			bool const dn = edge(VK_DOWN, down_prev);
 			bool const ok = edge(VK_RETURN, ret_prev);
@@ -1649,6 +1654,16 @@ void midv_trace_wheelpos(running_machine &machine, const char *tag)
 //                         a constant force
 //   MIDV_FFB_INVERT=1     flip the direction (bases differ in axis sign; the
 //                         default is right for a Moza R12 - see midv_ffb_write)
+//   MIDV_FFB_SMOOTH=N     first-order low-pass on the level, time constant N ms
+//                         (0 = off). The arcade motor + wheel had inertia a
+//                         direct-drive base lacks: without it the V-Unit damper
+//                         kicks, arriving a couple of frames late, drive a strong
+//                         wheel into a left-right limit cycle even hands-off
+//   MIDV_FFB_DAMPER=N     stand-in for the arcade wheel mechanism: a DirectInput
+//                         damper (resistance proportional to wheel speed) at N %
+//                         for the whole session (0 = off). MIDV_FFB_FRICTION=N adds
+//                         constant drag the same way. Both are condition effects
+//                         the base renders itself, independent of the game forces.
 //   MIDV_FFB_HOLD_MS=N    release the force when the game has not written the
 //                         motor for N ms (500; 0 = hold forever like the
 //                         arcade board - a paused direct-drive base holding
@@ -1699,6 +1714,9 @@ static std::thread s_thread;
 static int s_strength = 100;
 static bool s_invert = false;
 static int s_hold_ms = 500;
+static int s_smooth_ms = 0;   // MIDV_FFB_SMOOTH: first-order low-pass time constant
+static int s_damper = 0;      // MIDV_FFB_DAMPER: velocity-proportional resistance, % of full
+static int s_friction = 0;    // MIDV_FFB_FRICTION: constant drag, % of full
 static int s_loglevel = 1;
 static FILE *s_log = nullptr;
 static std::mutex s_logmtx;
@@ -1915,7 +1933,37 @@ static void worker()
 			return;
 		}
 	}
-	flog("ready: strength %d%%, invert %d, hold %d ms", s_strength, int(s_invert), s_hold_ms);
+	flog("ready: strength %d%%, invert %d, hold %d ms, smooth %d ms, damper %d%%, friction %d%%",
+			s_strength, int(s_invert), s_hold_ms, s_smooth_ms, s_damper, s_friction);
+	// static condition effects (the arcade wheel mechanism the base lacks)
+	int cond_ids[2] = { -1, -1 };
+	struct { int pct; unsigned cap; Uint16 type; const char *name; } const conds[2] = {
+		{ s_damper, SDL_HAPTIC_DAMPER, SDL_HAPTIC_DAMPER, "damper" },
+		{ s_friction, SDL_HAPTIC_FRICTION, SDL_HAPTIC_FRICTION, "friction" } };
+	for (int i = 0; i < 2; i++)
+	{
+		if (conds[i].pct <= 0)
+			continue;
+		if (!(d.caps & conds[i].cap))
+		{
+			flog("%s: not supported by this device (caps 0x%x)", conds[i].name, d.caps);
+			continue;
+		}
+		SDL_HapticEffect e;
+		memset(&e, 0, sizeof(e));
+		e.type = conds[i].type;
+		e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
+		e.condition.direction.dir[0] = 1;
+		e.condition.length = SDL_HAPTIC_INFINITY;
+		Sint16 const coeff = Sint16(0x7fff * conds[i].pct / 100);
+		e.condition.right_sat[0] = e.condition.left_sat[0] = 0xffff;
+		e.condition.right_coeff[0] = e.condition.left_coeff[0] = coeff;
+		cond_ids[i] = p_SDL_HapticNewEffect(d.hp, &e);
+		if (cond_ids[i] < 0 || p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0)
+			flog("%s: could not start: %s", conds[i].name, p_SDL_GetError());
+		else
+			flog("%s: %d%% running", conds[i].name, conds[i].pct);
+	}
 
 	bool running = false;
 	int applied = 0;
@@ -1931,11 +1979,13 @@ static void worker()
 		apply(d, 0, running, applied);
 		flog("TEST: released");
 	}
+	double filt = 0.0;
+	auto last_tick = std::chrono::steady_clock::now();
 	while (!s_stop.load())
 	{
 		{
 			std::unique_lock<std::mutex> lk(s_mtx);
-			s_cv.wait_for(lk, std::chrono::milliseconds(20), [] { return s_stop.load() || s_dirty; });
+			s_cv.wait_for(lk, std::chrono::milliseconds(s_smooth_ms > 0 ? 4 : 20), [] { return s_stop.load() || s_dirty; });
 			s_dirty = false;
 		}
 		if (s_stop.load())
@@ -1949,10 +1999,29 @@ static void worker()
 		}
 		else if (want != 0)
 			hold_said = false;
-		if (want != applied)
-			apply(d, want, running, applied);
+		int out = want;
+		if (s_smooth_ms > 0)
+		{
+			// first-order low-pass toward the requested level (see MIDV_FFB_SMOOTH)
+			auto const now = std::chrono::steady_clock::now();
+			double const dt = std::chrono::duration<double, std::milli>(now - last_tick).count();
+			last_tick = now;
+			double const a = 1.0 - std::exp(-dt / double(s_smooth_ms));
+			filt += (double(want) - filt) * a;
+			out = int(std::lround(filt));
+			if (want == 0 && std::abs(out) < 160)   // settled: let the effect stop
+			{
+				filt = 0.0;
+				out = 0;
+			}
+		}
+		// re-level on any real change (>= 0.1 %) and always on stop/start
+		if (std::abs(out - applied) >= 33 || (out == 0) != (applied == 0))
+			apply(d, out, running, applied);
 	}
 	apply(d, 0, running, applied);
+	for (int id : cond_ids)
+		if (id >= 0) { p_SDL_HapticStopEffect(d.hp, id); p_SDL_HapticDestroyEffect(d.hp, id); }
 	p_SDL_HapticDestroyEffect(d.hp, d.effect);
 	p_SDL_HapticClose(d.hp);
 	p_SDL_JoystickClose(d.js);
@@ -1987,6 +2056,12 @@ static void start(running_machine &machine)
 		s_invert = atoi(s) != 0;
 	if (const char *s = std::getenv("MIDV_FFB_HOLD_MS"))
 		s_hold_ms = std::clamp(atoi(s), 0, 60000);
+	if (const char *s = std::getenv("MIDV_FFB_SMOOTH"))
+		s_smooth_ms = std::clamp(atoi(s), 0, 2000);
+	if (const char *s = std::getenv("MIDV_FFB_DAMPER"))
+		s_damper = std::clamp(atoi(s), 0, 100);
+	if (const char *s = std::getenv("MIDV_FFB_FRICTION"))
+		s_friction = std::clamp(atoi(s), 0, 100);
 	flog("built-in force feedback for %s", machine.system().name);
 	if (s_strength == 0)
 	{
