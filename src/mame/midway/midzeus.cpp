@@ -945,7 +945,23 @@ uint32_t crusnexo_state::analog_r(offs_t offset)
 		if (offset < 8 || offset > 11)
 			LOGMASKED(LOG_INPUT, "%06X:analog_r(%X)\n", m_maincpu->pc(), offset);
 	}
-	return m_io_analog[offset & 3]->read();
+	uint32_t val = m_io_analog[offset & 3]->read();
+	// POC (env-gated, inert unset): MIDZ_WHEEL_INVERT=1 goes with the
+	// "Wheel Invert" DIP switched ON. That DIP is what makes the TRANS
+	// SELECT screen interactive at all (with it off the game confirms
+	// AUTO immediately, whatever the wheel is doing - the long-standing
+	// "Exotica always picks automatic"), but it also mirrors the wheel
+	// for driving. Mirroring the steering value here cancels that, so
+	// the car steers the way it always did and only the menu changes.
+	static int s_invert = -1;
+	if (s_invert < 0)
+	{
+		const char *e = std::getenv("MIDZ_WHEEL_INVERT");
+		s_invert = (e && atoi(e) != 0) ? 1 : 0;
+	}
+	if (s_invert && (offset & 3) == 3)
+		val = (val & ~uint32_t(0xff)) | (0xff - (val & 0xff));
+	return val;
 }
 
 
