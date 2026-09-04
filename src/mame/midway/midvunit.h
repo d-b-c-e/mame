@@ -163,7 +163,7 @@ protected:
 		, m_adc(*this, "adc")
 		, m_nvram(*this, "nvram")
 		, m_optional_drivers(*this, "lamp%u", 0U)
-		, m_wheel_motor(*this, "wheel")
+		, m_wheel_motor(*this, "wheel_motor")
 		, m_in0(*this, "IN0")
 		, m_in1(*this, "IN1")
 		, m_dsw(*this, "DSW")

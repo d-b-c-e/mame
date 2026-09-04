@@ -141,7 +141,7 @@ public:
 		, m_digits(*this, "digit%u", 0U)
 		, m_leds(*this, "led%u", 0U)
 		, m_lamps(*this, "lamp%u", 0U)
-		, m_wheel_motor(*this, "wheel")
+		, m_wheel_motor(*this, "wheel_motor")
 		, m_io_gears(*this, "GEARS")
 		, m_io_seq(*this, "SEQ")
 		, m_io_analog(*this, "ANALOG%u", 0U)
@@ -807,10 +807,11 @@ uint32_t midzeus_state::tms320c32_control_r(offs_t offset)
 	// watch for accesses to the timers
 	if (offset == 0x24 || offset == 0x34)
 	{
-		// timer is clocked at 100ns
+		// CLKSRC in the timer's control register selects the internal clock, H1/2 = CLKIN/4;
+		// the external TCLK rate is unknown, so keep the 100ns the driver has always assumed
 		int const which = (offset >> 4) & 1;
-		int32_t const result = (m_timer[which]->elapsed() * 10000000).as_double();
-		return result;
+		uint32_t const rate = BIT(m_tms320c32_control[offset - 4], 9) ? m_maincpu->unscaled_clock() / 4 : 10000000;
+		return m_timer[which]->elapsed().as_ticks(rate);
 	}
 
 	// log anything else except the memory control register
