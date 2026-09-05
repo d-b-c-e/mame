@@ -2100,6 +2100,10 @@ static void worker()
 	auto last_tick = std::chrono::steady_clock::now();
 	int prev_want = 0;
 	long long rumble_until = 0;   // no new burst until the last ends
+	static const int RUMBLE_HIST = 24;   // ~400 ms of history at 60 Hz
+	int hist_v[RUMBLE_HIST] = { 0 };
+	long long hist_t[RUMBLE_HIST] = { 0 };
+	int hist_i = 0;
 	while (!s_stop.load())
 	{
 		{
@@ -2120,32 +2124,38 @@ static void worker()
 			hold_said = false;
 		if (want != prev_want)
 		{
-			// Rumble on ONSET only - a large jump in the requested force, not
-			// every update. Measured at the rig 2026-09-05: a Cruis'n USA
-			// collision holds near-full force for 1.2 to 4.7 SECONDS, and
-			// re-firing a 100 ms burst throughout turned the moment of contact
-			// into a continuous buzz - which is exactly how you stop being able
-			// to feel the hit. One thump as the force arrives, then silence
-			// while it pushes, is what reads as an impact.
+			// Rumble on a real HIT. Measured from a marked drive (rams at +5.6s
+			// and +13.7s): a collision RAMPS - byte -25 -40 -67 -80 -103 -113
+			// -126 over about six frames - and then HOLDS near full for 1.2 to
+			// 4.7 seconds. A single-frame jump test therefore fired once in 463
+			// updates, and firing on every update turned the hit into a buzz.
+			// So: the force must ARRIVE high and have RISEN there recently.
+			// Thresholds picked against that trace - 8 thumps in 28 s of racing,
+			// where 25%-rise-only gave 35 and ordinary steering triggered most.
 			if (rumble_ok)
 			{
+				double const full = 32767.0 * (s_strength > 0 ? s_strength : 100) / 100.0;
+				long long const nowms = now_ms();
 				if (want == 0)
 				{
 					p_SDL_HapticRumbleStop(d.hp);
-					rumble_until = 0;
 				}
 				else
 				{
-					double const jump = std::abs(double(want) - double(prev_want));
-					long long const nowms = now_ms();
-					// 25% of full scale is the onset test; a burst finishes before
-					// another may start, so a fast ramp is one thump, not a buzz.
-					if (jump >= 0.25 * 32767.0 && nowms >= rumble_until)
+					hist_v[hist_i] = std::abs(want);
+					hist_t[hist_i] = nowms;
+					hist_i = (hist_i + 1) % RUMBLE_HIST;
+					int floor_lvl = std::abs(want);
+					for (int k = 0; k < RUMBLE_HIST; k++)
+						if (hist_t[k] && nowms - hist_t[k] <= 250)
+							floor_lvl = std::min(floor_lvl, hist_v[k]);
+					double const arrived = std::abs(want) / full;
+					double const risen = (std::abs(want) - floor_lvl) / full;
+					if (arrived >= 0.80 && risen >= 0.40 && nowms >= rumble_until)
 					{
-						double const amp = std::min(1.0, jump / 32767.0)
-							* s_rumble / 100.0;
-						p_SDL_HapticRumblePlay(d.hp, float(amp), 120);
-						rumble_until = nowms + 120;
+						p_SDL_HapticRumblePlay(d.hp,
+							float(std::min(1.0, arrived) * s_rumble / 100.0), 120);
+						rumble_until = nowms + 250;
 					}
 				}
 			}
@@ -2990,7 +3000,12 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		if (v >= 0.0f && v < vmax && !parked)
 			telem_rpm = v;
 	}
-	if (s_telem_sock != INVALID_SOCKET && s_speed_word)
+	// Emit the speed whenever anything is listening OR the trace is open.
+	// It used to be gated on s_speed_word, which is 0 for every game (the
+	// RAM addresses were retired for the HUD OCR), so the speed the OCR
+	// read never reached the trace - and a support bundle could not answer
+	// "what did the reader actually see?" about a dropout report.
+	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace)
 		telem_notify("speed", s32(telem_mph + 0.5f), nullptr);
 	if (s_telem_sock != INVALID_SOCKET && s_rpm_word)
 		telem_notify("rpm", s32(telem_rpm + 0.5f), nullptr);
