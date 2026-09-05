@@ -2112,7 +2112,21 @@ static void worker()
 		float const shaped = shaper.shape(float(want) / 32767.f, 0.f, float(dt_ms / 1000.0), false);
 		int const out = int(std::lround(double(shaped) * 32767.0));
 		if (out != applied)
+		{
+			// Trace our SHAPED output beside the game's motor byte, so a run of
+			// this and a run of the stock FFB Arcade Plugin can be compared as
+			// algorithms rather than as impressions: same input signal, two
+			// outputs, one file each. (Diagnostic only; the FILE* is shared with
+			// telem_notify on the game thread and CRT stream locking covers it.)
+			if (s_ffb_trace)
+			{
+				auto const tms = std::chrono::duration_cast<std::chrono::milliseconds>(
+						std::chrono::steady_clock::now() - s_ffb_trace_t0).count();
+				fprintf(s_ffb_trace, "%lld,shaped,%d\n", (long long)tms, out);
+				fflush(s_ffb_trace);
+			}
 			apply(d, out, running, applied);
+		}
 	}
 	apply(d, 0, running, applied);
 	if (rumble_ok)
