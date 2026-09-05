@@ -298,8 +298,19 @@ static const HudBox s_hud_box[] = {
 	{ "crusnusa", 18, 72, 347, 370 },
 	// crusnwld: calibrated offline from the 2026-08-25 drive captures -
 	// same digit font as crusnusa (USA templates read the World digits
-	// as-is; validated trace 0->97 with clean accel/decel runs)
+	// as-is). Re-checked 2026-09-05 after USA turned out to be clipping
+	// its hundreds digit: this box is NOT clipped. It reads to 142 mph
+	// with 1198 three-digit reads in two minutes, and moving x0 left of
+	// 14 breaks every read. The old "0->97" note was that drive's top
+	// speed, not a ceiling.
 	{ "crusnwld", 14, 76, 342, 368 },
+	// offroadc: STILL PROVISIONAL AND STILL WRONG (checked 2026-09-05).
+	// A 120 s run reads a single lit cell nearly every frame and every
+	// value is rejected, so this game has never reported a speed. Moving
+	// x0 does not help - the box is not on the digits at all, and a hunt
+	// across a dumped frame found no 2-3 digit cluster near these coords.
+	// Needs the same calibration USA and World got: a screenshot of the
+	// speedo while driving, then coords read off it.
 	// offroadc: PROVISIONAL - the MPH box sits at the TOP of the screen
 	// (outside the old dump window), coords derived from the user's
 	// 4x driving screenshot geometry; the OCR rejects unreadable frames
