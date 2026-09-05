@@ -288,6 +288,12 @@ static void telem_notify(const char *outname, s32 value, void *)
 // calibrated yet (speed stays 0 for that game).
 struct HudBox { const char *game; int x0, x1, y0, y1; };
 static const HudBox s_hud_box[] = {
+	// crusnusa: measured 2026-09-05 from a videoram dump at speed - the
+	// digits occupy columns 45-66 inside this 30..72 window, with room
+	// for a third. Widening x0 to 14 to "make room" pulled in the road
+	// behind the HUD and made every read fail, so leave it alone. No
+	// capture has exceeded 99 mph because the car did not, not because
+	// the reader could not.
 	{ "crusnusa", 30, 72, 347, 370 },
 	// crusnwld: calibrated offline from the 2026-08-25 drive captures -
 	// same digit font as crusnusa (USA templates read the World digits
@@ -2093,6 +2099,7 @@ static void worker()
 
 	auto last_tick = std::chrono::steady_clock::now();
 	int prev_want = 0;
+	long long rumble_until = 0;   // no new burst until the last ends
 	while (!s_stop.load())
 	{
 		{
@@ -2113,14 +2120,34 @@ static void worker()
 			hold_said = false;
 		if (want != prev_want)
 		{
-			// a new force value from the game: the plugin-style vibration burst
+			// Rumble on ONSET only - a large jump in the requested force, not
+			// every update. Measured at the rig 2026-09-05: a Cruis'n USA
+			// collision holds near-full force for 1.2 to 4.7 SECONDS, and
+			// re-firing a 100 ms burst throughout turned the moment of contact
+			// into a continuous buzz - which is exactly how you stop being able
+			// to feel the hit. One thump as the force arrives, then silence
+			// while it pushes, is what reads as an impact.
 			if (rumble_ok)
 			{
 				if (want == 0)
+				{
 					p_SDL_HapticRumbleStop(d.hp);
+					rumble_until = 0;
+				}
 				else
-					p_SDL_HapticRumblePlay(d.hp,
-							float(std::min(1.0, std::abs(want) / 32767.0) * s_rumble / 100.0), 100);
+				{
+					double const jump = std::abs(double(want) - double(prev_want));
+					long long const nowms = now_ms();
+					// 25% of full scale is the onset test; a burst finishes before
+					// another may start, so a fast ramp is one thump, not a buzz.
+					if (jump >= 0.25 * 32767.0 && nowms >= rumble_until)
+					{
+						double const amp = std::min(1.0, jump / 32767.0)
+							* s_rumble / 100.0;
+						p_SDL_HapticRumblePlay(d.hp, float(amp), 120);
+						rumble_until = nowms + 120;
+					}
+				}
 			}
 			prev_want = want;
 		}
@@ -2926,8 +2953,11 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		// box absent (menus): decay to 0 rather than freeze
 		else if (mph < 0)
 		{
+			// 60 frames was one second: a brief unreadable patch mid-race
+			// zeroed the speed and the dash needle fell to the floor.
+			// Menus stay absent far longer than three seconds.
 			static int s_absent = 0;
-			if (++s_absent >= 60) { s_hud_last = 0.0f; s_absent = 0; }
+			if (++s_absent >= 180) { s_hud_last = 0.0f; s_absent = 0; }
 		}
 		telem_mph = s_hud_last;
 	}
