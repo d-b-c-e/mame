@@ -2007,14 +2007,28 @@ static void worker()
 		e.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
 		e.condition.direction.dir[0] = 1;
 		e.condition.length = SDL_HAPTIC_INFINITY;
-		Sint16 const coeff = Sint16(0x7fff * conds[i].pct / 100);
-		e.condition.right_sat[0] = e.condition.left_sat[0] = 0xffff;
+		// Scale by FFB STRENGTH, and cap the saturation at the same ceiling.
+		// These used to be absolute: a 72% spring sat at 72% of the wheel s
+		// full force with saturation wide open, while the game s own forces
+		// were scaled to FFB STRENGTH (50%). The spring was therefore
+		// STRONGER than the feedback it accompanies and reached maximum at a
+		// modest angle, burying everything - "the spring masks any other
+		// feedback whatsoever" (rig, 2026-09-05). Scaling keeps the balance
+		// fixed as STRENGTH moves, which is the only way one dial can mean
+		// anything.
+		int const eff = conds[i].pct * s_strength / 100;
+		if (eff <= 0)
+			continue;
+		Sint16 const coeff = Sint16(0x7fff * eff / 100);
+		Uint16 const sat = Uint16(0xffff * eff / 100);
+		e.condition.right_sat[0] = e.condition.left_sat[0] = sat;
 		e.condition.right_coeff[0] = e.condition.left_coeff[0] = coeff;
 		cond_ids[i] = p_SDL_HapticNewEffect(d.hp, &e);
 		if (cond_ids[i] < 0 || p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0)
 			flog("%s: could not start: %s", conds[i].name, p_SDL_GetError());
 		else
-			flog("%s: %d%% running", conds[i].name, conds[i].pct);
+			flog("%s: %d%% of full (%d%% x strength %d%%)", conds[i].name,
+				eff, conds[i].pct, s_strength);
 	}
 
 	bool running = false;
