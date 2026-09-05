@@ -1731,6 +1731,7 @@ static int s_strength = 100;
 static bool s_invert = false;
 static int s_hold_ms = 500;
 static int s_smooth_ms = 0;   // MIDV_FFB_SMOOTH: first-order low-pass time constant
+static bool s_smooth_set = false;  // ...and whether it was given at all
 static std::string s_profile_id = "cruisn-vunit@1";  // MIDV_FFB_PROFILE
 static int s_damper = 0;      // MIDV_FFB_DAMPER: velocity-proportional resistance, % of full
 static int s_friction = 0;    // MIDV_FFB_FRICTION: constant drag, % of full
@@ -2058,8 +2059,14 @@ static void worker()
 		}
 		else
 			flog("profile '%s' loaded from %s", s_profile_id.c_str(), dir.c_str());
-		// MIDV_FFB_SMOOTH stays the live knob the launcher exposes.
-		prof.shaper.smoothing_ms = float(s_smooth_ms);
+		// The PROFILE owns smoothing. This used to overwrite it unconditionally
+		// with MIDV_FFB_SMOOTH, whose default is 0 - so an unset env silently
+		// turned every tune into an unfiltered one, and a set env made the
+		// shipped tunes identical to each other. They differ ONLY in this
+		// value, so that made the whole family inert. Now the env is a
+		// developer override that applies only when actually present.
+		if (s_smooth_set)
+			prof.shaper.smoothing_ms = float(s_smooth_ms);
 		// Their FFB STRENGTH is a plain percent; shaper.strength is 50-is-unity.
 		prof.shaper.strength = std::clamp(s_strength / 2, 0, 100);
 		prof.shaper.invert = false;   // sign is applied in midv_ffb_write
@@ -2168,7 +2175,10 @@ static void start(running_machine &machine)
 	if (const char *s = std::getenv("MIDV_FFB_HOLD_MS"))
 		s_hold_ms = std::clamp(atoi(s), 0, 60000);
 	if (const char *s = std::getenv("MIDV_FFB_SMOOTH"))
+	{
 		s_smooth_ms = std::clamp(atoi(s), 0, 2000);
+		s_smooth_set = true;
+	}
 	if (const char *s = std::getenv("MIDV_FFB_PROFILE"))
 		if (*s)
 			s_profile_id = s;
