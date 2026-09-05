@@ -288,13 +288,14 @@ static void telem_notify(const char *outname, s32 value, void *)
 // calibrated yet (speed stays 0 for that game).
 struct HudBox { const char *game; int x0, x1, y0, y1; };
 static const HudBox s_hud_box[] = {
-	// crusnusa: measured 2026-09-05 from a videoram dump at speed - the
-	// digits occupy columns 45-66 inside this 30..72 window, with room
-	// for a third. Widening x0 to 14 to "make room" pulled in the road
-	// behind the HUD and made every read fail, so leave it alone. No
-	// capture has exceeded 99 mph because the car did not, not because
-	// the reader could not.
-	{ "crusnusa", 30, 72, 347, 370 },
+	// crusnusa: x0 was 30 and CLIPPED the hundreds digit. The reader s own
+	// diagnostics settled it - leftmost lit column sat exactly on 30 in
+	// 2758 samples (content cut off at the edge), only 112 reads ever
+	// segmented 3 cells, and the speed ceiling was 98 mph in every capture.
+	// Swept x0 with MIDV_HUD_X0: 30 -> max 88; 18 -> max 141 with 15x the
+	// three-digit reads and no extra failures; 12 pulls in the road drawn
+	// behind the HUD and breaks every read. 18 it is.
+	{ "crusnusa", 18, 72, 347, 370 },
 	// crusnwld: calibrated offline from the 2026-08-25 drive captures -
 	// same digit font as crusnusa (USA templates read the World digits
 	// as-is; validated trace 0->97 with clean accel/decel runs)
@@ -349,10 +350,38 @@ static int hud_ocr_digit(const float *cell, int ch, int cw)
 }
 
 // returns displayed MPH, or -1 when the box is absent/unreadable
+// Diagnostics for the reader itself: how many digit cells the last call
+// segmented, and how far left the leftmost lit column reached. A speed
+// that reads two digits when the game is showing three is the difference
+// between "the reader is fine" and "the window is too narrow", and no
+// amount of staring at the output can tell them apart.
+// Experiment knobs for the OCR window, so a sweep does not need a rebuild.
+// MIDV_HUD_X0 moves the left edge, MIDV_HUD_THR the "lit" threshold.
+static float hud_lit_threshold()
+{
+	static float v = -1.0f;
+	if (v < 0.0f)
+	{
+		const char *e = std::getenv("MIDV_HUD_THR");
+		v = e ? float(atof(e)) : 110.0f;
+	}
+	return v;
+}
+
+static int s_hud_cells = 0;
+static int s_hud_leftcol = -1;
+
 static int hud_ocr_mph(const uint16_t *videoram, uint16_t page_control,
 		const HudBox *box)
 {
 	uint32_t const base = (page_control & 1) ? 0x40000 : 0x00000;
+	HudBox tuned = *box;
+	if (const char *e = std::getenv("MIDV_HUD_X0"))
+	{
+		int const x0 = atoi(e);
+		if (x0 >= 0 && x0 < tuned.x1 - 8) tuned.x0 = x0;
+	}
+	box = &tuned;
 	int const W = box->x1 - box->x0, H = box->y1 - box->y0;
 	if (W <= 0 || W > 64 || H <= 0 || H > 32)
 		return -1;
@@ -364,8 +393,11 @@ static int hud_ocr_mph(const uint16_t *videoram, uint16_t page_control,
 		{
 			float v = float(videoram[base + (box->y0 + y) * 512 + box->x0 + x] & 0xff);
 			win[y][x] = v;
-			if (v > 110.0f) coloncol[x] = true;
+					if (v > hud_lit_threshold()) coloncol[x] = true;
 		}
+	s_hud_leftcol = -1;
+	for (int x = 0; x < W; x++)
+		if (coloncol[x]) { s_hud_leftcol = box->x0 + x; break; }
 	// segment cells: lit column runs, gaps >=2 split, min width 2
 	int cells[4][2];
 	int ncell = 0, s0 = -1, gap = 0;
@@ -382,6 +414,7 @@ static int hud_ocr_mph(const uint16_t *videoram, uint16_t page_control,
 	if (ncell < 1 || ncell > 3)
 		return -1;
 	int value = 0;
+	s_hud_cells = ncell;
 	for (int ci = 0; ci < ncell; ci++)
 	{
 		int a = cells[ci][0], b = cells[ci][1];
@@ -389,7 +422,7 @@ static int hud_ocr_mph(const uint16_t *videoram, uint16_t page_control,
 		int r0 = -1, r1 = -1;
 		for (int y = 0; y < H; y++)
 			for (int x = a; x < b; x++)
-				if (win[y][x] > 110.0f) { if (r0 < 0) r0 = y; r1 = y; }
+				if (win[y][x] > hud_lit_threshold()) { if (r0 < 0) r0 = y; r1 = y; }
 		if (r0 < 0 || r1 - r0 + 1 < 12)
 			return -1;
 		int const ch = r1 - r0 + 1, cw = b - a;
@@ -3007,6 +3040,11 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// "what did the reader actually see?" about a dropout report.
 	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace)
 		telem_notify("speed", s32(telem_mph + 0.5f), nullptr);
+	if (s_ffb_trace)
+	{
+		telem_notify("speed_cells", s_hud_cells, nullptr);
+		telem_notify("speed_leftcol", s_hud_leftcol, nullptr);
+	}
 	if (s_telem_sock != INVALID_SOCKET && s_rpm_word)
 		telem_notify("rpm", s32(telem_rpm + 0.5f), nullptr);
 
