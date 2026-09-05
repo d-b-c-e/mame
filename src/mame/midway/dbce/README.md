@@ -14,7 +14,7 @@ The rise detector consumes pre-gain magnitude on every worker tick, including
 zero. It identifies candidate impacts, not independently verified collisions.
 
 Synchronize both consumers from a committed toolkit ref with
-`python harness/sync_toolkit.py --ref v0.10.0 --write` in cruisn-collection.
+`python harness/sync_toolkit.py --ref v0.10.1 --write` in cruisn-collection.
 The command verifies the previous source before replacing either copy and
 records the resolved commit in VERSION and the collection's MANIFEST.json.
 
