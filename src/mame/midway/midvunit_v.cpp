@@ -37,6 +37,11 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
+// Shared conditioning chain, vendored from dbce-wheel-mod-toolkit.
+// Cruis'n uses the SHAPER ONLY - the arcade board hands over a finished
+// motor byte, so there is no force model to run. See dbce/README.md.
+#include "dbce/force_model.h"
+#include "dbce/force_profile.h"
 #include <mutex>
 #include <condition_variable>
 #include <cmath>
@@ -1726,6 +1731,7 @@ static int s_strength = 100;
 static bool s_invert = false;
 static int s_hold_ms = 500;
 static int s_smooth_ms = 0;   // MIDV_FFB_SMOOTH: first-order low-pass time constant
+static std::string s_profile_id = "cruisn-vunit@1";  // MIDV_FFB_PROFILE
 static int s_damper = 0;      // MIDV_FFB_DAMPER: velocity-proportional resistance, % of full
 static int s_friction = 0;    // MIDV_FFB_FRICTION: constant drag, % of full
 static int s_rumble = 0;      // MIDV_FFB_RUMBLE: vibration burst per force update, % scale
@@ -1733,6 +1739,17 @@ static int s_loglevel = 1;
 static FILE *s_log = nullptr;
 static std::mutex s_logmtx;
 static std::chrono::steady_clock::time_point s_t0;
+
+// Directory holding vunit.exe. force-profiles.ini is deployed beside it by the
+// launcher, and the working directory is not reliably that folder.
+static std::string exe_dir()
+{
+	char buf[MAX_PATH] = { 0 };
+	DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+	std::string p(buf, buf + (n ? n : 0));
+	size_t cut = p.find_last_of("\\/");
+	return cut == std::string::npos ? std::string(".") : p.substr(0, cut);
+}
 
 static long long now_ms()
 {
@@ -2002,10 +2019,48 @@ static void worker()
 		apply(d, 0, running, applied);
 		flog("TEST: released");
 	}
-	double filt = 0.0;
+	// ---- conditioning: the toolkit's shaper, driven by a named profile ----
+	// Everything this used to do by hand (impulse bypass, dt-aware low-pass,
+	// settle-to-zero, re-level threshold) now lives in dbce::force::Shaper and is
+	// described by cruisn-vunit@1. A conformance test in the toolkit holds that
+	// profile to this code's previous output over 62 s of real captured driving.
+	dbce::force::Profile prof;
+	{
+		std::string why, dir = exe_dir();
+		if (!dbce::force::load_profile_dir(dir, s_profile_id, prof, &why))
+		{
+			flog("profile '%s' not loaded from %s (%s) - using built-in values",
+					s_profile_id.c_str(), dir.c_str(), why.c_str());
+			// Built-in fallback, identical to cruisn-vunit@1. Force feedback must
+			// not depend on a data file being present.
+			prof.shaper = dbce::force::ShaperSettings();
+			prof.shaper.deadzone = 0.f;
+			prof.shaper.attack_smoothing = 0.f;
+			prof.shaper.decay_smoothing = 0.f;
+			prof.shaper.output_deadband = 0.f;
+			prof.shaper.fade_start_kmh = 0.f;
+			prof.shaper.fade_full_kmh = 0.f;
+			prof.shaper.ramp_seconds = 0.f;
+			prof.shaper.impulse_bypass = 0.6f;
+			prof.shaper.settle_below = 160.f / 32767.f;
+			prof.shaper.releveling = 33.f / 32767.f;
+		}
+		else
+			flog("profile '%s' loaded from %s", s_profile_id.c_str(), dir.c_str());
+		// MIDV_FFB_SMOOTH stays the live knob the launcher exposes.
+		prof.shaper.smoothing_ms = float(s_smooth_ms);
+		// Their FFB STRENGTH is a plain percent; shaper.strength is 50-is-unity.
+		prof.shaper.strength = std::clamp(s_strength / 2, 0, 100);
+		prof.shaper.invert = false;   // sign is applied in midv_ffb_write
+		flog("shaper: strength %d (from %d%%), smoothing %.0f ms, impulse %.2f, "
+				"settle %.5f, releveling %.5f",
+				prof.shaper.strength, s_strength, prof.shaper.smoothing_ms,
+				prof.shaper.impulse_bypass, prof.shaper.settle_below, prof.shaper.releveling);
+	}
+	dbce::force::Shaper shaper(prof.shaper);
+
 	auto last_tick = std::chrono::steady_clock::now();
 	int prev_want = 0;
-	double const full = 32767.0 * s_strength / 100.0;   // level of a full-scale byte
 	while (!s_stop.load())
 	{
 		{
@@ -2032,32 +2087,20 @@ static void worker()
 				if (want == 0)
 					p_SDL_HapticRumbleStop(d.hp);
 				else
-					p_SDL_HapticRumblePlay(d.hp, float(std::min(1.0, std::abs(want) / full) * s_rumble / 100.0), 100);
+					p_SDL_HapticRumblePlay(d.hp,
+							float(std::min(1.0, std::abs(want) / 32767.0) * s_rumble / 100.0), 100);
 			}
-			// an impulse (a jump of >= 60 % of full in one update - crashes, jumps,
-			// World off-track) goes through the smoothing unfiltered
-			if (s_smooth_ms > 0 && std::abs(want - prev_want) >= full * 0.6)
-				filt = double(want);
 			prev_want = want;
 		}
-		int out = want;
-		if (s_smooth_ms > 0)
-		{
-			// first-order low-pass toward the requested level (see MIDV_FFB_SMOOTH)
-			auto const now = std::chrono::steady_clock::now();
-			double const dt = std::chrono::duration<double, std::milli>(now - last_tick).count();
-			last_tick = now;
-			double const a = 1.0 - std::exp(-dt / double(s_smooth_ms));
-			filt += (double(want) - filt) * a;
-			out = int(std::lround(filt));
-			if (want == 0 && std::abs(out) < 160)   // settled: let the effect stop
-			{
-				filt = 0.0;
-				out = 0;
-			}
-		}
-		// re-level on any real change (>= 0.1 %) and always on stop/start
-		if (std::abs(out - applied) >= 33 || (out == 0) != (applied == 0))
+
+		// One tick of the shared chain. The impulse bypass, the low-pass, the
+		// settle and the re-level threshold are all inside it now.
+		auto const now = std::chrono::steady_clock::now();
+		double const dt_ms = std::chrono::duration<double, std::milli>(now - last_tick).count();
+		last_tick = now;
+		float const shaped = shaper.shape(float(want) / 32767.f, 0.f, float(dt_ms / 1000.0), false);
+		int const out = int(std::lround(double(shaped) * 32767.0));
+		if (out != applied)
 			apply(d, out, running, applied);
 	}
 	apply(d, 0, running, applied);
@@ -2101,6 +2144,9 @@ static void start(running_machine &machine)
 		s_hold_ms = std::clamp(atoi(s), 0, 60000);
 	if (const char *s = std::getenv("MIDV_FFB_SMOOTH"))
 		s_smooth_ms = std::clamp(atoi(s), 0, 2000);
+	if (const char *s = std::getenv("MIDV_FFB_PROFILE"))
+		if (*s)
+			s_profile_id = s;
 	if (const char *s = std::getenv("MIDV_FFB_DAMPER"))
 		s_damper = std::clamp(atoi(s), 0, 100);
 	if (const char *s = std::getenv("MIDV_FFB_FRICTION"))
@@ -2131,7 +2177,9 @@ void midv_ffb_write(int f)
 	if (f != 0 && f != -128)
 	{
 		double p = std::min(1.0, double(f < 0 ? -f : f) / 126.0);
-		level = int(p * 32767.0 * mvffb::s_strength / 100.0 + 0.5);
+		// Un-gained on purpose since the toolkit conversion: the shaper owns the
+		// gain now (shaper.strength), so applying it here as well would square it.
+		level = int(p * 32767.0 + 0.5);
 		// Sign. Measured 2026-09-03 with the game's own spring (Exotica parked
 		// left of centre writes +58, right of centre -70: a positive byte
 		// pushes the wheel RIGHT) and with a raw level on the Moza R12 (a
