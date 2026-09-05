@@ -10,6 +10,7 @@
 #include <chrono>
 #include "midvunit.h"
 #include "midvunit_hud_ocr.h"
+#include "cruisn/hud_speed_filter.h"
 
 #include "williamssound.h"
 
@@ -320,8 +321,7 @@ static const HudBox s_hud_box[] = {
 	{ nullptr, 0, 0, 0, 0 },
 };
 static const HudBox *s_hud = nullptr;   // resolved at telem_init
-static float s_hud_last = 0.0f;
-static float s_hud_pending = -1.0f;
+static cruisn::HudSpeedFilter s_hud_speed;
 
 static int hud_ocr_digit(const float *cell, int ch, int cw)
 {
@@ -514,6 +514,7 @@ static void telem_init(const char *spec, const char *game)
 	for (const SpeedAddr *p = s_speed_addr; p->game; ++p)
 		if (game_match(p->game)) { s_speed_word = p->addr; break; }
 	s_hud = nullptr;
+	s_hud_speed.reset();
 	for (const HudBox *p = s_hud_box; p->game; ++p)
 		if (game_match(p->game)) { s_hud = p; break; }
 	s_rpm_word = 0;
@@ -526,6 +527,11 @@ static void telem_init(const char *spec, const char *game)
 			break;
 		}
 
+	strncpy(s_telem_game, game, sizeof(s_telem_game) - 1);
+	// Source selection also serves file-only diagnostics. Opening a trace must
+	// not require a UDP destination, nor silently leave OCR/RPM uninitialized.
+	if (!spec && !std::getenv("MIDV_TELEM_FORZA"))
+		return;
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
 		return;
@@ -944,6 +950,14 @@ void thread_main()
 		s_log = fopen("midv_gl.log", "w");
 	int const S = std::getenv("MIDV_GL_SCALE") ? atoi(std::getenv("MIDV_GL_SCALE")) : 3;
 	const char *snapdir = std::getenv("MIDV_GL_SNAP");
+	int const snap_every = std::getenv("MIDV_GL_SNAP_EVERY")
+		? std::max(1, atoi(std::getenv("MIDV_GL_SNAP_EVERY"))) : 150;
+	int const snap_first = std::getenv("MIDV_GL_SNAP_FIRST")
+		? std::max(0, atoi(std::getenv("MIDV_GL_SNAP_FIRST"))) : 0;
+	int const snap_last = std::getenv("MIDV_GL_SNAP_LAST")
+		? atoi(std::getenv("MIDV_GL_SNAP_LAST")) : -1;
+	int const snap_max = std::getenv("MIDV_GL_SNAP_MAX")
+		? std::max(0, atoi(std::getenv("MIDV_GL_SNAP_MAX"))) : 0;
 	int H = std::getenv("MIDV_GL_HEIGHT") ? atoi(std::getenv("MIDV_GL_HEIGHT")) : HEIGHT;
 	if (H < HEIGHT || H > MAXH)
 		H = HEIGHT;
@@ -1193,6 +1207,7 @@ void thread_main()
 	std::vector<uint32_t> udata;
 	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
 	int snap_n = 0;
+	uint32_t last_received_frame = 0;
 
 	auto ring_read = [&](uint64_t pos, void *dst, uint32_t len)
 	{
@@ -1319,6 +1334,8 @@ void thread_main()
 			uint32_t const type = hdr[0], len = hdr[1];
 			if (len > staging.size()) staging.resize(len);
 			ring_read(r + 8, staging.data(), len);
+			if (type >= 1 && type <= 5 && len >= 4)
+				memcpy(&last_received_frame, staging.data(), 4);
 			r += (8 + len + 7) & ~7u;
 			*lv.rpos = r;
 			switch (type)
@@ -1533,7 +1550,10 @@ void thread_main()
 				(unsigned long long)n_flips,
 				(unsigned long long)(*lv.wpos - *lv.rpos), visible,
 				int(quad_fresh[visible]), quad_count[visible], gl.GetError(), double(lv.speed_pct));
-		if (snapdir && (presents % 150) == 0)
+		if (snapdir && (presents % snap_every) == 0 &&
+			int(last_received_frame) >= snap_first &&
+			(snap_last < 0 || int(last_received_frame) <= snap_last) &&
+			(snap_max == 0 || snap_n < snap_max))
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
 			// tight rows: the default GL_PACK_ALIGNMENT of 4 pads each row
@@ -1568,6 +1588,19 @@ void thread_main()
 					fwrite(row.data(), 1, rowsz, f);
 				}
 				fclose(f);
+				// This is the most recently CONSUMED stream frame, not a promise
+				// that the async backbuffer equals a native frame at that instant.
+				// Preserve that distinction and the queue/drop state for analysis.
+				char index_path[512];
+				snprintf(index_path, sizeof(index_path), "%s\\captures.csv", snapdir);
+				if (FILE *index = fopen(index_path, snap_n == 1 ? "w" : "a"))
+				{
+					if (snap_n == 1) fprintf(index, "file,present,last_received_frame,width,height,visible_page,queued_bytes,dropped_messages\n");
+					fprintf(index, "mvgl_%03d.bmp,%llu,%u,%d,%d,%d,%llu,%llu\n", snap_n - 1,
+						(unsigned long long)presents, last_received_frame, cw, ch, visible,
+						(unsigned long long)(*lv.wpos - *lv.rpos), (unsigned long long)*lv.dropped);
+					fclose(index);
+				}
 			}
 		}
 		SwapBuffers(dc);
@@ -2142,17 +2175,12 @@ static void worker()
 	dbce::force::Shaper shaper(prof.shaper);
 
 	auto last_tick = std::chrono::steady_clock::now();
-	int prev_want = 0;
-	long long rumble_until = 0;   // no new burst until the last ends
-	static const int RUMBLE_HIST = 24;   // ~400 ms of history at 60 Hz
-	int hist_v[RUMBLE_HIST] = { 0 };
-	long long hist_t[RUMBLE_HIST] = { 0 };
-	int hist_i = 0;
+	dbce::force::RiseDetector impact_detector;
 	while (!s_stop.load())
 	{
 		{
 			std::unique_lock<std::mutex> lk(s_mtx);
-			s_cv.wait_for(lk, std::chrono::milliseconds(s_smooth_ms > 0 ? 4 : 20), [] { return s_stop.load() || s_dirty; });
+			s_cv.wait_for(lk, std::chrono::milliseconds(prof.shaper.smoothing_ms > 0 ? 4 : 20), [] { return s_stop.load() || s_dirty; });
 			s_dirty = false;
 		}
 		if (s_stop.load())
@@ -2162,48 +2190,40 @@ static void worker()
 		{
 			want = 0;
 			s_level.store(0);
+			impact_detector.reset();
+			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
 			if (!hold_said) { flog("no motor write for %d ms - force released", s_hold_ms); hold_said = true; }
 		}
 		else if (want != 0)
 			hold_said = false;
-		if (want != prev_want)
+		// The detector consumes source units, before strength. Feed every tick,
+		// including idle: changed-nonzero-only history missed an isolated hit and
+		// dividing this ungained level by a gained maximum changed classification
+		// whenever the player moved the strength slider.
+		bool const impact_candidate = impact_detector.observe(float(want) / 32767.f,
+			double(now_ms()) / 1000.0);
+		if (impact_candidate)
 		{
-			// Rumble on a real HIT. Measured from a marked drive (rams at +5.6s
-			// and +13.7s): a collision RAMPS - byte -25 -40 -67 -80 -103 -113
-			// -126 over about six frames - and then HOLDS near full for 1.2 to
-			// 4.7 seconds. A single-frame jump test therefore fired once in 463
-			// updates, and firing on every update turned the hit into a buzz.
-			// So: the force must ARRIVE high and have RISEN there recently.
-			// Thresholds picked against that trace - 8 thumps in 28 s of racing,
-			// where 25%-rise-only gave 35 and ordinary steering triggered most.
+			// This is a waveform candidate, not a decoded game collision flag.
+			// SDL's generic rumble backend still needs wheel-specific evaluation.
+			// Normal zero writes do not cut a 120 ms cue short; watchdog/exit do.
+			int result = -1;
 			if (rumble_ok)
 			{
-				double const full = 32767.0 * (s_strength > 0 ? s_strength : 100) / 100.0;
-				long long const nowms = now_ms();
-				if (want == 0)
-				{
-					p_SDL_HapticRumbleStop(d.hp);
-				}
-				else
-				{
-					hist_v[hist_i] = std::abs(want);
-					hist_t[hist_i] = nowms;
-					hist_i = (hist_i + 1) % RUMBLE_HIST;
-					int floor_lvl = std::abs(want);
-					for (int k = 0; k < RUMBLE_HIST; k++)
-						if (hist_t[k] && nowms - hist_t[k] <= 250)
-							floor_lvl = std::min(floor_lvl, hist_v[k]);
-					double const arrived = std::abs(want) / full;
-					double const risen = (std::abs(want) - floor_lvl) / full;
-					if (arrived >= 0.80 && risen >= 0.40 && nowms >= rumble_until)
-					{
-						p_SDL_HapticRumblePlay(d.hp,
-							float(std::min(1.0, arrived) * s_rumble / 100.0), 120);
-						rumble_until = nowms + 250;
-					}
-				}
+				float const amplitude = impact_detector.last_arrival * float(s_rumble) / 100.f
+					* float(s_strength) / 100.f;
+				result = p_SDL_HapticRumblePlay(d.hp, amplitude, 120);
+				if (result < 0) { flog("rumble play failed: %s", p_SDL_GetError()); rumble_ok = false; }
 			}
-			prev_want = want;
+			flog("impact candidate: arrived %.3f rise %.3f rumble_result %d",
+				impact_detector.last_arrival, impact_detector.last_rise, result);
+			if (s_ffb_trace)
+			{
+				auto const tms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - s_ffb_trace_t0).count();
+				fprintf(s_ffb_trace, "%lld,impact_candidate,1\n%lld,rumble_result,%d\n",
+					(long long)tms, (long long)tms, result);
+			}
 		}
 
 		// One tick of the shared chain. The impulse bypass, the low-pass, the
@@ -2338,7 +2358,7 @@ void midv_telemetry_start(running_machine &machine)
 	s_started = true;
 	mvffb::start(machine);   // POC built-in force feedback (MIDV_FFB=1)
 	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
-	if (telem_spec || std::getenv("MIDV_TELEM_FORZA"))
+	if (telem_spec || std::getenv("MIDV_TELEM_FORZA") || std::getenv("MIDV_FFB_TRACE"))
 		telem_init(telem_spec, machine.system().name);
 	if (const char *tr = std::getenv("MIDV_FFB_TRACE"))
 	{
@@ -2984,36 +3004,8 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	}
 	else if (s_hud)
 	{
-		// HUD OCR path: read the displayed MPH straight off the frame.
-		// A lone-frame misread (rare 4/9 confusion) must persist a second
-		// frame before a jump >25 mph is accepted.
 		int const mph = hud_ocr_mph(&m_videoram[0], m_page_control, s_hud);
-		if (mph >= 0 && mph < 400)
-		{
-			float const f = float(mph);
-			if (std::fabs(f - s_hud_last) <= 25.0f)
-			{
-				s_hud_last = f;
-				s_hud_pending = -1.0f;
-			}
-			else if (s_hud_pending >= 0.0f && std::fabs(f - s_hud_pending) <= 25.0f)
-			{
-				s_hud_last = f;
-				s_hud_pending = -1.0f;
-			}
-			else
-				s_hud_pending = f;
-		}
-		// box absent (menus): decay to 0 rather than freeze
-		else if (mph < 0)
-		{
-			// 60 frames was one second: a brief unreadable patch mid-race
-			// zeroed the speed and the dash needle fell to the floor.
-			// Menus stay absent far longer than three seconds.
-			static int s_absent = 0;
-			if (++s_absent >= 180) { s_hud_last = 0.0f; s_absent = 0; }
-		}
-		telem_mph = s_hud_last;
+		telem_mph = float(s_hud_speed.observe(mph));
 	}
 	if (s_rpm_word)
 	{
@@ -3055,6 +3047,9 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	{
 		telem_notify("speed_cells", s_hud_cells, nullptr);
 		telem_notify("speed_leftcol", s_hud_leftcol, nullptr);
+		telem_notify("speed_ocr_reading", s_hud ? s_hud_speed.raw : -1, nullptr);
+		telem_notify("speed_status", s_hud ? s_hud_speed.status() : 0, nullptr);
+		telem_notify("speed_age_frames", s_hud ? s_hud_speed.age_frames : 0, nullptr);
 	}
 	if (s_telem_sock != INVALID_SOCKET && s_rpm_word)
 		telem_notify("rpm", s32(telem_rpm + 0.5f), nullptr);

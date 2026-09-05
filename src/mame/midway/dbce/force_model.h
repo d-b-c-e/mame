@@ -33,8 +33,52 @@
 #pragma once
 #include <cmath>
 #include <cstring>
+#include <deque>
 
 namespace dbce { namespace force {
+
+// A source-signal rise candidate, not proof of a collision. Feed every sample,
+// including unchanged values and zero, in PRE-GAIN units. A steady plateau must
+// not retrigger, and changing wheel strength must not change recognition.
+class RiseDetector {
+public:
+    float arrival = 0.80f, rise = 0.40f;
+    double window_seconds = 0.25, cooldown_seconds = 0.25;
+    float last_arrival = 0.f, last_rise = 0.f;
+
+    void reset() {
+        minima_.clear(); last_time_ = -1.0; last_event_ = -1e30;
+        last_arrival = last_rise = 0.f;
+    }
+
+    bool observe(float normalised, double seconds) {
+        if (!std::isfinite(normalised) || !std::isfinite(seconds) || seconds < 0.0) {
+            reset(); return false;
+        }
+        if (seconds < last_time_) reset();
+        if (seconds == last_time_) return false;
+        last_time_ = seconds;
+        float level = std::fabs(normalised);
+        if (level > 1.f) level = 1.f;
+        while (!minima_.empty() && minima_.front().time < seconds - window_seconds)
+            minima_.pop_front();
+        while (!minima_.empty() && minima_.back().value >= level)
+            minima_.pop_back();
+        minima_.push_back(Sample{seconds, level});
+        last_arrival = level;
+        last_rise = level - minima_.front().value;
+        if (level >= arrival && last_rise >= rise && seconds - last_event_ >= cooldown_seconds) {
+            last_event_ = seconds;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    struct Sample { double time; float value; };
+    std::deque<Sample> minima_;
+    double last_time_ = -1.0, last_event_ = -1e30;
+};
 
 // ---------------------------------------------------------------- inputs
 struct Inputs {
@@ -207,7 +251,7 @@ public:
             impact_t_ = 0.f;
             impact_mag_ = i.impact > 1.f ? 1.f : i.impact;
             impact_sign_ = i.impact_direction != 0.f ? signf(i.impact_direction)
-                                                     : (i.has_steer ? -signf(i.steer) : 1.f);
+                             : (i.has_steer && i.steer != 0.f ? -signf(i.steer) : 1.f);
         }
         if (impact_t_ >= 0.f) {
             float span = s.impact_seconds > 0.001f ? s.impact_seconds : 0.001f;

@@ -8,8 +8,15 @@ Do not edit them here. Fix a shaping bug in the toolkit, cut a release, then
 re-vendor. The toolkit's conformance test pins these headers against a C#
 implementation of the same maths, and editing this copy silently breaks that.
 
-Cruis'n uses the **shaper only**. There is no force model to run: the arcade
+Cruis'n uses the **shaper and source-force rise detector**. The arcade
 board hands over a finished signed motor byte, so `Model` is never constructed.
+The rise detector consumes pre-gain magnitude on every worker tick, including
+zero. It identifies candidate impacts, not independently verified collisions.
+
+Synchronize both consumers from a committed toolkit ref with
+`python harness/sync_toolkit.py --ref v0.10.0 --write` in cruisn-collection.
+The command verifies the previous source before replacing either copy and
+records the resolved commit in VERSION and the collection's MANIFEST.json.
 
 ## Licensing note
 
