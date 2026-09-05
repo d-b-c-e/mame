@@ -1734,6 +1734,7 @@ static int s_smooth_ms = 0;   // MIDV_FFB_SMOOTH: first-order low-pass time cons
 static std::string s_profile_id = "cruisn-vunit@1";  // MIDV_FFB_PROFILE
 static int s_damper = 0;      // MIDV_FFB_DAMPER: velocity-proportional resistance, % of full
 static int s_friction = 0;    // MIDV_FFB_FRICTION: constant drag, % of full
+static int s_spring = 0;      // MIDV_FFB_SPRING: centring toward straight-ahead, % of full
 static int s_rumble = 0;      // MIDV_FFB_RUMBLE: vibration burst per force update, % scale
 static int s_loglevel = 1;
 static FILE *s_log = nullptr;
@@ -1964,6 +1965,7 @@ static void worker()
 	}
 	flog("ready: strength %d%%, invert %d, hold %d ms, smooth %d ms, damper %d%%, friction %d%%, rumble %d%%",
 			s_strength, int(s_invert), s_hold_ms, s_smooth_ms, s_damper, s_friction, s_rumble);
+	flog("spring: %d%% (the plugin runs one for these games; 0 = off)", s_spring);
 	bool rumble_ok = false;
 	if (s_rumble > 0)
 	{
@@ -1976,11 +1978,20 @@ static void worker()
 			flog("rumble: not available on this device (%s)", p_SDL_GetError());
 	}
 	// static condition effects (the arcade wheel mechanism the base lacks)
-	int cond_ids[2] = { -1, -1 };
-	struct { int pct; unsigned cap; Uint16 type; const char *name; } const conds[2] = {
+	// The spring is the one the FFB Arcade Plugin runs for these games
+	// (EnableForceSpringEffectCrusnUSA=1 in its stock FFBPlugin.ini) and this
+	// code did not have. It is a POSITION-based centring torque, so its
+	// authority is greatest exactly where the game's own motor force is
+	// smallest - around straight-ahead. Without it the centre goes light, which
+	// is what "the self-centring near the centre feels looser than normal"
+	// describes. Off by default; the arcade cabinet's own mechanism is what it
+	// stands in for, so how much you want is a matter of taste and of base.
+	int cond_ids[3] = { -1, -1, -1 };
+	struct { int pct; unsigned cap; Uint16 type; const char *name; } const conds[3] = {
 		{ s_damper, SDL_HAPTIC_DAMPER, SDL_HAPTIC_DAMPER, "damper" },
-		{ s_friction, SDL_HAPTIC_FRICTION, SDL_HAPTIC_FRICTION, "friction" } };
-	for (int i = 0; i < 2; i++)
+		{ s_friction, SDL_HAPTIC_FRICTION, SDL_HAPTIC_FRICTION, "friction" },
+		{ s_spring, SDL_HAPTIC_SPRING, SDL_HAPTIC_SPRING, "spring" } };
+	for (int i = 0; i < 3; i++)
 	{
 		if (conds[i].pct <= 0)
 			continue;
@@ -2149,6 +2160,8 @@ static void start(running_machine &machine)
 			s_profile_id = s;
 	if (const char *s = std::getenv("MIDV_FFB_DAMPER"))
 		s_damper = std::clamp(atoi(s), 0, 100);
+	if (const char *s = std::getenv("MIDV_FFB_SPRING"))
+		s_spring = std::clamp(atoi(s), 0, 100);
 	if (const char *s = std::getenv("MIDV_FFB_FRICTION"))
 		s_friction = std::clamp(atoi(s), 0, 100);
 	if (const char *s = std::getenv("MIDV_FFB_RUMBLE"))
