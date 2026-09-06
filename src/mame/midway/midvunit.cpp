@@ -25,7 +25,10 @@
 #include "emu.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include "midvunit.h"
+#include "cruisn/checked_patch.h"
 
 #include "cpu/adsp2100/adsp2100.h"
 #include "cpu/tms320c3x/tms320c3x.h"
@@ -116,8 +119,7 @@ void midvplus_state::machine_start()
 // 0..0x1ffff; OLD is verified before writing, or "*" to skip the check).
 // Lines starting with # are comments. Used for the ground-culling widen
 // experiment - see cruisn-collection results/RESULTS.md.
-struct midv_patch_entry { uint32_t addr, oldval, newval; bool guarded; };
-static std::vector<midv_patch_entry> s_midv_patches;
+static std::vector<cruisn::patch_word> s_midv_patches;
 
 static void midv_apply_patches(uint32_t *ram)
 {
@@ -130,32 +132,46 @@ static void midv_apply_patches(uint32_t *ram)
 		return;
 	char line[256];
 	int applied = 0, skipped = 0;
+	bool invalid = false;
+	auto hex_word = [](const char *text, uint32_t &value)
+	{
+		char *end = nullptr;
+		errno = 0;
+		unsigned long long const parsed = strtoull(text, &end, 16);
+		if (errno || end == text || *end || parsed > 0xffffffffULL) return false;
+		value = uint32_t(parsed);
+		return true;
+	};
 	while (fgets(line, sizeof(line), f))
 	{
-		if (line[0] == '#' || line[0] == '\n')
-			continue;
-		char oldtok[64] = {};
-		unsigned addr = 0, newval = 0;
-		if (sscanf(line, "%x %63s %x", &addr, oldtok, &newval) != 3)
-			continue;
-		if (addr >= 0x20000)
-			continue;
-		bool const guarded = (strcmp(oldtok, "*") != 0);
-		unsigned oldval = 0;
-		if (guarded)
+		if (char *comment = strchr(line, '#')) *comment = 0;
+		char *first = line;
+		while (isspace(static_cast<unsigned char>(*first))) ++first;
+		if (!*first) continue;
+		char addrtext[64] = {}, oldtext[64] = {}, newtext[64] = {}, extra[2] = {};
+		uint32_t addr = 0, oldval = 0, newval = 0;
+		if (sscanf(first, "%63s %63s %63s %1s", addrtext, oldtext, newtext, extra) != 3
+			|| !hex_word(addrtext, addr) || !hex_word(newtext, newval)
+			|| (strcmp(oldtext, "*") && !hex_word(oldtext, oldval)))
 		{
-			oldval = strtoul(oldtok, nullptr, 16);
-			if (ram[addr] != oldval)
-			{
-				skipped++;
-				continue;   // guard: game version / address mismatch
-			}
+			invalid = true;
+			continue;
 		}
-		ram[addr] = newval;
-		applied++;
-		s_midv_patches.push_back({ addr, oldval, newval, guarded });
+		s_midv_patches.push_back({addr, oldval, newval, strcmp(oldtext, "*") != 0});
 	}
+	if (ferror(f)) invalid = true;
 	fclose(f);
+	size_t bad_entry = 0;
+	if (!invalid && !s_midv_patches.empty()
+		&& cruisn::apply_checked_patch(ram, 0x20000, s_midv_patches, bad_entry))
+		applied = int(s_midv_patches.size());
+	else
+	{
+		skipped = int(s_midv_patches.size());
+		fprintf(stderr, "MIDV_PATCH rejected entire file %s (invalid syntax, duplicate, or guard at entry %zu); no writes\n",
+			path, bad_entry);
+		s_midv_patches.clear();
+	}
 	if (std::getenv("MIDV_GL_LOG"))
 	{
 		FILE *lg = fopen("midv_gl.log", "a");
