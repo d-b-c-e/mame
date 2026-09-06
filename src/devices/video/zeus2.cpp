@@ -399,6 +399,7 @@ static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
 static std::atomic<int> s_zpause{0};
 static std::atomic<double> s_secs{0.0};   // machine time, published by screen_update for the GL thread
 static std::thread s_thread;
+struct FrameTick { uint32_t base, frame; double seconds; };
 
 static std::atomic<uint32_t> s_drops_quad{0}, s_drops_state{0};   // ring overflow accounting (midz_gl.log)
 static std::atomic<bool> s_wave_resync{false};   // a waveram span was lost: re-emit the FULL waveram at the next flush
@@ -885,6 +886,16 @@ void thread_main()
 	};
 
 	std::vector<uint8_t> rec;
+    uint32_t completed_frame = 0;
+    double completed_seconds = 0;
+    // Explicit diagnostic fault injection. Physical outputs stay off in replay.
+    int const stop_frame = envi("MIDZ_GL_STOP_FRAME",nullptr,-1);
+    FILE *snap_index = nullptr;
+    if (snapdir) {
+        char path[512]; snprintf(path,sizeof(path),"%s/captures.csv",snapdir);
+        snap_index=fopen(path,"w");
+        if (snap_index) fprintf(snap_index,"file,present,last_received_frame,width,height,quads,dropped_messages,completed_frame\n");
+    }
 	zlogf("MZGL up: scale %d fb %dx%d crt=%d", S, fw, fh, int(crt));
 
 	while (IsWindow(parent) && !s_stopz.load())
@@ -944,6 +955,7 @@ void thread_main()
 					SWP_NOACTIVATE | SWP_NOZORDER);
 		}
 
+		bool frame_ready = false;
 		// ---- drain the ring ----
 		uint64_t w = s_rw.load(std::memory_order_acquire);
 		uint64_t r = s_rr.load(std::memory_order_relaxed);
@@ -1051,13 +1063,23 @@ void thread_main()
 				break;
 			}
 			case 6:
-				zb38 = ((const uint32_t *)rec.data())[0];
+                if (rec.size() == sizeof(FrameTick)) {
+                    FrameTick tick; memcpy(&tick,rec.data(),sizeof(tick));
+                    zb38=tick.base; completed_frame=tick.frame;
+                    completed_seconds=tick.seconds; frame_ready=true;
+                }
 				break;
 			}
+            if (frame_ready) break; // never consume the next frame before presenting this one
 		}
 		s_rr.store(r, std::memory_order_release);
 		flush();
 
+		if (!frame_ready && !menu_open) { Sleep(1); continue; }
+        if (frame_ready && stop_frame >= 0 && completed_frame >= uint32_t(stop_frame)) {
+            zlogf("diagnostic consumer stop at completed frame %u",completed_frame);
+            break;
+        }
 		// ---- present ----
 		// 3D scenes present 16:9 (full wide canvas); 2D screens (menus,
 		// high scores - drawn via frame writes) present 4:3, cropped to the
@@ -1066,14 +1088,14 @@ void thread_main()
 		// iterations - a mid-frame iteration catching only HUD frame
 		// writes otherwise flickered the aspect (seen as width "wobble").
 		static int s_no_quad_writes = 0;
-		if (had_quads_iter)
+		if (frame_ready && had_quads_iter)
 		{
 			wide_mode = (MARGIN > 0);
 			s_no_quad_writes = 0;
 		}
-		else if (had_writes_iter && ++s_no_quad_writes >= 30)
+		else if (frame_ready && had_writes_iter && ++s_no_quad_writes >= 30)
 			wide_mode = false;
-		had_quads_iter = had_writes_iter = false;
+		if (frame_ready) had_quads_iter = had_writes_iter = false;
 
 		int const cw = rc.right - rc.left, ch = rc.bottom - rc.top;
 		gl.BindFramebuffer(FRAMEBUFFER, 0);
@@ -1167,9 +1189,13 @@ void thread_main()
 			s_snap_from_sec = e ? atof(e) : 0.0;
 		}
 		static long s_snap_base = -1;
-		if (s_snap_base < 0 && s_secs.load() >= s_snap_from_sec)
+		if (s_snap_base < 0 && completed_seconds >= s_snap_from_sec)
 			s_snap_base = presents;
-		if (snapdir && s_snap_base >= 0 && presents >= s_snap_from && ((presents - s_snap_base) % s_snap_every) == 0 && snap_n < s_snap_max)
+		int const first_frame = envi("MIDZ_GL_SNAP_FIRST",nullptr,0);
+        int const last_frame = envi("MIDZ_GL_SNAP_LAST",nullptr,2147483647);
+        if (snapdir && snap_index && frame_ready && s_snap_base >= 0 && presents >= s_snap_from &&
+            completed_frame >= uint32_t(first_frame) && completed_frame <= uint32_t(last_frame) &&
+            (completed_frame % s_snap_every) == 0 && snap_n < s_snap_max)
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0, 0x1401, px.data());
@@ -1196,7 +1222,11 @@ void thread_main()
 					memcpy(rowbuf.data(), &px[size_t(y) * cw * 3], cw * 3);
 					fwrite(rowbuf.data(), 1, rowsz, f);
 				}
-				fclose(f);
+                fclose(f);
+                fprintf(snap_index,"mzgl_%03d.bmp,%llu,%u,%d,%d,%llu,%u,%u\n", snap_n-1,
+                    (unsigned long long)presents,completed_frame,cw,ch,(unsigned long long)n_quads,
+                    s_drops_quad.load()+s_drops_state.load(),completed_frame);
+                fflush(snap_index);
 			}
 		}
 		SwapBuffers(dc);
@@ -1213,6 +1243,7 @@ void thread_main()
 			fclose(f);
 		}
 	}
+	if (snap_index) fclose(snap_index);
 	s_zpause.store(0);
 	zlogf("ring drops: quads %u, state(spans/pal/tick) %u", s_drops_quad.load(), s_drops_state.load());
 	zlogf("exit after %llu presents, %llu quads",
@@ -1249,9 +1280,13 @@ void stop()
 }   // namespace mzgl
 #endif   // _WIN32
 
-void zeus2_device::midz_screen_hook()
+void zeus2_device::midz_screen_hook(bool completed)
 {
 #ifdef _WIN32
+    if (midz_live && (mzgl::s_donez.load() || mzgl::s_stopz.load())) {
+        midz_live = false;
+        osd_printf_error("MIDZ render stream failed: GL stopped; restoring CPU polygon rasterization\n");
+    }
 	if (midz_live)
 	{
 		// Esc-menu pause: block the emu thread here while the menu is open,
@@ -1286,7 +1321,10 @@ void zeus2_device::midz_screen_hook()
 			s_wave_lo = ~0u;
 			s_wave_hi = 0;
 		}
-		mzgl::ring_push2(6, &m_zeusbase[0x38], 4, nullptr, 0);
+		if (completed) {
+            mzgl::FrameTick tick{m_zeusbase[0x38], uint32_t(screen().frame_number()), machine().time().as_double()};
+            mzgl::ring_push2(6, &tick, sizeof(tick), nullptr, 0);
+        }
 	}
 #endif
 	if (s_cap_state == -2)
@@ -1501,7 +1539,7 @@ uint32_t zeus2_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap
 	if (!(m_zeusbase[0x10] & 0x20))
 		return 0;
 
-	midz_screen_hook();
+	midz_screen_hook(cliprect.max_y >= screen.visible_area().max_y);
 
 	// POC scoping stats (MIDZ_STATS=1): quads/frame profile to stderr
 	if (s_mz_stats > 0)
@@ -3108,7 +3146,9 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	// capture path (midz_cap without live) still rasterizes: the oracle
 	// diffs against the CPU framebuffer.
 	zeus2_poly_extra_data local_extra;
-	zeus2_poly_extra_data& extra = m_state->midz_live
+	static bool const native_diagnostic = std::getenv("MIDZ_GL_NATIVE") && atoi(std::getenv("MIDZ_GL_NATIVE")) == 1;
+	bool const gl_only = m_state->midz_live && !native_diagnostic;
+	zeus2_poly_extra_data& extra = gl_only
 		? local_extra : this->object_data().next();
 
 	extra.ucode_src = m_state->m_curUCodeSrc;
@@ -3162,7 +3202,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	}
 
 	m_state->midz_cap_quad(numverts, clipvert, extra, texdata);
-	if (m_state->midz_live)
+	if (gl_only)
 		return;   // see local_extra above - GL overlay renders this quad
 	render_triangle_fan<4>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
 }

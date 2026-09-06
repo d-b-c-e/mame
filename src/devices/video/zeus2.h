@@ -135,7 +135,7 @@ public:
 	// (zero cost) unless a capture is armed. Definitions in zeus2.cpp.
 	bool midz_cap = false;
 	bool midz_live = false;   // MIDZ_GL=1: in-process GL renderer active
-	void midz_screen_hook();
+	void midz_screen_hook(bool completed);
 	void midz_cap_quad(int numverts, const void *verts,
 			const zeus2_poly_extra_data &extra, uint32_t texdata);
 	void midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t color, int32_t depth);
