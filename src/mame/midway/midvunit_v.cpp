@@ -1231,6 +1231,14 @@ void thread_main()
 	int const stall_frame = std::getenv("MIDV_GL_STALL_FRAME") ? atoi(std::getenv("MIDV_GL_STALL_FRAME")) : -1;
 	int const stall_ms = std::getenv("MIDV_GL_STALL_MS") ? std::clamp(atoi(std::getenv("MIDV_GL_STALL_MS")), 0, 5000) : 0;
 	bool stalled = false;
+	// Explicit, output-free menu regression: exercise the same key edges as the
+	// player without injecting global Windows input. Game captures stay separate.
+	int const menu_test_frame = (std::getenv("MIDV_FFB") &&
+		strcmp(std::getenv("MIDV_FFB"), "0") == 0 && std::getenv("MIDV_GL_MENU_TEST_FRAME"))
+		? atoi(std::getenv("MIDV_GL_MENU_TEST_FRAME")) : -1;
+	int menu_test_step = -1, menu_test_saved = -1;
+	ULONGLONG menu_test_next = 0;
+	uint32_t completed_frame = 0;
 
 	auto ring_read = [&](uint64_t pos, void *dst, uint32_t len)
 	{
@@ -1321,10 +1329,22 @@ void thread_main()
 		}
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+		bool ui_changed = false;
+		int menu_test_key = 0;
+		if (menu_test_frame >= 0 && completed_frame >= uint32_t(menu_test_frame) &&
+			menu_test_step < 8 && GetTickCount64() >= menu_test_next)
+		{
+			static int const keys[] = { VK_ESCAPE, VK_DOWN, VK_RETURN, VK_UP,
+				VK_RETURN, VK_ESCAPE, VK_DOWN, VK_DOWN, VK_RETURN };
+			menu_test_key = keys[++menu_test_step];
+			menu_test_next = GetTickCount64() + 350;
+			logf("menu test step=%d key=%d completed_frame=%u", menu_test_step, menu_test_key, completed_frame);
+		}
 		// F9: live CRT toggle (edge-triggered; global key, only polled here)
 		bool const f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
 		if (f9 && !f9_prev)
 		{
+			ui_changed = true;
 			crt = !crt;
 			gl.UseProgram(pal);
 			gl.Uniform1i(uCrt, crt ? 1 : 0);
@@ -1340,10 +1360,11 @@ void thread_main()
 				bool const down = fg && (GetAsyncKeyState(vk) & 0x8000) != 0;
 				bool const e = down && !prev;
 				prev = down;
-				return e;
+				return e || menu_test_key == vk;
 			};
 			if (edge(VK_ESCAPE, esc_prev) && menuprog)
 			{
+				ui_changed = true;
 				menu_open = !menu_open;
 				if (menu_open)
 					midv_ffb_cancel();   // POC: drop the wheel force the moment the menu opens
@@ -1353,6 +1374,7 @@ void thread_main()
 			bool const ok = edge(VK_RETURN, ret_prev);
 			if (menu_open)
 			{
+				ui_changed = ui_changed || up || dn || ok;
 				if (up) menu_sel = (menu_sel + 2) % 3;
 				if (dn) menu_sel = (menu_sel + 1) % 3;
 				if (ok)
@@ -1488,11 +1510,14 @@ void thread_main()
 			case 6:
 				complete_run();
 				frame_complete = true;
+				completed_frame = last_received_frame;
 				break;
 			}
 			if (frame_complete) break;
 		}
-		if (!frame_complete) { Sleep(1); continue; }
+		// Opening Esc pauses the producer before its next frame fence. The UI
+		// must still present and process selection/CRT/resume without that fence.
+		if (!frame_complete && !menu_open && !ui_changed) { Sleep(1); continue; }
 
 		// ---- present ----
 		int const cw = rc.right, ch = rc.bottom;
@@ -1577,10 +1602,12 @@ void thread_main()
 				(unsigned long long)n_flips,
 				(unsigned long long)(ring_load(lv.wpos) - ring_load(lv.rpos)), visible,
 				int(quad_fresh[visible]), quad_count[visible], gl.GetError(), double(lv.speed_pct));
-		if (snapdir && (last_received_frame % snap_every) == 0 &&
+		bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 8 && menu_test_saved != menu_test_step;
+		if (snapdir && (menu_test_capture || (frame_complete && !menu_open &&
+			(last_received_frame % snap_every) == 0 &&
 			int(last_received_frame) >= snap_first &&
 			(snap_last < 0 || int(last_received_frame) <= snap_last) &&
-			(snap_max == 0 || snap_n < snap_max))
+			(snap_max == 0 || snap_n < snap_max))))
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
 			// tight rows: the default GL_PACK_ALIGNMENT of 4 pads each row
@@ -1591,7 +1618,10 @@ void thread_main()
 			gl.PixelStorei(0x0D05 /*GL_PACK_ALIGNMENT*/, 1);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0 /*BGR*/, 0x1401, px.data());
 			char path[512];
-			snprintf(path, sizeof(path), "%s\\mvgl_%03d.bmp", snapdir, snap_n++);
+			if (menu_test_capture)
+				snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
+			else
+				snprintf(path, sizeof(path), "%s\\mvgl_%03d.bmp", snapdir, snap_n++);
 			FILE *f = fopen(path, "wb");
 			logf("snap %s -> %s", path, f ? "ok" : "FOPEN FAILED");
 			if (f)
@@ -1615,12 +1645,18 @@ void thread_main()
 					fwrite(row.data(), 1, rowsz, f);
 				}
 				fclose(f);
+				if (menu_test_capture)
+				{
+					menu_test_saved = menu_test_step;
+					logf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
+						menu_test_step, int(menu_open), menu_sel, int(crt), completed_frame, int(frame_complete));
+				}
 				// This is the most recently CONSUMED stream frame, not a promise
 				// that the async backbuffer equals a native frame at that instant.
 				// Preserve that distinction and the queue/drop state for analysis.
 				char index_path[512];
 				snprintf(index_path, sizeof(index_path), "%s\\captures.csv", snapdir);
-				if (FILE *index = fopen(index_path, snap_n == 1 ? "w" : "a"))
+				if (FILE *index = menu_test_capture ? nullptr : fopen(index_path, snap_n == 1 ? "w" : "a"))
 				{
 					if (snap_n == 1) fprintf(index, "file,present,last_received_frame,width,height,visible_page,queued_bytes,dropped_messages,completed_frame\n");
 					fprintf(index, "mvgl_%03d.bmp,%llu,%u,%d,%d,%d,%llu,%llu,%u\n", snap_n - 1,
