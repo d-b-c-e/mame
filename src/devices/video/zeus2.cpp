@@ -406,7 +406,7 @@ static std::atomic<bool> s_wave_resync{false};   // a waveram span was lost: re-
 static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 		const void *p2, uint32_t n2)
 {
-	if (!s_on.load(std::memory_order_relaxed))
+	if (!s_on.load(std::memory_order_relaxed) || s_stopz.load(std::memory_order_relaxed))
 		return;
 	uint32_t const bytes = n1 + n2;
 	uint64_t w = s_rw.load(std::memory_order_relaxed);
@@ -414,29 +414,18 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 	uint64_t const need = 8 + ((uint64_t(bytes) + 7) & ~7ull);
 	if (w - r + need > RING)
 	{
-		// Full. A dropped quad is a one-frame blip; a dropped waveram span
-		// (5) or palette (2) or display tick (6) leaves the GL mirror stale
-		// until the game happens to rewrite that region - the Amazon bushes
-		// drawn from wrong texture bytes. Wait (bounded) for the consumer
-		// to drain; if it still does not fit, remember to resync the whole
-		// texture memory at the next flush.
-		bool const essential = (type == 5 || type == 2 || type == 6);
-		if (essential)
+		// Quads, clears and direct writes all mutate persistent framebuffer/depth
+		// state. Losing any one of them cannot be repaired by a texture refresh.
+		for (int i = 0; i < 500 && w - r + need > RING; ++i)
 		{
-			for (int i = 0; i < 400 && (w - r + need > RING); i++)
-			{
-				Sleep(1);
-				r = s_rr.load(std::memory_order_acquire);
-			}
+			Sleep(1);
+			r = s_rr.load(std::memory_order_acquire);
 		}
 		if (w - r + need > RING)
 		{
-			if (type == 5)
-				s_wave_resync.store(true);
-			if (essential)
-				s_drops_state.fetch_add(1);
-			else
-				s_drops_quad.fetch_add(1);
+			s_drops_state.fetch_add(1);
+			s_stopz.store(true);
+			osd_printf_error("MIDZ render stream failed: consumer timeout; native presentation fallback\n");
 			return;
 		}
 	}

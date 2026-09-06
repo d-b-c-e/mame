@@ -87,8 +87,17 @@ FILE *quadlog_open()
 //   3 PALETTE u32 frame, u8 bytes[]
 //   4 TEXTURE u32 frame, u8 bytes[]
 //   5 VRAM    u32 frame, u32 offset, u32 count, u16 data[count]
+//   6 FRAME   u32 frame (end of visible screen update)
 #ifdef _WIN32
 
+// Interlocked operations preserve the cross-process ring layout and publish payloads
+// before the consumer sees a position. Volatile alone is not a memory barrier.
+static uint64_t ring_load(volatile uint64_t *p) {
+	return uint64_t(InterlockedCompareExchange64((volatile LONG64 *)p, 0, 0));
+}
+static void ring_store(volatile uint64_t *p, uint64_t value) {
+	InterlockedExchange64((volatile LONG64 *)p, LONG64(value));
+}
 struct midv_live
 {
 	volatile float speed_pct = 0.0f;   // MAME speed %, for the overlay stats
@@ -100,6 +109,7 @@ struct midv_live
 	volatile uint64_t *rpos = nullptr;
 	volatile uint64_t *dropped = nullptr;
 	uint8_t *data = nullptr;
+	uint32_t capacity = RING_SIZE;
 	bool enabled = false;
 	bool tex_dirty = true;    // force initial snapshots
 	bool pal_dirty = true;
@@ -121,6 +131,8 @@ struct midv_live
 		base = (volatile uint8_t *)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 0);
 		if (!base)
 			return;
+		if (const char *e = std::getenv("MIDV_GL_QUEUE_MB"))
+			capacity = uint32_t(std::clamp(atoi(e), 16, 128)) << 20;
 		memset((void *)base, 0, HDR_SIZE);
 		memcpy((void *)base, "MVL1", 4);
 		*(volatile uint32_t *)(base + 4) = RING_SIZE;
@@ -137,10 +149,21 @@ struct midv_live
 		if (!enabled)
 			return false;
 		uint32_t const need = (8 + l1 + l2 + 7) & ~7u;
-		uint64_t const w = *wpos, r = *rpos;
-		if (RING_SIZE - uint32_t(w - r) < need)
+		uint64_t const w = ring_load(wpos);
+		uint64_t r = ring_load(rpos);
+		// Every message mutates persistent state, including quads and CPU writes.
+		// Backpressure is lossless; a dead consumer fails the entire stream.
+		for (int wait = 0; need <= capacity && w - r + need > capacity && wait < 500; ++wait)
 		{
-			++*dropped;
+			Sleep(1);
+			r = ring_load(rpos);
+		}
+		if (need > capacity || w - r + need > capacity)
+		{
+			InterlockedIncrement64((volatile LONG64 *)dropped);
+			InterlockedExchange((volatile LONG *)(base + 32), 1);
+			enabled = false;
+			osd_printf_error("MIDV render stream failed: consumer timeout; native presentation fallback\n");
 			return false;
 		}
 		auto put = [&](uint64_t at, const void *src, uint32_t len)
@@ -156,7 +179,7 @@ struct midv_live
 		put(w + 8, p1, l1);
 		if (l2)
 			put(w + 8 + l1, p2, l2);
-		*wpos = w + need;   // x86: plain store publishes after the memcpys
+		ring_store(wpos, w + need);
 		return true;
 	}
 
@@ -1029,6 +1052,7 @@ void thread_main()
 	GL gl;
 	if (!gl.load_base()) { logf("opengl32 load failed"); return; }
 	HGLRC legacy = gl.CreateContext(dc);
+	HGLRC context = legacy;
 	gl.MakeCurrent(dc, legacy);
 	if (!gl.load_rest()) { logf("GL function resolution failed"); return; }
 	if (gl.CreateContextAttribs)
@@ -1039,6 +1063,7 @@ void thread_main()
 		{
 			gl.MakeCurrent(dc, core);
 			gl.DeleteContext(legacy);
+			context = core;
 			gl.load_rest();   // re-resolve in the core context
 		}
 	}
@@ -1069,7 +1094,6 @@ void thread_main()
 	// the palette pass fills unwritten slivers (hardware quad cracks that
 	// would show the stale page) from axis-bounded neighbours
 	uint maskTex[2] = { make_tex(fw, fh, R8UI), make_tex(fw, fh, R8UI) };
-	uint underTex[2] = { make_tex(512, H, R16UI), make_tex(512, H, R16UI) };
 	uint fbo[2];
 	gl.GenFramebuffers(2, fbo);
 	for (int i = 0; i < 2; i++)
@@ -1197,9 +1221,9 @@ void thread_main()
 		snapdir ? snapdir : "(null)");
 
 	// ---- stream state ----
-	std::vector<QuadMsg> run, pend[2];
-	uint16_t run_pc = 0xffff, pend_pc[2] = {};
-	bool pend_valid[2] = {};
+	std::vector<QuadMsg> run;
+	uint16_t run_pc = 0xffff, active_pc = 0xffff;
+	int scene_axis[2] = {}, cpu_written[2] = {};
 	static uint16_t shadow[2][MAXH * 512];
 	bool quad_fresh[2] = {};
 	bool crop2d[2] = {};
@@ -1212,6 +1236,9 @@ void thread_main()
 	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
 	int snap_n = 0;
 	uint32_t last_received_frame = 0;
+	int const stall_frame = std::getenv("MIDV_GL_STALL_FRAME") ? atoi(std::getenv("MIDV_GL_STALL_FRAME")) : -1;
+	int const stall_ms = std::getenv("MIDV_GL_STALL_MS") ? std::clamp(atoi(std::getenv("MIDV_GL_STALL_MS")), 0, 5000) : 0;
+	bool stalled = false;
 
 	auto ring_read = [&](uint64_t pos, void *dst, uint32_t len)
 	{
@@ -1221,43 +1248,85 @@ void thread_main()
 		if (len > first) memcpy((uint8_t *)dst + first, lv.data, len - first);
 	};
 	uint64_t n_flips = 0;
-	int logged_runs = 0;
 	auto complete_run = [&]()
 	{
 		if (run.empty()) return;
-		if (logged_runs < 30)
-			logf("run: pc=%u quads=%zu", run_pc, run.size()), ++logged_runs;
-		int pg = (run_pc & 4) ? 1 : 0;
-		// merge cap: a stalled GL thread would otherwise accumulate every
-		// same-pc scene into one ever-growing draw (positive feedback on
-		// a slow GPU). Past this, fall back to skip-to-latest - one
-		// possibly-partial frame beats a runaway backlog.
-		constexpr size_t MERGE_CAP = 16384;
-		if (pend_valid[pg] && pend_pc[pg] == run_pc
-			&& pend[pg].size() + run.size() <= MERGE_CAP)
+		int const pg = (run_pc & 4) ? 1 : 0;
+		bool const new_scene = active_pc != run_pc;
+		if (new_scene) { quad_count[pg] = 0; scene_axis[pg] = 0; active_pc = run_pc; }
+		build_vertices(run, float(MARGIN), fdata, udata);
+		quad_count[pg] += int(run.size());
+		cpu_written[pg] = 0;
+		// 2D screens (menus, high scores) are drawn almost entirely from
+		// axis-aligned rectangles; 3D scenes almost never are. Quad-count
+		// thresholds proved unreliable (2D ~160 vs 3D dipping to ~260).
+		int axis = 0;
+		for (auto const &q : run)
 		{
-			// same pc, same page, previous half not drawn yet: these are
-			// PARTS of one scene, not a stale scene to skip. 2D screens
-			// write page_control every frame but change it every TWO
-			// (base+tiles one frame, text the next); replacing the undrawn
-			// first half here dropped the map background forever and left
-			// the 129/130 tile seam showing entry-stale page pixels - the
-			// crusnusa continue-screen vertical line. Merging keeps
-			// skip-to-latest semantics harmless: a genuinely newer scene
-			// just overdraws the older quads in one call.
-			pend[pg].insert(pend[pg].end(), run.begin(), run.end());
+			int16_t const x0 = int16_t(q.dma[2]), y0 = int16_t(q.dma[3]);
+			int16_t const x1 = int16_t(q.dma[4]), y1 = int16_t(q.dma[5]);
+			int16_t const x2 = int16_t(q.dma[6]), y2 = int16_t(q.dma[7]);
+			int16_t const x3 = int16_t(q.dma[8]), y3 = int16_t(q.dma[9]);
+			if ((y0 == y1 && y2 == y3 && x1 == x2 && x3 == x0) ||
+				(x0 == x1 && x2 == x3 && y1 == y2 && y3 == y0))
+				++axis;
 		}
-		else
+		scene_axis[pg] += axis;
+		crop2d[pg] = (scene_axis[pg] * 10 >= quad_count[pg] * 7);
+		gl.UseProgram(prog);
+		gl.BindVertexArray(vao);
+		gl.BindBuffer(ARRAY_BUFFER, vbo_f);
+		gl.BufferData(ARRAY_BUFFER, fdata.size() * 4, fdata.data(), STREAM_DRAW);
+		gl.BindBuffer(ARRAY_BUFFER, vbo_u);
+		gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
+		gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
+		gl.Viewport(0, 0, fw, fh);
+		if (new_scene)
 		{
-			pend[pg].swap(run);
-			pend_pc[pg] = run_pc;
-			pend_valid[pg] = true;
+			// reset the crack-fill mask to "unwritten" for the whole frame -
+			// glClearBufferuiv touches ONLY attachment 1, so the page itself
+			// still persists between scenes (hardware behavior)
+			{
+				uint const zero[4] = { 0, 0, 0, 0 };
+				gl.ClearBufferuiv(0x1800 /*GL_COLOR*/, 1, zero);
+			}
+			// The game guarantees repainting only the 512-wide hardware
+			// region; the 16:9 margins are ours. Scenes that draw nothing
+			// there (2D screens, showcase scenes) would otherwise show the
+			// previous scene's stale margins - seen at the rig as scenery
+			// strips beside a 4:3 screen and a thin border at crop edges.
+			gl.Enable(0x0C11 /*SCISSOR_TEST*/);
+			gl.ClearColor(0, 0, 0, 0);
+			// widen by a 2-pixel overscan inset: the outermost rows/columns
+			// of the hardware region carry edge pixels a real CRT never
+			// showed (seen as a thin bright border at the rig)
+			int const os = 2 * S;
+			gl.Scissor(0, 0, MARGIN * S + os, fh);
+			gl.Clear(0x4000);
+			gl.Scissor(fw - MARGIN * S - os, 0, MARGIN * S + os, fh);
+			gl.Clear(0x4000);
+			gl.Scissor(0, 0, fw, os);
+			gl.Clear(0x4000);
+			gl.Scissor(0, fh - os, fw, os);
+			gl.Clear(0x4000);
+			gl.Disable(0x0C11);
 		}
+		gl.ActiveTexture(TEXTURE0);
+		gl.BindTexture(0x0DE1, texram);
+		gl.DrawArrays(0x0004 /*TRIANGLES*/, 0, int(run.size() * 6));
+		gl.BindFramebuffer(FRAMEBUFFER, 0);
+		quad_fresh[pg] = true;
+		if (new_scene) ++n_scenes;
 		run.clear();
 	};
 
 	while (IsWindow(parent) && !s_stop.load())
 	{
+		if (InterlockedCompareExchange((volatile LONG *)(lv.base + 32), 0, 0))
+		{
+			logf("render stream failed: persistent state incomplete; closing overlay");
+			break;
+		}
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
 		// F9: live CRT toggle (edge-triggered; global key, only polled here)
@@ -1329,8 +1398,15 @@ void thread_main()
 					SWP_NOACTIVATE | SWP_NOZORDER);
 		}
 
+		if (!stalled && stall_frame >= 0 && int(last_received_frame) >= stall_frame)
+		{
+			stalled = true;
+			logf("diagnostic consumer stall frame=%u ms=%d", last_received_frame, stall_ms);
+			Sleep(stall_ms);
+		}
 		// ---- drain ----
-		uint64_t w = *lv.wpos, r = *lv.rpos;
+		bool frame_complete = false;
+		uint64_t w = ring_load(lv.wpos), r = ring_load(lv.rpos);
 		while (r < w)
 		{
 			uint32_t hdr[2];
@@ -1338,10 +1414,10 @@ void thread_main()
 			uint32_t const type = hdr[0], len = hdr[1];
 			if (len > staging.size()) staging.resize(len);
 			ring_read(r + 8, staging.data(), len);
-			if (type >= 1 && type <= 5 && len >= 4)
+			if (type >= 1 && type <= 6 && len >= 4)
 				memcpy(&last_received_frame, staging.data(), 4);
 			r += (8 + len + 7) & ~7u;
-			*lv.rpos = r;
+			ring_store(lv.rpos, r);
 			switch (type)
 			{
 			case 1:
@@ -1363,6 +1439,7 @@ void thread_main()
 				break;
 			}
 			case 3:
+				complete_run();
 				++n_pal;
 				memcpy(pal_copy, staging.data() + 4, sizeof(pal_copy));
 				gl.ActiveTexture(TEXTURE0 + 2);
@@ -1370,6 +1447,7 @@ void thread_main()
 				gl.TexSubImage2D(0x0DE1, 0, 0, 0, 256, 128, RED_INTEGER, 0x1405, staging.data() + 4);
 				break;
 			case 4:
+				complete_run();
 				++n_tex;
 				gl.ActiveTexture(TEXTURE0);
 				gl.BindTexture(0x0DE1, texram);
@@ -1377,6 +1455,7 @@ void thread_main()
 				break;
 			case 5:
 			{
+				complete_run();
 				uint32_t o, n;
 				memcpy(&o, staging.data() + 4, 4);
 				memcpy(&n, staging.data() + 8, 4);
@@ -1387,77 +1466,41 @@ void thread_main()
 				{
 					uint32_t end = std::min(rel + n, uint32_t(H) * 512);
 					memcpy(&shadow[pg][rel], staging.data() + 12, (end - rel) * 2);
-					quad_fresh[pg] = false;
+					// CPU pixels and quads mutate the same persistent indexed page.
+					// Upload only this span, with nearest expansion and the same Y flip.
+					gl.ActiveTexture(TEXTURE0 + 1);
+					std::vector<uint16_t> pixels;
+					std::vector<uint8_t> mask;
+					for (uint32_t at = rel; at < end; )
+					{
+						int const x = at % 512, y = at / 512;
+						int const count = std::min(end - at, uint32_t(512 - x));
+						pixels.resize(count * S * S); mask.assign(count * S * S, 1);
+						for (int yy = 0; yy < S; ++yy)
+							for (int xx = 0; xx < count * S; ++xx)
+								pixels[yy * count * S + xx] = shadow[pg][at + xx / S];
+						gl.BindTexture(0x0DE1, pageTex[pg]);
+						gl.TexSubImage2D(0x0DE1, 0, (MARGIN + x) * S, (H - 1 - y) * S,
+							count * S, S, RED_INTEGER, 0x1403, pixels.data());
+						gl.BindTexture(0x0DE1, maskTex[pg]);
+						gl.TexSubImage2D(0x0DE1, 0, (MARGIN + x) * S, (H - 1 - y) * S,
+							count * S, S, RED_INTEGER, 0x1401, mask.data());
+						at += count;
+					}
+					cpu_written[pg] += end - rel;
+					if (cpu_written[pg] >= H * 512 * 7 / 10)
+						quad_fresh[pg] = false, active_pc = 0xffff;
 				}
 				break;
 			}
+			case 6:
+				complete_run();
+				frame_complete = true;
+				break;
 			}
+			if (frame_complete) break;
 		}
-
-		// ---- render pending scenes (skip-to-latest already applied) ----
-		for (int pg = 0; pg < 2; pg++)
-		{
-			if (!pend_valid[pg]) continue;
-			pend_valid[pg] = false;
-			build_vertices(pend[pg], float(MARGIN), fdata, udata);
-			quad_count[pg] = int(pend[pg].size());
-			// 2D screens (menus, high scores) are drawn almost entirely from
-			// axis-aligned rectangles; 3D scenes almost never are. Quad-count
-			// thresholds proved unreliable (2D ~160 vs 3D dipping to ~260).
-			int axis = 0;
-			for (auto const &q : pend[pg])
-			{
-				int16_t const x0 = int16_t(q.dma[2]), y0 = int16_t(q.dma[3]);
-				int16_t const x1 = int16_t(q.dma[4]), y1 = int16_t(q.dma[5]);
-				int16_t const x2 = int16_t(q.dma[6]), y2 = int16_t(q.dma[7]);
-				int16_t const x3 = int16_t(q.dma[8]), y3 = int16_t(q.dma[9]);
-				if ((y0 == y1 && y2 == y3 && x1 == x2 && x3 == x0) ||
-					(x0 == x1 && x2 == x3 && y1 == y2 && y3 == y0))
-					++axis;
-			}
-			crop2d[pg] = (axis * 10 >= int(pend[pg].size()) * 7);
-			gl.UseProgram(prog);
-			gl.BindVertexArray(vao);
-			gl.BindBuffer(ARRAY_BUFFER, vbo_f);
-			gl.BufferData(ARRAY_BUFFER, fdata.size() * 4, fdata.data(), STREAM_DRAW);
-			gl.BindBuffer(ARRAY_BUFFER, vbo_u);
-			gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
-			gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
-			gl.Viewport(0, 0, fw, fh);
-			// reset the crack-fill mask to "unwritten" for the whole frame -
-			// glClearBufferuiv touches ONLY attachment 1, so the page itself
-			// still persists between scenes (hardware behavior)
-			{
-				uint const zero[4] = { 0, 0, 0, 0 };
-				gl.ClearBufferuiv(0x1800 /*GL_COLOR*/, 1, zero);
-			}
-			// The game guarantees repainting only the 512-wide hardware
-			// region; the 16:9 margins are ours. Scenes that draw nothing
-			// there (2D screens, showcase scenes) would otherwise show the
-			// previous scene's stale margins - seen at the rig as scenery
-			// strips beside a 4:3 screen and a thin border at crop edges.
-			gl.Enable(0x0C11 /*SCISSOR_TEST*/);
-			gl.ClearColor(0, 0, 0, 0);
-			// widen by a 2-pixel overscan inset: the outermost rows/columns
-			// of the hardware region carry edge pixels a real CRT never
-			// showed (seen as a thin bright border at the rig)
-			int const os = 2 * S;
-			gl.Scissor(0, 0, MARGIN * S + os, fh);
-			gl.Clear(0x4000);
-			gl.Scissor(fw - MARGIN * S - os, 0, MARGIN * S + os, fh);
-			gl.Clear(0x4000);
-			gl.Scissor(0, 0, fw, os);
-			gl.Clear(0x4000);
-			gl.Scissor(0, fh - os, fw, os);
-			gl.Clear(0x4000);
-			gl.Disable(0x0C11);
-			gl.ActiveTexture(TEXTURE0);
-			gl.BindTexture(0x0DE1, texram);
-			gl.DrawArrays(0x0004 /*TRIANGLES*/, 0, int(pend[pg].size() * 6));
-			gl.BindFramebuffer(FRAMEBUFFER, 0);
-			quad_fresh[pg] = true;
-			++n_scenes;
-		}
+		if (!frame_complete) { Sleep(1); continue; }
 
 		// ---- present ----
 		int const cw = rc.right, ch = rc.bottom;
@@ -1470,7 +1513,7 @@ void thread_main()
 		int vw = cw, vh = int(cw / aspect + 0.5f);
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
 		gl.UseProgram(pal);
-		gl.Uniform1i(uCrop, (quad_fresh[visible] && !wide3d) ? MARGIN * S : 0);
+		gl.Uniform1i(uCrop, !wide3d ? MARGIN * S : 0);
 		// fill radius: live 3D scenes get the full crack fill; 2D screens
 		// (menus, track select) get a tight 1-px pass only - their bitmap
 		// tiles leave hairline unwritten seams (offroadc track select's
@@ -1482,19 +1525,7 @@ void thread_main()
 		gl.ActiveTexture(TEXTURE0 + 3);
 		gl.BindTexture(0x0DE1, maskTex[visible]);
 		gl.ActiveTexture(TEXTURE0 + 1);
-		if (quad_fresh[visible])
-			gl.BindTexture(0x0DE1, pageTex[visible]);
-		else
-		{
-			// the pal pass samples rows bottom-up (the quad path flips Y in
-			// its VS); the CPU shadow is top-down, so upload row-reversed or
-			// boot/test screens display vertically flipped
-			static uint16_t flipped[MAXH * 512];
-			for (int y = 0; y < H; y++)
-				memcpy(&flipped[y * 512], &shadow[visible][(H - 1 - y) * 512], 512 * 2);
-			gl.BindTexture(0x0DE1, underTex[visible]);
-			gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, H, RED_INTEGER, 0x1403, flipped);
-		}
+		gl.BindTexture(0x0DE1, pageTex[visible]);
 		gl.ActiveTexture(TEXTURE0 + 2);
 		gl.BindTexture(0x0DE1, paltex);
 		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
@@ -1552,9 +1583,9 @@ void thread_main()
 				(unsigned long long)n_scenes, (unsigned long long)n_pal,
 				(unsigned long long)n_tex, (unsigned long long)n_vram,
 				(unsigned long long)n_flips,
-				(unsigned long long)(*lv.wpos - *lv.rpos), visible,
+				(unsigned long long)(ring_load(lv.wpos) - ring_load(lv.rpos)), visible,
 				int(quad_fresh[visible]), quad_count[visible], gl.GetError(), double(lv.speed_pct));
-		if (snapdir && (presents % snap_every) == 0 &&
+		if (snapdir && (last_received_frame % snap_every) == 0 &&
 			int(last_received_frame) >= snap_first &&
 			(snap_last < 0 || int(last_received_frame) <= snap_last) &&
 			(snap_max == 0 || snap_n < snap_max))
@@ -1599,10 +1630,10 @@ void thread_main()
 				snprintf(index_path, sizeof(index_path), "%s\\captures.csv", snapdir);
 				if (FILE *index = fopen(index_path, snap_n == 1 ? "w" : "a"))
 				{
-					if (snap_n == 1) fprintf(index, "file,present,last_received_frame,width,height,visible_page,queued_bytes,dropped_messages\n");
-					fprintf(index, "mvgl_%03d.bmp,%llu,%u,%d,%d,%d,%llu,%llu\n", snap_n - 1,
+					if (snap_n == 1) fprintf(index, "file,present,last_received_frame,width,height,visible_page,queued_bytes,dropped_messages,completed_frame\n");
+					fprintf(index, "mvgl_%03d.bmp,%llu,%u,%d,%d,%d,%llu,%llu,%u\n", snap_n - 1,
 						(unsigned long long)presents, last_received_frame, cw, ch, visible,
-						(unsigned long long)(*lv.wpos - *lv.rpos), (unsigned long long)*lv.dropped);
+						(unsigned long long)(ring_load(lv.wpos) - ring_load(lv.rpos)), (unsigned long long)ring_load(lv.dropped), last_received_frame);
 					fclose(index);
 				}
 			}
@@ -1622,8 +1653,12 @@ void thread_main()
 		}
 	}
 	logf("%s after %llu presents, %d snaps",
-		s_stop.load() ? "machine exit" : "parent gone",
+		s_stop.load() ? "machine exit" : "parent gone or failed stream",
 		(unsigned long long)presents, snap_n);
+	gl.MakeCurrent(nullptr, nullptr);
+	gl.DeleteContext(context);
+	ReleaseDC(child, dc);
+	DestroyWindow(child);
 }
 
 } // namespace mvgl
@@ -3107,9 +3142,18 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// boot and test screens are CPU-drawn, and without this the palette never
 	// reaches the renderer until the first 3D scene (boot showed black).
 	if (live().enabled)
+	{
 		live().sync_state(uint32_t(screen.frame_number()),
 			m_paletteram.target(), uint32_t(m_paletteram.bytes()),
 			m_textureram.target(), uint32_t(m_textureram.bytes()));
+		// update_partial can call this more than once in one emulated frame.
+		// Only the final visible scanline seals the displayed transaction.
+		if (cliprect.max_y >= screen.visible_area().max_y)
+		{
+			uint32_t const frame = uint32_t(screen.frame_number());
+			live().write_msg(6, &frame, sizeof(frame));
+		}
+	}
 
 	// POC telemetry Phase B RAM hunt: dump the DSP work RAM every N frames
 	// (MIDV_RAMDUMP_DIR + MIDV_RAMDUMP_EVERY, default 30) so a demo-race
