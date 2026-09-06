@@ -29,6 +29,7 @@
 #include <cctype>
 #include "midvunit.h"
 #include "cruisn/checked_patch.h"
+#include "cruisn/world_scenery.h"
 
 #include "cpu/adsp2100/adsp2100.h"
 #include "cpu/tms320c3x/tms320c3x.h"
@@ -69,6 +70,103 @@ void midvunit_base_state::machine_start()
 	save_item(NAME(m_cmos_protected));
 	save_item(NAME(m_control_data));
 	save_item(NAME(m_timer_rate));
+	save_item(NAME(m_scenery_tree));
+	scenery_start();
+}
+
+// Narrow, opt-in distance extension for attributed World 2.4 scenery only.
+// Drawing remains guest work and may change a recorded drive's later history.
+void midvunit_base_state::scenery_start()
+{
+	using namespace cruisn::world_scenery;
+	const char *mode = std::getenv("MIDV_SCENERY");
+	if (!mode || !strcmp(mode, "off")) return;
+	if (!strcmp(mode, "mountains")) m_scenery_mode = 1;
+	else if (!strcmp(mode, "trees")) m_scenery_mode = 2;
+	else if (!strcmp(mode, "all")) m_scenery_mode = 3;
+	if (!m_scenery_mode || strcmp(machine().system().name, "crusnwld24"))
+	{
+		osd_printf_warning("MIDV_SCENERY ignored: unsupported mode or ROM revision\n");
+		m_scenery_mode = 0;
+		return;
+	}
+	if (const char *log = std::getenv("MIDV_SCENERY_LOG"); log && !strcmp(log, "1"))
+	{
+		m_scenery_log = fopen("scenery.csv", "w");
+		if (m_scenery_log) fprintf(m_scenery_log, "frame,mountain_admissions,tree_admissions,extended_reads,maximum_index\n");
+	}
+	for (uint32_t i = first_extra; i <= last_extra; ++i)
+		m_scenery_reciprocal[i-first_extra] = reciprocal(i);
+	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&midvunit_base_state::scenery_exit, this));
+	address_space &s = m_maincpu->space(AS_PROGRAM);
+	m_scenery_far_tap = s.install_read_tap(0x40, 0x40, "world_scenery_far",
+		[this](offs_t offset, uint32_t &data, uint32_t mem_mask)
+		{
+			if (machine().side_effects_disabled()) return;
+			uint32_t const pc = m_maincpu->state_int(TMS320C3X_PC);
+			if (pc != 0xa1 && pc != 0xa9) return;
+			uint32_t const object = m_maincpu->state_int(TMS320C3X_AR0);
+			if (pc == 0xa1)
+			{
+				m_scenery_tree = 0;
+				if (data != original_far || !code_matches(m_ram_base, m_ram_base.bytes()/4)
+					|| object == 0 || object >= 0x20000-14) return;
+				// Read the RAM backing directly. Nested address-space reads here
+				// could re-enter the reciprocal tap because the ranges overlap.
+				uint32_t const model = m_ram_base[m_ram_base[0x9c] & 0xffff];
+				uint32_t const radius = m_maincpu->state_int(TMS320C3X_R4);
+				int32_t const depth = int32_t(m_maincpu->state_int(TMS320C3X_R3));
+				kind const type = classify(model, m_ram_base[object+14], radius);
+				if ((type == mountain && !(m_scenery_mode & 1)) || (type == tree && !(m_scenery_mode & 2))) return;
+				uint32_t const limit = admission(type, depth, radius);
+				if (limit == original_far) return;
+				data = limit;
+				if (depth > int32_t(limit)) return;
+				if (type == mountain) ++m_scenery_mountains;
+				if (type == tree) { m_scenery_tree = object; ++m_scenery_trees; }
+			}
+			else if (m_scenery_tree && object == m_scenery_tree && data == original_far)
+				data = extended_far; // selected new tree fits fully within valid projection range
+		});
+	m_scenery_reciprocal_tap = s.install_read_tap(reciprocal_base+first_extra, 0x1ffff,
+		"world_scenery_projection", [this](offs_t offset, uint32_t &data, uint32_t mem_mask)
+		{
+			if (machine().side_effects_disabled() || !m_scenery_tree
+				|| !projection_pc(m_maincpu->state_int(TMS320C3X_PC))
+				|| m_maincpu->state_int(TMS320C3X_AR0) != m_scenery_tree
+				|| m_maincpu->state_int(TMS320C3X_AR2) != reciprocal_base) return;
+			uint32_t const index = offset-reciprocal_base;
+			// Radius guards prove this bound for the attributed model. Never
+			// silently consume unrelated RAM if a later code change violates it.
+			if (index > last_extra)
+			{
+				osd_printf_error("World scenery reciprocal out of bounds: %u; exiting\n", index);
+				midv_ffb_cancel();
+				machine().schedule_exit();
+				data = m_scenery_reciprocal.back();
+				return;
+			}
+			data = m_scenery_reciprocal[index-first_extra];
+			++m_scenery_reads;
+			m_scenery_max_index = std::max(m_scenery_max_index, index);
+		});
+	osd_printf_info("MIDV_SCENERY %s: World 2.4, guarded mountain/tree models, far=160000\n", mode);
+}
+
+void midvunit_base_state::scenery_tick()
+{
+	if (!m_scenery_mode) return;
+	if (m_scenery_log)
+		fprintf(m_scenery_log, "%llu,%llu,%llu,%llu,%u\n", (unsigned long long)m_screen->frame_number(),
+			(unsigned long long)m_scenery_mountains, (unsigned long long)m_scenery_trees,
+			(unsigned long long)m_scenery_reads, m_scenery_max_index);
+	m_scenery_mountains = m_scenery_trees = m_scenery_reads = 0;
+	m_scenery_max_index = 0;
+}
+
+void midvunit_base_state::scenery_exit()
+{
+	if (m_scenery_log) { fclose(m_scenery_log); m_scenery_log = nullptr; }
 }
 
 
@@ -202,6 +300,7 @@ void midv_patches_tick(uint32_t *ram)
 
 void midvunit_base_state::machine_reset()
 {
+	m_scenery_tree = 0;
 	reset_display_assets();
 	m_dcs->reset_w(0);
 	m_dcs->reset_w(1);

@@ -3134,6 +3134,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// ROM after machine_reset applied MIDV_PATCH - re-assert reverted
 	// entries once per frame (no-op without MIDV_PATCH)
 	midv_patches_tick(m_ram_base);
+	scenery_tick();
 	if (live().enabled)
 		live().speed_pct = float(machine().video().speed_percent() * 100.0);
 	midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half (every frame)

@@ -96,6 +96,9 @@ protected:
 	virtual void video_start() override ATTR_COLD;
 	void mvgl_exit();   // POC: stop the GL overlay thread before teardown
 	void reset_display_assets();
+	void scenery_start();
+	void scenery_tick();
+	void scenery_exit();
 
 	void cmos_protect_w(uint32_t data);
 	void dma_queue_w(uint32_t data);
@@ -147,6 +150,14 @@ protected:
 	emu_timer *m_scanline_timer = nullptr;
 	emu_timer *m_eoi_timer = nullptr;
 	std::unique_ptr<midvunit_renderer> m_poly;
+	// Optional World 2.4 scenery extension. Taps never write guest RAM.
+	memory_passthrough_handler m_scenery_far_tap, m_scenery_reciprocal_tap;
+	uint32_t m_scenery_tree = 0;
+	uint8_t m_scenery_mode = 0;
+	std::array<uint32_t, 5001> m_scenery_reciprocal{};
+	uint64_t m_scenery_mountains = 0, m_scenery_trees = 0, m_scenery_reads = 0;
+	uint32_t m_scenery_max_index = 0;
+	FILE *m_scenery_log = nullptr;
 };
 
 class midvunit_state : public midvunit_base_state
