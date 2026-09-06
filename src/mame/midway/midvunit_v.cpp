@@ -504,25 +504,9 @@ static const SpeedAddr s_speed_addr[] = {
 };
 static uint32_t s_speed_word = 0;   // resolved at telem_init
 
-// Telemetry Phase B: engine RPM (tach). Formats differ per game:
-//   RPM_C3X  = whole word is a TMS320C3x float
-//   RPM_LO16 = low 16 bits, unsigned integer (high half is another field)
-// crusnusa 0x0E632.lo16 CONFIRMED against the ON-SCREEN TACH: the HUD RPM
-// gauge's fill-pixel count correlates r=+0.91 with this field over a real
-// drive (results/drive-capture-crusnusa-20260823-214142) - gauge
-// quantization is the only miss. Range ~0..14650 (redline ~14.6k game
-// units). The earlier 0x0DC20 was a drone's engine (same investigation).
-enum { RPM_C3X = 0, RPM_LO16 = 1 };
-struct RpmAddr { const char *game; uint32_t addr; int kind; float forza_scale; };
-static const RpmAddr s_rpm_addr[] = {
-	{ "crusnusa", 0x0E632, RPM_LO16, 0.5f },   // 14.6k raw -> ~7300 on the dash
-	{ "crusnwld", 0, RPM_C3X, 1.0f },
-	{ "offroadc", 0, RPM_C3X, 1.0f },
-	{ nullptr, 0, 0, 0.0f },
-};
-static uint32_t s_rpm_word = 0;   // resolved at telem_init
-static int s_rpm_kind = RPM_C3X;
-static float s_rpm_fscale = 1.0f;
+// No validated engine-RPM producer exists yet. USA RAM word E632 is packed
+// decimal speed text, as established by its formatter and HUD submissions.
+// The retired low-16-bit correlation was not an RPM measurement.
 
 // TMS320C3x 32-bit float -> host float: [exp 8b two's-comp][sign][frac 23b]
 static float c3x_to_float(uint32_t w)
@@ -551,19 +535,10 @@ static void telem_init(const char *spec, const char *game)
 	s_hud_speed.reset();
 	for (const HudBox *p = s_hud_box; p->game; ++p)
 		if (game_match(p->game)) { s_hud = p; break; }
-	s_rpm_word = 0;
-	for (const RpmAddr *p = s_rpm_addr; p->game; ++p)
-		if (game_match(p->game))
-		{
-			s_rpm_word = p->addr;
-			s_rpm_kind = p->kind;
-			s_rpm_fscale = p->forza_scale;
-			break;
-		}
 
 	strncpy(s_telem_game, game, sizeof(s_telem_game) - 1);
 	// Source selection also serves file-only diagnostics. Opening a trace must
-	// not require a UDP destination, nor silently leave OCR/RPM uninitialized.
+	// not require a UDP destination, nor silently leave OCR uninitialized.
 	if (!spec && !std::getenv("MIDV_TELEM_FORZA"))
 		return;
 	WSADATA wsa;
@@ -3081,16 +3056,10 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// and this game's speed word has been hunted.
 	// Gating (found live on the rig): OUTSIDE races the DSP words hold
 	// unrelated data - the "speed" word spiked to ~990 in menus/transitions
-	// (pegging SimHub gauges at full scale) and the rpm word parks on a
-	// constant junk value (~541) in menus. Two-layer gate:
-	//  1. plausibility: speed 0..400 (real max ~301), rpm 0..1400 (redline
-	//     ~912, transient spikes ~1371); out-of-range -> 0. (speed junk
-	//     observed at 373 and 990 - the bound must sit under 373.)
-	//  2. rpm freshness: when the car is stationary AND the rpm word's raw
-	//     bits have been frozen for ~3s it's a parked menu value -> 0.
-	//     (Only while stationary: at real top-speed cruise or start-line
-	//     revving the engine sim wobbles the bits, and speed>0 bypasses it.)
-	float telem_mph = 0.0f, telem_rpm = 0.0f;
+	// (pegging SimHub gauges). Unreadable speed uses bounded held/invalid state.
+	// RPM is unavailable until a real producer is validated; never derive it
+	// from the speed formatter's packed ASCII buffer.
+	float telem_mph = 0.0f;
 	if (s_speed_word)
 	{
 		float v = c3x_to_float(m_ram_base[s_speed_word]);
@@ -3135,35 +3104,6 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 			speed_sample.seconds, (unsigned long long)speed_sample.frame, speed_sample.value);
 
 
-	if (s_rpm_word)
-	{
-		static uint32_t s_rpm_bits = 0;
-		static int s_rpm_still = 0;
-		uint32_t bits = m_ram_base[s_rpm_word];
-		if (bits == s_rpm_bits)
-			s_rpm_still += (s_rpm_still < 10000);
-		else
-		{
-			s_rpm_bits = bits;
-			s_rpm_still = 0;
-		}
-		float v;
-		float vmax;
-		if (s_rpm_kind == RPM_LO16)
-		{
-			uint32_t lo = bits & 0xffff;
-			v = (lo < 0x8000) ? float(lo) : 0.0f;   // 0xFFFF = invalid marker
-			vmax = 20000.0f;
-		}
-		else
-		{
-			v = c3x_to_float(bits);
-			vmax = 1400.0f;
-		}
-		bool const parked = (telem_mph < 0.5f && s_rpm_still >= 180);
-		if (v >= 0.0f && v < vmax && !parked)
-			telem_rpm = v;
-	}
 	// Emit the speed whenever anything is listening OR the trace is open.
 	// It used to be gated on s_speed_word, which is 0 for every game (the
 	// RAM addresses were retired for the HUD OCR), so the speed the OCR
@@ -3181,33 +3121,24 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		telem_notify("speed_status", s_hud ? s_hud_speed.status() : 0, nullptr);
 		telem_notify("speed_age_frames", s_hud ? s_hud_speed.age_frames : 0, nullptr);
 	}
-	if (s_telem_sock != INVALID_SOCKET && s_rpm_word)
-		telem_notify("rpm", s32(telem_rpm + 0.5f), nullptr);
+	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace)
+		telem_notify("rpm_status", 0, nullptr); // unavailable, not a measured zero
 
 	// Telemetry Phase C: Forza Horizon 4/5 "Data Out" packet (324 bytes),
 	// so SimHub / dash apps consume us as Forza with stock profiles.
 	// Layout: FM7 sled (0-231) + 12-byte Horizon block + dash section.
-	// We fill IsRaceOn, timestamp, RPM trio, forward velocity, Speed, gear.
-	// Game RPM is internal tach units (crusnusa redline ~912): x8 puts the
-	// needle in a believable 0-7300 band under EngineMaxRpm 7500.
+	// RPM fields remain zero: this legacy packet has no per-signal validity
+	// field. JSON/diagnostics publish rpm_status=0 and omit the RPM value.
 	if (s_forza_n > 0 && s_telem_sock != INVALID_SOCKET)
 	{
 		float const mph = telem_mph;   // gated above
-		float const rpm = telem_rpm;
 		uint8_t pkt[324] = { 0 };
 		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
 		const int32_t one = 1;
-		const float maxrpm = 7500.0f, idlerpm = 700.0f;
-		// per-game scale maps raw tach units into the 0..7500 dash band;
-		// clamp so transient junk never pegs the gauge
-		const float currpm = std::min(rpm * s_rpm_fscale, maxrpm);
 		const float spd_ms = mph * 0.44704f;
 		s_forza_ms += 17;
 		put32(0, &one);              // IsRaceOn
 		put32(4, &s_forza_ms);       // TimestampMS
-		put32(8, &maxrpm);           // EngineMaxRpm
-		put32(12, &idlerpm);         // EngineIdleRpm
-		put32(16, &currpm);          // EngineCurrentRpm
 		put32(40, &spd_ms);          // VelocityZ (forward, m/s)
 		put32(256, &spd_ms);         // Speed (m/s, FH dash offset)
 		// Gear: mirror the REAL latched shifter (driver-maintained state,
