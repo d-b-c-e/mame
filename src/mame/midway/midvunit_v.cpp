@@ -124,11 +124,14 @@ struct midv_live
 	{
 		if (!std::getenv("MIDV_LIVE") && !std::getenv("MIDV_GL"))
 			return;
+		std::string tag = "Local\\MIDV_LIVE";
+		if (std::getenv("MIDV_GL")) tag += "_" + std::to_string(GetCurrentProcessId());
 		HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr,
-			PAGE_READWRITE, 0, HDR_SIZE + RING_SIZE, "Local\\MIDV_LIVE");
+			PAGE_READWRITE, 0, HDR_SIZE + RING_SIZE, tag.c_str());
 		if (!h)
 			return;
 		base = (volatile uint8_t *)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+		CloseHandle(h);
 		if (!base)
 			return;
 		if (const char *e = std::getenv("MIDV_GL_QUEUE_MB"))
