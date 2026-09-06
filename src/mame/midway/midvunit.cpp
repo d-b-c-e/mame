@@ -202,6 +202,7 @@ void midv_patches_tick(uint32_t *ram)
 
 void midvunit_base_state::machine_reset()
 {
+	reset_display_assets();
 	m_dcs->reset_w(0);
 	m_dcs->reset_w(1);
 

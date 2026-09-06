@@ -14,6 +14,7 @@
 #include "cruisn/hud_numeric_speed.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/tjunctions.h"
+#include "cruisn/retained_texture.h"
 
 #include "williamssound.h"
 
@@ -119,6 +120,9 @@ struct midv_live
 	bool tex_dirty = true;    // force initial snapshots
 	bool pal_dirty = true;
 	uint32_t last_frame = 0;
+	cruisn::retained_texture ui_assets;
+	std::vector<uint8_t> texture_upload;
+	bool retain_ui_assets = false;
 
 	// coalescing buffer for CPU videoram writes
 	uint32_t span_start = 0xffffffff;
@@ -149,6 +153,10 @@ struct midv_live
 		dropped = (volatile uint64_t *)(base + 24);
 		data = (uint8_t *)(base + HDR_SIZE);
 		enabled = true;
+		const char *scale = std::getenv("MIDV_GL_SCALE");
+		const char *ui = std::getenv("MIDV_GL_UI_ASSETS");
+		retain_ui_assets = std::getenv("MIDV_GL") && (!scale || atoi(scale) > 1)
+			&& (!ui || atoi(ui) != 0);
 	}
 
 	bool write_msg(uint32_t type, const void *p1, uint32_t l1,
@@ -219,8 +227,19 @@ struct midv_live
 		flush_span();
 		if (pal_dirty && write_msg(3, &frame, 4, pal, pal_len))
 			pal_dirty = false;
-		if (tex_dirty && write_msg(4, &frame, 4, tex, tex_len))
-			tex_dirty = false;   // stays dirty on drop; retried next scene
+		if (tex_dirty)
+		{
+			const void *upload = tex;
+			if (ui_assets.active())
+			{
+				const uint8_t *source = static_cast<const uint8_t *>(tex);
+				texture_upload.assign(source, source + tex_len);
+				ui_assets.apply(texture_upload.data(), texture_upload.size());
+				upload = texture_upload.data();
+			}
+			if (write_msg(4, &frame, 4, upload, tex_len))
+				tex_dirty = false;   // stays dirty on drop; retried next scene
+		}
 	}
 };
 
@@ -2512,6 +2531,18 @@ void midvunit_base_state::video_start()
 void midvunit_base_state::device_post_load()
 {
 	m_video_changed = true;
+	reset_display_assets();
+}
+
+void midvunit_base_state::reset_display_assets()
+{
+#ifdef _WIN32
+	if (std::getenv("MIDV_GL"))
+	{
+		live().ui_assets.release();
+		live().tex_dirty = true;
+	}
+#endif
 }
 
 /*************************************
@@ -3048,6 +3079,20 @@ void midvunit_base_state::textureram_w(offs_t offset, uint32_t data)
 {
 	uint8_t *const base = (uint8_t *)m_textureram.target();
 	m_poly->wait("Texture RAM write");
+#ifdef _WIN32
+	// World 2.4 loads level textures over the still-linked transmission UI.
+	// Retain the outgoing atlas for enhanced presentation ONLY. Guest RAM,
+	// DMA, instruction timing and native snapshots remain untouched.
+	if (offset * 2 >= 0x393000 && offset * 2 < 0x3c1000
+		&& live().enabled && live().retain_ui_assets && !live().ui_assets.active()
+		&& !strcmp(machine().system().name, "crusnwld24")
+		&& cruisn::world24_transmission_visible(m_ram_base, m_ram_base.bytes() / 4))
+	{
+		live().ui_assets.capture(base, m_textureram.bytes(), 0x393000, 0x2e000);
+		osd_printf_info("MIDV UI assets retained: frame=%llu World 2.4 transmission\n",
+			(unsigned long long)m_screen->frame_number());
+	}
+#endif
 	base[offset * 2] = data;
 	base[offset * 2 + 1] = data >> 8;
 	live().tex_dirty = true;
@@ -3074,6 +3119,16 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	uint32_t offset;
 
 	m_poly->wait("Refresh Time");
+#ifdef _WIN32
+	if (live().ui_assets.active()
+		&& !cruisn::world24_transmission_visible(m_ram_base, m_ram_base.bytes() / 4))
+	{
+		live().ui_assets.release();
+		live().tex_dirty = true;
+		osd_printf_info("MIDV UI assets released: frame=%llu\n",
+			(unsigned long long)screen.frame_number());
+	}
+#endif
 
 	// POC: the games' startup code re-copies the low program words from
 	// ROM after machine_reset applied MIDV_PATCH - re-assert reverted
