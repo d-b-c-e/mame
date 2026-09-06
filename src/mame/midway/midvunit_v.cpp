@@ -1156,14 +1156,12 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(prog, "texMask"), (8 << 20) - 1);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uDbgQuadId"), 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipW"), WIDE);
-	// suppress the sky/horizon backdrop inside the 16:9 margins (leaves it
-	// for the margin-extend to fill from the 4:3 boundary - sky above,
-	// terrain below - covering the "water through the ground" reveal).
-	// Shares the crack/margin-fill gate; MIDV_GL_CRACKFILL=0 or
-	// MIDV_GL_MARGINFILL=0 disables it.
-	bool const bg_gate =
-		!(std::getenv("MIDV_GL_CRACKFILL") && atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0)
-		&& !(std::getenv("MIDV_GL_MARGINFILL") && atoi(std::getenv("MIDV_GL_MARGINFILL")) == 0);
+	// Legacy margin suppression/column stretching destroyed valid skies in
+	// recorded World/Off Road races. Retain it only as an explicit experiment.
+	bool const margin_on = std::getenv("MIDV_GL_MARGINFILL")
+		&& atoi(std::getenv("MIDV_GL_MARGINFILL")) == 1;
+	bool const bg_gate = margin_on &&
+		!(std::getenv("MIDV_GL_CRACKFILL") && atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uBgMargin"), bg_gate ? MARGIN : 0);
 	gl.UseProgram(pal);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
@@ -1175,15 +1173,11 @@ void thread_main()
 	int const uSrcH = gl.GetUniformLocation(pal, "uSrcH");
 	int const uFillR = gl.GetUniformLocation(pal, "uFillR");
 	bool crt = std::getenv("MIDV_GL_CRT") && atoi(std::getenv("MIDV_GL_CRT")) != 0;
-	// crack fill defaults ON (a pure improvement: only pixels the scene
-	// never wrote are touched); MIDV_GL_CRACKFILL=0 restores raw hardware
+	// Local crack fill remains a cosmetic option; missing geometry and
+	// intentional gaps cannot be distinguished by coverage alone.
 	bool const fill_on = !(std::getenv("MIDV_GL_CRACKFILL")
 			&& atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0);
-	// margin extend: clamp-stretch the hardware-boundary column into
-	// unwritten margin pixels (black holes where 4:3-era culling never
-	// drew). MIDV_GL_MARGINFILL=0 disables independently of crack fill.
-	bool const margin_on = !(std::getenv("MIDV_GL_MARGINFILL")
-			&& atoi(std::getenv("MIDV_GL_MARGINFILL")) == 0);
+	// Explicit legacy margin experiment shares the local fill prerequisite.
 	gl.Uniform1i(uCrt, crt ? 1 : 0);
 	gl.Uniform1f(uSrcH, float(H));
 	gl.Uniform1i(gl.GetUniformLocation(pal, "maskTex"), 3);
