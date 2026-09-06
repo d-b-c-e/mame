@@ -11,6 +11,7 @@
 #include "midvunit.h"
 #include "midvunit_hud_ocr.h"
 #include "cruisn/hud_speed_filter.h"
+#include "cruisn/hud_numeric_speed.h"
 
 #include "williamssound.h"
 
@@ -308,7 +309,7 @@ static void telem_notify(const char *outname, s32 value, void *)
 }
 
 // ---- HUD OCR speed (Phase B final form) -----------------------------------
-// The player's displayed speed exists in NO memory (see RESULTS.md saga);
+// USA numeric HUD text is now traced; other games still use OCR (see RESULTS.md).
 // the HUD digits are CPU-blitted into videoram. So read them back: decode
 // the MPH box glyphs from the visible page each frame against the baked
 // templates (validated offline: 822/823 agreement with the calibration
@@ -350,6 +351,10 @@ static const HudBox s_hud_box[] = {
 };
 static const HudBox *s_hud = nullptr;   // resolved at telem_init
 static cruisn::HudSpeedFilter s_hud_speed;
+static int s_numeric_mph[2] = { -1, -1 };
+static uint64_t s_numeric_frame[2] = { 0, 0 };
+static double s_numeric_seconds[2] = { 0, 0 };
+static bool s_numeric_seen[2] = { false, false };
 
 static int hud_ocr_digit(const float *cell, int ch, int cw)
 {
@@ -486,7 +491,7 @@ struct SpeedAddr { const char *game; uint32_t addr; };
 // investigation (2026-08-23, RESULTS.md) proved the earlier attract-hunted
 // addresses (crusnusa 0x0F22D, crusnwld 0x0DDDC) track DRONE cars, not the
 // player - attract demos are drone-driven, so shape-hunting them lies. The
-// player's displayed speed is computed transiently (it lives in NO dumped
+// player's physics speed was not identified in the earlier searches (the dumped
 // memory: both external banks + C31 internal RAM, all decodings, r<0.55).
 // The replacement is the HUD-quad DMA tap (reads the MPH digits at the
 // source); until it lands, emitting 0 beats emitting another car.
@@ -2380,6 +2385,7 @@ static void start(running_machine &machine)
 } // namespace mvffb
 
 static FILE *s_force_source = nullptr;
+static FILE *s_signal_trace = nullptr;
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
 {
 	if (s_force_source)
@@ -2433,7 +2439,15 @@ void midv_telemetry_start(running_machine &machine)
 			}));
 		}
 	}
-
+	if (const char *path = std::getenv("MIDV_SIGNAL_TRACE")) {
+		s_signal_trace = fopen(path, "w");
+		if (s_signal_trace) {
+			fprintf(s_signal_trace, "# schema=1 clock=emulated signal=speed unit=metres_per_second\nseconds,frame,source,quality,sample_seconds,sample_frame,value\n");
+			machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () {
+				fclose(s_signal_trace); s_signal_trace = nullptr;
+			}));
+		}
+	}
 	mvffb::start(machine);   // POC built-in force feedback (MIDV_FFB=1)
 	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
 	if (telem_spec || std::getenv("MIDV_TELEM_FORZA") || std::getenv("MIDV_FFB_TRACE"))
@@ -2698,10 +2712,28 @@ void midvunit_renderer::make_vertices_inclusive(vertex_t *vert)
 static uint32_t s_last_scene_quads = 0;
 static uint32_t s_cur_frame_quads = 0, s_cur_frame_no = 0xffffffff;
 
-
+void midvunit_base_state::observe_numeric_hud()
+{
+	// USA v4.5: numeric text buffer produced by A7C2 and consumed by 7A91.
+	// Accept only the foreground speed digits actually submitted on this page.
+	// Opcodes guard the ROM revision; the short lifetime rejects retained menu text.
+	static bool const numeric_rom = strcmp(machine().system().name, "crusnusa") == 0;
+	const auto &dq = m_dma_data;
+	if (numeric_rom && dq[0] == 0x900 && dq[14] == 0x2f8b && dq[3] == 346 &&
+		dq[7] == 368 && dq[2] >= 14 && dq[4] <= 72 &&
+		m_ram_base[0xa7c2] == 0x1541c200 && m_ram_base[0x7a91] == 0x0848c200)
+	{
+		int const pg = (m_page_control & 4) ? 1 : 0;
+		s_numeric_mph[pg] = cruisn::packed_hud_speed(m_ram_base[0xe632]);
+		s_numeric_frame[pg] = m_screen->frame_number();
+		s_numeric_seconds[pg] = machine().time().as_double();
+		s_numeric_seen[pg] = true;
+	}
+}
 
 void midvunit_renderer::process_dma_queue()
 {
+	m_state.observe_numeric_hud();
 	{
 		uint32_t const fr = uint32_t(m_state.m_screen->frame_number());
 		if (fr != s_cur_frame_no)
@@ -3087,6 +3119,38 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		int const mph = hud_ocr_mph(&m_videoram[0], m_page_control, s_hud);
 		telem_mph = float(s_hud_speed.observe(mph));
 	}
+	int const numeric_page = (m_page_control & 1) ? 1 : 0;
+	uint64_t const numeric_age = screen.frame_number() - s_numeric_frame[numeric_page];
+	int const numeric_mph = s_numeric_seen[numeric_page] && numeric_age <= 3 ? s_numeric_mph[numeric_page] : -1;
+	bool const numeric_enabled = !std::getenv("MIDV_SPEED_NUMERIC") || atoi(std::getenv("MIDV_SPEED_NUMERIC")) != 0;
+	bool const numeric_used = numeric_enabled && numeric_mph >= 0;
+	if (numeric_used) telem_mph = float(numeric_mph);
+	// Versioned shared sample contract. Held OCR retains its actual acceptance
+	// timestamp; an unavailable value is distinguishable from a measured zero.
+	static dbce::telemetry::SignalSample speed_sample;
+	if (numeric_used) {
+		speed_sample.source = dbce::telemetry::Source::numeric_hud;
+		speed_sample.quality = numeric_age ? dbce::telemetry::Quality::held : dbce::telemetry::Quality::fresh;
+		speed_sample.seconds = s_numeric_seconds[numeric_page];
+		speed_sample.frame = s_numeric_frame[numeric_page];
+		speed_sample.value = double(telem_mph) * .44704;
+	} else if (s_hud && s_hud_speed.has_value) {
+		if (s_hud_speed.fresh || speed_sample.source != dbce::telemetry::Source::hud_ocr) {
+			speed_sample.seconds = machine().time().as_double();
+			speed_sample.frame = screen.frame_number();
+		}
+		speed_sample.source = dbce::telemetry::Source::hud_ocr;
+		speed_sample.quality = s_hud_speed.fresh ? dbce::telemetry::Quality::fresh : dbce::telemetry::Quality::held;
+		speed_sample.value = double(telem_mph) * .44704;
+	} else {
+		speed_sample = dbce::telemetry::SignalSample{};
+	}
+	speed_sample.unit = dbce::telemetry::Unit::metres_per_second;
+	if (s_signal_trace)
+		fprintf(s_signal_trace, "%.9f,%llu,%d,%d,%.9f,%llu,%.9f\n", machine().time().as_double(),
+			(unsigned long long)screen.frame_number(), int(speed_sample.source), int(speed_sample.quality),
+			speed_sample.seconds, (unsigned long long)speed_sample.frame, speed_sample.value);
+
 
 	if (s_rpm_word)
 	{
@@ -3126,6 +3190,8 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		telem_notify("speed", s32(telem_mph + 0.5f), nullptr);
 	if (s_ffb_trace)
 	{
+		telem_notify("speed_numeric_hud", numeric_mph, nullptr);
+		telem_notify("speed_source", numeric_used ? 2 : (s_hud && s_hud_speed.status() ? 1 : 0), nullptr);
 		telem_notify("speed_cells", s_hud_cells, nullptr);
 		telem_notify("speed_leftcol", s_hud_leftcol, nullptr);
 		telem_notify("speed_ocr_reading", s_hud ? s_hud_speed.raw : -1, nullptr);

@@ -62,6 +62,7 @@ private:
 class midvunit_base_state : public driver_device
 {
 public:
+	void observe_numeric_hud();
 	uint16_t m_page_control = 0;
 	uint16_t m_dma_data[16]{};
 	uint8_t m_video_changed = 0;
