@@ -37,7 +37,9 @@ struct midvunit_object_data
 void midv_patches_tick(uint32_t *ram);
 // POC: built-in force feedback - the drivers hand over the signed motor byte
 // (see mvffb in midvunit_v.cpp); inert unless MIDV_FFB=1
+void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds);
 void midv_ffb_write(int f);
+void midv_ffb_cancel();
 
 class midvunit_base_state;
 

@@ -227,6 +227,7 @@ private:
  *************************************/
 
 void midv_telemetry_start(running_machine &machine);   // midvunit_v.cpp (POC)
+void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds);
 void midv_ffb_write(int f);                             // midvunit_v.cpp (POC built-in FFB)
 
 void midzeus_state::machine_start()
@@ -745,6 +746,7 @@ void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 				f = std::clamp(f, -s_clamp, s_clamp);
 			s_prev = f;
 			m_wheel_motor = uint8_t(int8_t(f));
+			midv_ffb_source(int(int8_t(data & 0xff)), f, m_screen->frame_number(), machine().time().as_double());
 			midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)
 			break;
 		}

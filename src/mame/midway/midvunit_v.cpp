@@ -43,6 +43,8 @@
 // motor byte, so there is no force model to run. See dbce/README.md.
 #include "dbce/force_model.h"
 #include "dbce/force_profile.h"
+#include "dbce/impact_mixer.h"
+#include "dbce/signal_sample.h"
 #include <mutex>
 #include <condition_variable>
 #include <cmath>
@@ -1357,7 +1359,7 @@ void thread_main()
 			{
 				menu_open = !menu_open;
 				if (menu_open)
-					midv_ffb_write(0);   // POC: drop the wheel force the moment the menu opens
+					midv_ffb_cancel();   // POC: drop the wheel force the moment the menu opens
 			}
 			bool const up = edge(VK_UP, up_prev);
 			bool const dn = edge(VK_DOWN, down_prev);
@@ -1853,6 +1855,8 @@ static std::condition_variable s_cv;
 static bool s_dirty = false;
 static std::thread s_thread;
 static int s_strength = 100;
+static std::atomic<bool> s_cancel_impact{false};
+static bool s_impact_axis = false; // explicit opt-in; physical acceptance pending
 static bool s_invert = false;
 static int s_hold_ms = 500;
 static int s_smooth_ms = 0;   // MIDV_FFB_SMOOTH: first-order low-pass time constant
@@ -2207,7 +2211,7 @@ static void worker()
 		if (s_smooth_set)
 			prof.shaper.smoothing_ms = float(s_smooth_ms);
 		// Their FFB STRENGTH is a plain percent; shaper.strength is 50-is-unity.
-		prof.shaper.strength = std::clamp(s_strength / 2, 0, 100);
+		prof.shaper.strength = s_impact_axis ? 50 : std::clamp(s_strength / 2, 0, 100);
 		prof.shaper.invert = false;   // sign is applied in midv_ffb_write
 		flog("shaper: strength %d (from %d%%), smoothing %.0f ms, impulse %.2f, "
 				"settle %.5f, releveling %.5f",
@@ -2218,21 +2222,24 @@ static void worker()
 
 	auto last_tick = std::chrono::steady_clock::now();
 	dbce::force::RiseDetector impact_detector;
+	dbce::force::ImpactMixer impact_mixer;
 	while (!s_stop.load())
 	{
 		{
 			std::unique_lock<std::mutex> lk(s_mtx);
-			s_cv.wait_for(lk, std::chrono::milliseconds(prof.shaper.smoothing_ms > 0 ? 4 : 20), [] { return s_stop.load() || s_dirty; });
+			s_cv.wait_for(lk, std::chrono::milliseconds((s_impact_axis || prof.shaper.smoothing_ms > 0) ? 4 : 20), [] { return s_stop.load() || s_dirty; });
 			s_dirty = false;
 		}
 		if (s_stop.load())
 			break;
 		int want = s_level.load();
+		if (s_cancel_impact.exchange(false)) { impact_mixer.reset(); impact_detector.reset(); }
 		if (s_hold_ms > 0 && want != 0 && now_ms() - s_last_write.load() > s_hold_ms)
 		{
 			want = 0;
 			s_level.store(0);
 			impact_detector.reset();
+			impact_mixer.reset();
 			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
 			if (!hold_said) { flog("no motor write for %d ms - force released", s_hold_ms); hold_said = true; }
 		}
@@ -2250,7 +2257,9 @@ static void worker()
 			// SDL's generic rumble backend still needs wheel-specific evaluation.
 			// Normal zero writes do not cut a 120 ms cue short; watchdog/exit do.
 			int result = -1;
-			if (rumble_ok)
+			if (s_impact_axis)
+				impact_mixer.trigger(impact_detector.last_arrival, float(want), double(now_ms()) / 1000.0);
+			if (rumble_ok && !s_impact_axis)
 			{
 				float const amplitude = impact_detector.last_arrival * float(s_rumble) / 100.f
 					* float(s_strength) / 100.f;
@@ -2274,7 +2283,9 @@ static void worker()
 		double const dt_ms = std::chrono::duration<double, std::milli>(now - last_tick).count();
 		last_tick = now;
 		float const shaped = shaper.shape(float(want) / 32767.f, 0.f, float(dt_ms / 1000.0), false);
-		int const out = int(std::lround(double(shaped) * 32767.0));
+		float const mixed = s_impact_axis ? impact_mixer.mix(shaped, double(now_ms()) / 1000.0,
+			float(s_strength) / 100.f) : shaped;
+		int const out = int(std::lround(double(mixed) * 32767.0));
 		if (out != applied)
 		{
 			// Trace our SHAPED output beside the game's motor byte, so a run of
@@ -2290,6 +2301,11 @@ static void worker()
 				fflush(s_ffb_trace);
 			}
 			apply(d, out, running, applied);
+			if (s_ffb_trace) {
+				auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - s_ffb_trace_t0).count();
+				fprintf(s_ffb_trace, "%lld,constant_api_accepted,%d\n", (long long)ms, applied == out);
+			}
 		}
 	}
 	apply(d, 0, running, applied);
@@ -2322,6 +2338,7 @@ static void start(running_machine &machine)
 	if (!on || atoi(on) == 0)
 		return;
 	s_t0 = std::chrono::steady_clock::now();
+	s_impact_axis = std::getenv("MIDV_FFB_IMPACT") && atoi(std::getenv("MIDV_FFB_IMPACT")) == 1;
 	if (const char *l = std::getenv("MIDV_FFB_LOG"))
 		s_loglevel = atoi(l);
 	s_log = fopen("midv_ffb.log", "w");
@@ -2347,7 +2364,7 @@ static void start(running_machine &machine)
 		s_friction = std::clamp(atoi(s), 0, 100);
 	if (const char *s = std::getenv("MIDV_FFB_RUMBLE"))
 		s_rumble = std::clamp(atoi(s), 0, 100);
-	flog("built-in force feedback for %s", machine.system().name);
+	flog("built-in force feedback for %s; steering impact enhancement=%d", machine.system().name, int(s_impact_axis));
 	if (s_strength == 0)
 	{
 		flog("strength 0 - force feedback off");
@@ -2362,7 +2379,16 @@ static void start(running_machine &machine)
 
 } // namespace mvffb
 
+static FILE *s_force_source = nullptr;
+void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
+{
+	if (s_force_source)
+		fprintf(s_force_source, "%.9f,%llu,%d,%d\n", seconds,
+			(unsigned long long)frame, raw, adapted);
+}
+
 // Motor byte from the drivers (signed, after gain/slew/clamp). Any thread.
+void midv_ffb_cancel() { mvffb::s_cancel_impact.store(true); midv_ffb_write(0); }
 void midv_ffb_write(int f)
 {
 	if (!mvffb::s_running.load())
@@ -2398,6 +2424,16 @@ void midv_telemetry_start(running_machine &machine)
 	if (s_started)
 		return;
 	s_started = true;
+	if (const char *path = std::getenv("MIDV_FFB_SOURCE_TRACE")) {
+		s_force_source = fopen(path, "w");
+		if (s_force_source) {
+			fprintf(s_force_source, "# schema=1 game=%s units=signed_motor_byte clock=emulated\nseconds,frame,raw,adapted\n", machine.system().name);
+			machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () {
+				fclose(s_force_source); s_force_source = nullptr;
+			}));
+		}
+	}
+
 	mvffb::start(machine);   // POC built-in force feedback (MIDV_FFB=1)
 	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
 	if (telem_spec || std::getenv("MIDV_TELEM_FORZA") || std::getenv("MIDV_FFB_TRACE"))
@@ -2661,6 +2697,8 @@ void midvunit_renderer::make_vertices_inclusive(vertex_t *vert)
 // per-frame DMA quad count (emu thread), for the MINQUADS statedump trigger
 static uint32_t s_last_scene_quads = 0;
 static uint32_t s_cur_frame_quads = 0, s_cur_frame_no = 0xffffffff;
+
+
 
 void midvunit_renderer::process_dma_queue()
 {
@@ -3049,6 +3087,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		int const mph = hud_ocr_mph(&m_videoram[0], m_page_control, s_hud);
 		telem_mph = float(s_hud_speed.observe(mph));
 	}
+
 	if (s_rpm_word)
 	{
 		static uint32_t s_rpm_bits = 0;
