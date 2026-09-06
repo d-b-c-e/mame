@@ -13,6 +13,7 @@
 #include "cruisn/hud_speed_filter.h"
 #include "cruisn/hud_numeric_speed.h"
 #include "cruisn/motor_signal.h"
+#include "cruisn/tjunctions.h"
 
 #include "williamssound.h"
 
@@ -781,9 +782,11 @@ static void dilate_rect(float *vx, float *vy, const int16_t *ix, const int16_t *
 	vy[sy[1][0]] += ey; vy[sy[1][1]] += ey;
 }
 
-static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
-	std::vector<float> &fdata, std::vector<uint32_t> &udata)
+static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
+	std::vector<float> &fdata, std::vector<uint32_t> &udata, bool align_joins)
 {
+	cruisn::JoinResult joined;
+	if (align_joins) joined = cruisn::align_tjunctions(quads.size(), [&](size_t q) { return quads[q].dma; });
 	fdata.resize(quads.size() * 6 * 22);
 	udata.resize(quads.size() * 6 * 4);
 	for (size_t q = 0; q < quads.size(); q++)
@@ -794,6 +797,11 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 		{
 			vx[i] = float(int16_t(dma[2 + i * 2])) + 0.5f + xoff;
 			vy[i] = float(int16_t(dma[3 + i * 2])) + 0.5f;
+		}
+		if (align_joins) for (int i=0;i<4;++i)
+		{
+			vx[i]=joined.positions[q][i*2]+0.5f+xoff;
+			vy[i]=joined.positions[q][i*2+1]+0.5f;
 		}
 		uint32_t pixdata = dma[1];
 		bool const textured = (dma[0] & 0x300) == 0x100;
@@ -880,6 +888,7 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			u[0] = pixdata; u[1] = mode; u[2] = dither; u[3] = uint32_t(dma[14]) * 256;
 		}
 	}
+	return joined.aligned;
 }
 
 // ---- the render thread ----
@@ -1134,6 +1143,9 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipW"), WIDE);
 	// Legacy margin suppression/column stretching destroyed valid skies in
 	// recorded World/Off Road races. Retain it only as an explicit experiment.
+	bool const align_joins = S > 1 && std::getenv("MIDV_GL_TJUNCTIONS")
+		&& atoi(std::getenv("MIDV_GL_TJUNCTIONS")) == 1;
+	uint64_t n_aligned = 0;
 	bool const margin_on = std::getenv("MIDV_GL_MARGINFILL")
 		&& atoi(std::getenv("MIDV_GL_MARGINFILL")) == 1;
 	bool const bg_gate = margin_on &&
@@ -1234,7 +1246,7 @@ void thread_main()
 		int const pg = (run_pc & 4) ? 1 : 0;
 		bool const new_scene = active_pc != run_pc;
 		if (new_scene) { quad_count[pg] = 0; scene_axis[pg] = 0; active_pc = run_pc; }
-		build_vertices(run, float(MARGIN), fdata, udata);
+		n_aligned += build_vertices(run, float(MARGIN), fdata, udata, align_joins);
 		quad_count[pg] += int(run.size());
 		cpu_written[pg] = 0;
 		// 2D screens (menus, high scores) are drawn almost entirely from
@@ -1632,6 +1644,7 @@ void thread_main()
 			fclose(f);
 		}
 	}
+	logf("T-junction alignment enabled=%d vertices=%llu", int(align_joins), (unsigned long long)n_aligned);
 	logf("%s after %llu presents, %d snaps",
 		s_stop.load() ? "machine exit" : "parent gone or failed stream",
 		(unsigned long long)presents, snap_n);
