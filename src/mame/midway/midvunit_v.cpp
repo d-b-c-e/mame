@@ -775,7 +775,7 @@ static void dilate_rect(float *vx, float *vy, const int16_t *ix, const int16_t *
 static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 	std::vector<float> &fdata, std::vector<uint32_t> &udata)
 {
-	fdata.resize(quads.size() * 6 * 18);
+	fdata.resize(quads.size() * 6 * 22);
 	udata.resize(quads.size() * 6 * 4);
 	for (size_t q = 0; q < quads.size(); q++)
 	{
@@ -837,6 +837,9 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			default: mode = 0; pixdata = (pixdata + (dma[0] & 0xff)) & 0xffff; break;
 			}
 		}
+		float const bounds[4] = {
+			*std::min_element(us, us + 4), *std::max_element(us, us + 4),
+			*std::min_element(vs, vs + 4), *std::max_element(vs, vs + 4) };
 		make_inclusive(vx, vy);
 		{
 			// the live overlay is always quality mode; exact/DDA replay
@@ -858,11 +861,12 @@ static void build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 		const float cy[6] = { y0, y0, y1, y0, y1, y1 };
 		for (int k = 0; k < 6; k++)
 		{
-			float *f = &fdata[(q * 6 + k) * 18];
+			float *f = &fdata[(q * 6 + k) * 22];
 			f[0] = cx[k]; f[1] = cy[k];
 			for (int i = 0; i < 4; i++) { f[2 + i * 2] = vx[i]; f[3 + i * 2] = vy[i]; }
 			f[10] = us[0]; f[11] = vs[0]; f[12] = us[1]; f[13] = vs[1];
 			f[14] = us[2]; f[15] = vs[2]; f[16] = us[3]; f[17] = vs[3];
+			for (int i = 0; i < 4; i++) f[18 + i] = bounds[i];
 			uint32_t *u = &udata[(q * 6 + k) * 4];
 			u[0] = pixdata; u[1] = mode; u[2] = dither; u[3] = uint32_t(dma[14]) * 256;
 		}
@@ -1089,16 +1093,16 @@ void thread_main()
 	gl.GenBuffers(1, &vbo_u);
 	gl.BindVertexArray(vao);
 	gl.BindBuffer(ARRAY_BUFFER, vbo_f);
-	const char *fattr[] = { "in_corner", "in_v0", "in_v1", "in_v2", "in_v3", "in_uv01", "in_uv23" };
-	int const fsize[] = { 2, 2, 2, 2, 2, 4, 4 };
+	const char *fattr[] = { "in_corner", "in_v0", "in_v1", "in_v2", "in_v3", "in_uv01", "in_uv23", "in_uvBounds" };
+	int const fsize[] = { 2, 2, 2, 2, 2, 4, 4, 4 };
 	int off = 0;
-	for (int i = 0; i < 7; i++)
+	for (int i = 0; i < 8; i++)
 	{
 		int loc = gl.GetAttribLocation(prog, fattr[i]);
 		if (loc >= 0)
 		{
 			gl.EnableVertexAttribArray(loc);
-			gl.VertexAttribPointer(loc, fsize[i], 0x1406 /*FLOAT*/, 0, 18 * 4,
+			gl.VertexAttribPointer(loc, fsize[i], 0x1406 /*FLOAT*/, 0, 22 * 4,
 				(const void *)(uintptr_t)(off * 4));
 		}
 		off += fsize[i];
