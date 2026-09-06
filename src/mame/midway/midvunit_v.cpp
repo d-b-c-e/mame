@@ -12,6 +12,7 @@
 #include "midvunit_hud_ocr.h"
 #include "cruisn/hud_speed_filter.h"
 #include "cruisn/hud_numeric_speed.h"
+#include "cruisn/motor_signal.h"
 
 #include "williamssound.h"
 
@@ -1855,6 +1856,7 @@ static bool s_dirty = false;
 static std::thread s_thread;
 static int s_strength = 100;
 static std::atomic<bool> s_cancel_impact{false};
+static std::atomic<int> s_raw_level{0};
 static bool s_impact_axis = false; // explicit opt-in; physical acceptance pending
 static bool s_invert = false;
 static int s_hold_ms = 500;
@@ -2232,13 +2234,14 @@ static void worker()
 		if (s_stop.load())
 			break;
 		int want = s_level.load();
-		if (s_cancel_impact.exchange(false)) { impact_mixer.reset(); impact_detector.reset(); }
+		if (s_cancel_impact.exchange(false)) { impact_mixer.reset(); impact_detector.reset(); shaper.reset(); }
 		if (s_hold_ms > 0 && want != 0 && now_ms() - s_last_write.load() > s_hold_ms)
 		{
 			want = 0;
 			s_level.store(0);
 			impact_detector.reset();
 			impact_mixer.reset();
+			s_raw_level.store(0);
 			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
 			if (!hold_said) { flog("no motor write for %d ms - force released", s_hold_ms); hold_said = true; }
 		}
@@ -2248,7 +2251,8 @@ static void worker()
 		// including idle: changed-nonzero-only history missed an isolated hit and
 		// dividing this ungained level by a gained maximum changed classification
 		// whenever the player moved the strength slider.
-		bool const impact_candidate = impact_detector.observe(float(want) / 32767.f,
+		int const candidate_level = s_impact_axis ? s_raw_level.load() : want;
+		bool const impact_candidate = impact_detector.observe(float(candidate_level) / 32767.f,
 			double(now_ms()) / 1000.0);
 		if (impact_candidate)
 		{
@@ -2257,7 +2261,7 @@ static void worker()
 			// Normal zero writes do not cut a 120 ms cue short; watchdog/exit do.
 			int result = -1;
 			if (s_impact_axis)
-				impact_mixer.trigger(impact_detector.last_arrival, float(want), double(now_ms()) / 1000.0);
+				impact_mixer.trigger(impact_detector.last_arrival, float(candidate_level), double(now_ms()) / 1000.0);
 			if (rumble_ok && !s_impact_axis)
 			{
 				float const amplitude = impact_detector.last_arrival * float(s_rumble) / 100.f
@@ -2382,34 +2386,19 @@ static FILE *s_force_source = nullptr;
 static FILE *s_signal_trace = nullptr;
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
 {
+	mvffb::s_raw_level.store(cruisn::motor_level(raw, mvffb::s_invert));
 	if (s_force_source)
 		fprintf(s_force_source, "%.9f,%llu,%d,%d\n", seconds,
 			(unsigned long long)frame, raw, adapted);
 }
 
 // Motor byte from the drivers (signed, after gain/slew/clamp). Any thread.
-void midv_ffb_cancel() { mvffb::s_cancel_impact.store(true); midv_ffb_write(0); }
+void midv_ffb_cancel() { mvffb::s_raw_level.store(0); mvffb::s_cancel_impact.store(true); midv_ffb_write(0); }
 void midv_ffb_write(int f)
 {
 	if (!mvffb::s_running.load())
 		return;
-	int level = 0;
-	if (f != 0 && f != -128)
-	{
-		double p = std::min(1.0, double(f < 0 ? -f : f) / 126.0);
-		// Un-gained on purpose since the toolkit conversion: the shaper owns the
-		// gain now (shaper.strength), so applying it here as well would square it.
-		level = int(p * 32767.0 + 0.5);
-		// Sign. Measured 2026-09-03 with the game's own spring (Exotica parked
-		// left of centre writes +58, right of centre -70: a positive byte
-		// pushes the wheel RIGHT) and with a raw level on the Moza R12 (a
-		// positive SDL steering-axis level turns it LEFT). So a positive byte
-		// becomes a negative level; MIDV_FFB_INVERT flips it for a base whose
-		// axis sign runs the other way (the symptom: the wheel runs away from
-		// centre in Exotica, shakes in USA).
-		if ((f > 0) != mvffb::s_invert)
-			level = -level;
-	}
+	int const level = cruisn::motor_level(f, mvffb::s_invert);
 	if (mvffb::s_loglevel >= 2)
 		mvffb::flog("write %d -> level %d", f, level);
 	mvffb::s_level.store(level);
@@ -2444,7 +2433,7 @@ void midv_telemetry_start(running_machine &machine)
 	}
 	mvffb::start(machine);   // POC built-in force feedback (MIDV_FFB=1)
 	const char *telem_spec = std::getenv("MIDV_TELEM_UDP");
-	if (telem_spec || std::getenv("MIDV_TELEM_FORZA") || std::getenv("MIDV_FFB_TRACE"))
+	if (telem_spec || std::getenv("MIDV_TELEM_FORZA") || std::getenv("MIDV_FFB_TRACE") || std::getenv("MIDV_SIGNAL_TRACE"))
 		telem_init(telem_spec, machine.system().name);
 	if (const char *tr = std::getenv("MIDV_FFB_TRACE"))
 	{
