@@ -23,6 +23,7 @@
 **************************************************************************/
 
 #include "emu.h"
+#include "cruisn/motor_signal.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -845,12 +846,8 @@ void midvunit_state::wheel_board_w(uint32_t data)
 							if (s_slew < 0 || s_slew > 127)
 								s_slew = 0;
 						}
-						int f = int(int8_t(arg));
-						if (s_slew > 0)
-							f = s_prev + std::clamp(f - s_prev, -s_slew, s_slew);
-						if (s_clamp > 0)
-							f = std::clamp(f, -s_clamp, s_clamp);
-						s_prev = f;
+						int const f = cruisn::adapt_motor_byte(int(int8_t(arg)),
+							100, s_slew, s_clamp, s_prev);
 						m_wheel_motor = uint8_t(int8_t(f));
 						midv_ffb_source(int(int8_t(arg)), f, m_screen->frame_number(), machine().time().as_double());
 			midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)

@@ -27,6 +27,7 @@ The Grid         v1.2   10/18/2000
 **************************************************************************/
 
 #include "emu.h"
+#include "cruisn/motor_signal.h"
 
 #include <algorithm>
 
@@ -737,14 +738,8 @@ void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 				if (s_slew < 0 || s_slew > 127)
 					s_slew = 0;
 			}
-			int f = int(int8_t(data & 0xff));
-			if (s_gain != 100)
-				f = std::clamp((f * s_gain) / 100, -127, 127);
-			if (s_slew > 0)
-				f = s_prev + std::clamp(f - s_prev, -s_slew, s_slew);
-			if (s_clamp > 0)
-				f = std::clamp(f, -s_clamp, s_clamp);
-			s_prev = f;
+			int const f = cruisn::adapt_motor_byte(int(int8_t(data & 0xff)),
+				s_gain, s_slew, s_clamp, s_prev);
 			m_wheel_motor = uint8_t(int8_t(f));
 			midv_ffb_source(int(int8_t(data & 0xff)), f, m_screen->frame_number(), machine().time().as_double());
 			midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)
