@@ -155,7 +155,7 @@ protected:
 	uint32_t m_scenery_tree = 0;
 	uint8_t m_scenery_mode = 0;
 	std::array<uint32_t, 5001> m_scenery_reciprocal{};
-	uint64_t m_scenery_mountains = 0, m_scenery_trees = 0, m_scenery_reads = 0;
+	uint64_t m_scenery_mountains = 0, m_scenery_trees = 0, m_scenery_forests = 0, m_scenery_reads = 0;
 	uint32_t m_scenery_max_index = 0;
 	FILE *m_scenery_log = nullptr;
 };

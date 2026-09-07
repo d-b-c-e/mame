@@ -93,7 +93,7 @@ void midvunit_base_state::scenery_start()
 	if (const char *log = std::getenv("MIDV_SCENERY_LOG"); log && !strcmp(log, "1"))
 	{
 		m_scenery_log = fopen("scenery.csv", "w");
-		if (m_scenery_log) fprintf(m_scenery_log, "frame,mountain_admissions,tree_admissions,extended_reads,maximum_index\n");
+		if (m_scenery_log) fprintf(m_scenery_log, "frame,mountain_admissions,tree_admissions,forest_admissions,extended_reads,maximum_index\n");
 	}
 	for (uint32_t i = first_extra; i <= last_extra; ++i)
 		m_scenery_reciprocal[i-first_extra] = reciprocal(i);
@@ -117,12 +117,13 @@ void midvunit_base_state::scenery_start()
 				uint32_t const radius = m_maincpu->state_int(TMS320C3X_R4);
 				int32_t const depth = int32_t(m_maincpu->state_int(TMS320C3X_R3));
 				kind const type = classify(model, m_ram_base[object+14], radius);
-				if ((type == mountain && !(m_scenery_mode & 1)) || (type == tree && !(m_scenery_mode & 2))) return;
+				if (!enabled(type, m_scenery_mode)) return;
 				uint32_t const limit = admission(type, depth, radius);
 				if (limit == original_far) return;
 				data = limit;
 				if (depth > int32_t(limit)) return;
 				if (type == mountain) ++m_scenery_mountains;
+				if (type == forest) ++m_scenery_forests;
 				if (type == tree) { m_scenery_tree = object; ++m_scenery_trees; }
 			}
 			else if (m_scenery_tree && object == m_scenery_tree && data == original_far)
@@ -157,10 +158,11 @@ void midvunit_base_state::scenery_tick()
 {
 	if (!m_scenery_mode) return;
 	if (m_scenery_log)
-		fprintf(m_scenery_log, "%llu,%llu,%llu,%llu,%u\n", (unsigned long long)m_screen->frame_number(),
+		fprintf(m_scenery_log, "%llu,%llu,%llu,%llu,%llu,%u\n", (unsigned long long)m_screen->frame_number(),
 			(unsigned long long)m_scenery_mountains, (unsigned long long)m_scenery_trees,
+			(unsigned long long)m_scenery_forests,
 			(unsigned long long)m_scenery_reads, m_scenery_max_index);
-	m_scenery_mountains = m_scenery_trees = m_scenery_reads = 0;
+	m_scenery_mountains = m_scenery_trees = m_scenery_forests = m_scenery_reads = 0;
 	m_scenery_max_index = 0;
 }
 
