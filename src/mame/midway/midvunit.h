@@ -99,6 +99,9 @@ protected:
 	void scenery_start();
 	void scenery_tick();
 	void scenery_exit();
+	void world_distance_start();
+	void world_distance_tick();
+	void world_distance_exit();
 
 	void cmos_protect_w(uint32_t data);
 	void dma_queue_w(uint32_t data);
@@ -160,6 +163,12 @@ protected:
 	uint64_t m_scenery_activations = 0;
 	uint32_t m_scenery_max_index = 0;
 	FILE *m_scenery_log = nullptr;
+	// Explicit global experiment; projection table in host memory, no model IDs.
+	memory_passthrough_handler m_distance_far_tap, m_distance_reciprocal_tap, m_distance_pending_tap;
+	uint32_t m_distance_far = 0, m_distance_lead = 0, m_distance_max_index = 0;
+	std::vector<uint32_t> m_distance_reciprocal;
+	uint64_t m_distance_far_tests = 0, m_distance_extra_tests = 0, m_distance_reads = 0, m_distance_pending = 0;
+	FILE *m_distance_log = nullptr;
 };
 
 class midvunit_state : public midvunit_base_state

@@ -30,6 +30,7 @@
 #include "midvunit.h"
 #include "cruisn/checked_patch.h"
 #include "cruisn/world_scenery.h"
+#include "cruisn/world_distance.h"
 
 #include "cpu/adsp2100/adsp2100.h"
 #include "cpu/tms320c3x/tms320c3x.h"
@@ -72,6 +73,106 @@ void midvunit_base_state::machine_start()
 	save_item(NAME(m_timer_rate));
 	save_item(NAME(m_scenery_tree));
 	scenery_start();
+	world_distance_start();
+}
+
+// Developer-only global projection/residency experiment. The matching checked
+// game patch changes the far word and clamp instructions; this supplies the
+// larger reciprocal table without overwriting adjacent guest RAM.
+void midvunit_base_state::world_distance_start()
+{
+	using namespace cruisn::world_distance;
+	const char *far_text = std::getenv("MIDV_WORLD_FAR");
+	if (!far_text) return;
+	char *end = nullptr;
+	unsigned long far = strtoul(far_text, &end, 10);
+	if (!*far_text || *end || !valid_far(far) || strcmp(machine().system().name, "crusnwld24") || m_scenery_mode)
+		fatalerror("MIDV_WORLD_FAR requires World 2.4, scenery off, and 80000/100000/160000\n");
+	m_distance_far = far;
+	if (const char *lead = std::getenv("MIDV_WORLD_LEAD"))
+	{
+		unsigned long value = strtoul(lead, &end, 10);
+		if (!*lead || *end || value > 8) fatalerror("MIDV_WORLD_LEAD must be 0..8\n");
+		m_distance_lead = value;
+	}
+	if (const char *clock = std::getenv("MIDV_WORLD_CPU_PERCENT"))
+	{
+		unsigned long value = strtoul(clock, &end, 10);
+		if (!*clock || *end || (value != 100 && value != 125 && value != 150 && value != 200))
+			fatalerror("MIDV_WORLD_CPU_PERCENT must be 100/125/150/200\n");
+		m_maincpu->set_clock_scale(value / 100.0);
+	}
+	if (maximum_index(far) >= first_extra)
+	{
+		m_distance_reciprocal.resize(maximum_index(far)-first_extra+1);
+		for (uint32_t i=first_extra; i<=maximum_index(far); ++i)
+			m_distance_reciprocal[i-first_extra] = reciprocal(i, far);
+	}
+	m_distance_log = fopen("world-distance.csv", "w");
+	if (!m_distance_log) fatalerror("World distance diagnostic log could not be opened\n");
+	setvbuf(m_distance_log, nullptr, _IOFBF, 65536);
+	fprintf(m_distance_log, "frame,far,lead,cpu_percent,profile_ok,far_tests,extra_far_tests,extended_reads,maximum_index,pending_comparisons\n");
+	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&midvunit_base_state::world_distance_exit, this));
+	address_space &s = m_maincpu->space(AS_PROGRAM);
+	m_distance_far_tap = s.install_read_tap(0x40, 0x40, "world_global_far_observe",
+		[this](offs_t offset, uint32_t &data, uint32_t mask)
+		{
+			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC) != 0xa1) return;
+			if (!cruisn::world_distance::code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far))
+				fatalerror("World global distance guard failed: missing or incompatible checked game patch\n");
+			++m_distance_far_tests;
+			int32_t depth = int32_t(m_maincpu->state_int(TMS320C3X_R3));
+			if (depth > 80000 && depth <= int32_t(data)) ++m_distance_extra_tests;
+		});
+	if (!m_distance_reciprocal.empty())
+		m_distance_reciprocal_tap = s.install_read_tap(reciprocal_base+first_extra, 0x1ffff, "world_global_projection",
+			[this](offs_t offset, uint32_t &data, uint32_t mask)
+			{
+				using namespace cruisn::world_distance;
+				uint32_t pc = m_maincpu->state_int(TMS320C3X_PC);
+				if (machine().side_effects_disabled() || !projection_pc(pc)
+					|| (pc != 0xb4 && m_maincpu->state_int(TMS320C3X_AR2) != reciprocal_base)) return;
+				uint32_t index = offset-reciprocal_base;
+				if (index > maximum_index(m_distance_far) || !code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far))
+				{
+					midv_ffb_cancel();
+					fatalerror("World global projection guard failed: pc=%x index=%u far=%u\n", pc, index, m_distance_far);
+				}
+				data = m_distance_reciprocal[index-first_extra];
+				++m_distance_reads; m_distance_max_index = std::max(m_distance_max_index, index);
+			});
+	if (m_distance_lead)
+		m_distance_pending_tap = s.install_read_tap(0xd58c, 0xd58c, "world_global_pending",
+			[this](offs_t offset, uint32_t &data, uint32_t mask)
+			{
+				if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC) != 0x7b51) return;
+				if (data != 11 || !cruisn::world_distance::pending_matches(m_ram_base, m_ram_base.bytes()/4))
+				{
+					midv_ffb_cancel(); fatalerror("World global pending-list signature failed\n");
+				}
+				data += m_distance_lead; ++m_distance_pending;
+			});
+	osd_printf_info("MIDV_WORLD_FAR=%u lead=%u CPU=%.0f%%: global World 2.4 experiment, no model allowlist\n",
+		m_distance_far, m_distance_lead, m_maincpu->clock_scale()*100);
+}
+
+void midvunit_base_state::world_distance_tick()
+{
+	if (m_distance_log && fprintf(m_distance_log, "%llu,%u,%u,%.0f,%d,%llu,%llu,%llu,%u,%llu\n",
+		(unsigned long long)m_screen->frame_number(), m_distance_far, m_distance_lead,
+		m_maincpu->clock_scale()*100,
+		cruisn::world_distance::code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far),
+		(unsigned long long)m_distance_far_tests,
+		(unsigned long long)m_distance_extra_tests, (unsigned long long)m_distance_reads,
+		m_distance_max_index, (unsigned long long)m_distance_pending) < 0)
+		fatalerror("World distance diagnostic log write failed\n");
+	m_distance_far_tests = m_distance_extra_tests = m_distance_reads = m_distance_pending = 0;
+	m_distance_max_index = 0;
+}
+
+void midvunit_base_state::world_distance_exit()
+{
+	if (m_distance_log) { fclose(m_distance_log); m_distance_log = nullptr; }
 }
 
 // Narrow, opt-in distance extension for attributed World 2.4 scenery only.
