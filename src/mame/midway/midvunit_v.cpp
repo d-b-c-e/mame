@@ -3356,6 +3356,18 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	bool const numeric_enabled = !std::getenv("MIDV_SPEED_NUMERIC") || atoi(std::getenv("MIDV_SPEED_NUMERIC")) != 0;
 	bool const numeric_used = numeric_enabled && numeric_mph >= 0;
 	if (numeric_used) telem_mph = float(numeric_mph);
+	bool const world_rom=!strcmp(machine().system().name,"crusnwld24") || !strcmp(machine().system().name,"crusnwld");
+	bool const world25=!strcmp(machine().system().name,"crusnwld");
+	bool const world_menu=world_rom && cruisn::world_drivetrain_code(m_ram_base.target(),m_ram_base.bytes()/4,world25) &&
+		m_ram_base[world25?0xebdc:0xebe2]!=4 && m_ram_base[world25?0xebdc:0xebe2]!=5;
+	bool const offroad_no_hud=numeric_enabled && !strcmp(machine().system().name,"offroadc") && numeric_mph<0 &&
+		cruisn::offroad_drivetrain_code(m_ram_base.target(),m_ram_base.bytes()/4);
+	if (world_menu || offroad_no_hud) {
+		// Known HUD lifetime beats the generic three-second OCR hold. In menus
+		// it would retain the previous speed or accept unrelated background art.
+		s_hud_speed.reset();telem_mph=0.0f;
+	}
+
 	// Versioned shared sample contract. Held OCR retains its actual acceptance
 	// timestamp; an unavailable value is distinguishable from a measured zero.
 	static dbce::telemetry::SignalSample speed_sample;
