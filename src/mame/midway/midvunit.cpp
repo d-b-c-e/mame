@@ -90,10 +90,15 @@ void midvunit_base_state::scenery_start()
 		m_scenery_mode = 0;
 		return;
 	}
+	if (const char *lead = std::getenv("MIDV_SCENERY_LEAD"))
+	{
+		if (lead[0] >= '0' && lead[0] <= '8' && !lead[1]) m_scenery_lead = lead[0]-'0';
+		else { m_scenery_lead = 0; osd_printf_warning("MIDV_SCENERY_LEAD must be 0..8; activation extension disabled\n"); }
+	}
 	if (const char *log = std::getenv("MIDV_SCENERY_LOG"); log && !strcmp(log, "1"))
 	{
 		m_scenery_log = fopen("scenery.csv", "w");
-		if (m_scenery_log) fprintf(m_scenery_log, "frame,mountain_admissions,tree_admissions,forest_admissions,extended_reads,maximum_index\n");
+		if (m_scenery_log) fprintf(m_scenery_log, "frame,mountain_admissions,tree_admissions,forest_admissions,extended_reads,maximum_index,earlier_activations\n");
 	}
 	for (uint32_t i = first_extra; i <= last_extra; ++i)
 		m_scenery_reciprocal[i-first_extra] = reciprocal(i);
@@ -151,18 +156,36 @@ void midvunit_base_state::scenery_start()
 			++m_scenery_reads;
 			m_scenery_max_index = std::max(m_scenery_max_index, index);
 		});
-	osd_printf_info("MIDV_SCENERY %s: World 2.4, guarded mountain/tree models, far=160000\n", mode);
+	if (m_scenery_lead)
+		m_scenery_activation_tap = s.install_read_tap(0x10800, 0x1ffff, "world_scenery_activation",
+			[this](offs_t offset, uint32_t &data, uint32_t mem_mask)
+			{
+				if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC) != 0x7b69) return;
+				uint32_t const object = m_maincpu->state_int(TMS320C3X_AR0);
+				if (object < 0x10800 || object >= 0x20000-27 || offset != object+27
+					|| (m_ram_base[object+14] & 0x7fffffff) != 0x2000
+					|| !activation_code_matches(m_ram_base, m_ram_base.bytes()/4)) return;
+				// Classify the flag state the guest will produce (2000 -> 1000).
+				// These direct backing reads cannot re-enter overlapping taps.
+				kind const type = classify(m_ram_base[object+13], m_ram_base[object+14] ^ 0x3000,
+					m_ram_base[object+19]);
+				uint32_t const adjusted = activation_section(type, m_scenery_mode, data,
+					m_maincpu->state_int(TMS320C3X_R4), m_scenery_lead);
+				if (adjusted != data) { data = adjusted; ++m_scenery_activations; }
+			});
+	osd_printf_info("MIDV_SCENERY %s: World 2.4, guarded scenery, far=160000, activation lead=%u\n", mode, unsigned(m_scenery_lead));
 }
 
 void midvunit_base_state::scenery_tick()
 {
 	if (!m_scenery_mode) return;
 	if (m_scenery_log)
-		fprintf(m_scenery_log, "%llu,%llu,%llu,%llu,%llu,%u\n", (unsigned long long)m_screen->frame_number(),
+		fprintf(m_scenery_log, "%llu,%llu,%llu,%llu,%llu,%u,%llu\n", (unsigned long long)m_screen->frame_number(),
 			(unsigned long long)m_scenery_mountains, (unsigned long long)m_scenery_trees,
 			(unsigned long long)m_scenery_forests,
-			(unsigned long long)m_scenery_reads, m_scenery_max_index);
+			(unsigned long long)m_scenery_reads, m_scenery_max_index, (unsigned long long)m_scenery_activations);
 	m_scenery_mountains = m_scenery_trees = m_scenery_forests = m_scenery_reads = 0;
+	m_scenery_activations = 0;
 	m_scenery_max_index = 0;
 }
 
