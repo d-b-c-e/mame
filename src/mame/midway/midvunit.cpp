@@ -24,6 +24,7 @@
 
 #include "emu.h"
 #include "cruisn/motor_signal.h"
+#include "cruisn/hud_drivetrain.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -849,6 +850,9 @@ void midvunit_state::wheel_board_w(uint32_t data)
 						int const f = cruisn::adapt_motor_byte(int(int8_t(arg)),
 							100, s_slew, s_clamp, s_prev);
 						m_wheel_motor = uint8_t(int8_t(f));
+						if (!strcmp(machine().system().name,"crusnwld24") || !strcmp(machine().system().name,"crusnwld"))
+							midv_ffb_game_active(cruisn::world_driving(m_ram_base.target(),m_ram_base.bytes()/4,
+								!strcmp(machine().system().name,"crusnwld")));
 						midv_ffb_source(int(int8_t(arg)), f, m_screen->frame_number(), machine().time().as_double());
 			midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)
 					}

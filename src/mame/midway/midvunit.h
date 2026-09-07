@@ -40,6 +40,7 @@ void midv_patches_tick(uint32_t *ram);
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds);
 void midv_ffb_write(int f);
 void midv_ffb_cancel();
+void midv_ffb_game_active(bool active);
 
 class midvunit_base_state;
 

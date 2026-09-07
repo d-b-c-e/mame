@@ -1947,6 +1947,7 @@ namespace mvffb {
 MVFFB_SDL_FUNCS(MVFFB_DECL)
 #undef MVFFB_DECL
 
+static std::atomic<bool> s_game_active{true};
 static std::atomic<bool> s_running{false};     // worker up and a device in hand
 static std::atomic<bool> s_stop{false};
 static std::atomic<int> s_level{0};            // requested signed level (-32767..32767)
@@ -2219,6 +2220,7 @@ static void worker()
 	// describes. Off by default; the arcade cabinet's own mechanism is what it
 	// stands in for, so how much you want is a matter of taste and of base.
 	int cond_ids[3] = { -1, -1, -1 };
+	bool conditions_active=s_game_active.load();
 	struct { int pct; unsigned cap; Uint16 type; const char *name; } const conds[3] = {
 		{ s_damper, SDL_HAPTIC_DAMPER, SDL_HAPTIC_DAMPER, "damper" },
 		{ s_friction, SDL_HAPTIC_FRICTION, SDL_HAPTIC_FRICTION, "friction" },
@@ -2255,7 +2257,7 @@ static void worker()
 		e.condition.right_sat[0] = e.condition.left_sat[0] = sat;
 		e.condition.right_coeff[0] = e.condition.left_coeff[0] = coeff;
 		cond_ids[i] = p_SDL_HapticNewEffect(d.hp, &e);
-		if (cond_ids[i] < 0 || p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0)
+		if (cond_ids[i] < 0 || (conditions_active && p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0))
 			flog("%s: could not start: %s", conds[i].name, p_SDL_GetError());
 		else
 			flog("%s: %d%% of full (%d%% x strength %d%%)", conds[i].name,
@@ -2334,8 +2336,19 @@ static void worker()
 		}
 		if (s_stop.load())
 			break;
-		int want = s_level.load();
-		if (s_cancel_impact.exchange(false)) { impact_mixer.reset(); impact_detector.reset(); shaper.reset(); }
+		bool const game_active=s_game_active.load();
+		if (game_active!=conditions_active) {
+			for (int id : cond_ids) if (id>=0) {
+				int const rc=game_active?p_SDL_HapticRunEffect(d.hp,id,1):p_SDL_HapticStopEffect(d.hp,id);
+				if (rc<0) flog("condition gate failed: %s",p_SDL_GetError());
+			}
+			conditions_active=game_active;
+		}
+		int want = game_active?s_level.load():0;
+		if (s_cancel_impact.exchange(false)) {
+			impact_mixer.reset(); impact_detector.reset(); shaper.reset();
+			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
+		}
 		if (s_hold_ms > 0 && want != 0 && now_ms() - s_last_write.load() > s_hold_ms)
 		{
 			want = 0;
@@ -2484,11 +2497,15 @@ static void start(running_machine &machine)
 } // namespace mvffb
 
 static FILE *s_force_source = nullptr;
+static FILE *s_force_gate = nullptr;
 static FILE *s_signal_trace = nullptr;
 static FILE *s_drivetrain_trace = nullptr;
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
 {
-	mvffb::s_raw_level.store(cruisn::motor_level(raw, mvffb::s_invert));
+	mvffb::s_raw_level.store(mvffb::s_game_active.load()?cruisn::motor_level(raw, mvffb::s_invert):0);
+	if (s_force_gate)
+		fprintf(s_force_gate,"%.9f,%llu,%d,%d,%d\n",seconds,(unsigned long long)frame,
+			int(mvffb::s_game_active.load()),raw,mvffb::s_game_active.load()?cruisn::motor_level(adapted,mvffb::s_invert):0);
 	if (s_force_source)
 		fprintf(s_force_source, "%.9f,%llu,%d,%d\n", seconds,
 			(unsigned long long)frame, raw, adapted);
@@ -2500,13 +2517,23 @@ void midv_ffb_write(int f)
 {
 	if (!mvffb::s_running.load())
 		return;
-	int const level = cruisn::motor_level(f, mvffb::s_invert);
+	int const level = mvffb::s_game_active.load()?cruisn::motor_level(f, mvffb::s_invert):0;
 	if (mvffb::s_loglevel >= 2)
 		mvffb::flog("write %d -> level %d", f, level);
 	mvffb::s_level.store(level);
 	mvffb::s_last_write.store(mvffb::now_ms());
 	{ std::lock_guard<std::mutex> lk(mvffb::s_mtx); mvffb::s_dirty = true; }
 	mvffb::s_cv.notify_one();
+}
+
+void midv_ffb_game_active(bool active)
+{
+	static bool const enabled=!std::getenv("MIDV_FFB_GAME_GATE") || atoi(std::getenv("MIDV_FFB_GAME_GATE"))!=0;
+	if (!enabled) return;
+	if (mvffb::s_game_active.exchange(active)!=active) {
+		if (!active) midv_ffb_cancel();
+		telem_notify("force_game_active",active?1:0,nullptr);
+	}
 }
 
 void midv_game_speed(running_machine &machine, uint64_t frame, int mph)
@@ -2581,8 +2608,11 @@ void midv_telemetry_start(running_machine &machine)
 		s_force_source = fopen(path, "w");
 		if (s_force_source) {
 			fprintf(s_force_source, "# schema=1 game=%s units=signed_motor_byte clock=emulated\nseconds,frame,raw,adapted\n", machine.system().name);
+			s_force_gate=fopen("force-gate.csv","w");
+			if (s_force_gate) fprintf(s_force_gate,"seconds,frame,enabled,raw,requested_level\n");
 			machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () {
 				fclose(s_force_source); s_force_source = nullptr;
+				if (s_force_gate) { fclose(s_force_gate); s_force_gate=nullptr; }
 			}));
 		}
 	}
@@ -3276,6 +3306,9 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	world_distance_tick();
 	if (live().enabled)
 		live().speed_pct = float(machine().video().speed_percent() * 100.0);
+	if (!strcmp(machine().system().name,"crusnwld24") || !strcmp(machine().system().name,"crusnwld"))
+		midv_ffb_game_active(cruisn::world_driving(m_ram_base.target(),m_ram_base.bytes()/4,
+			!strcmp(machine().system().name,"crusnwld")));
 	midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half (every frame)
 
 	// Esc options menu pause: block the emu thread here while the menu is

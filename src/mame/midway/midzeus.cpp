@@ -231,6 +231,7 @@ private:
 
 void midv_telemetry_start(running_machine &machine);   // midvunit_v.cpp (POC)
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds);
+void midv_ffb_game_active(bool active);
 void midv_ffb_write(int f);                             // midvunit_v.cpp (POC built-in FFB)
 
 void midzeus_state::machine_start()
@@ -743,6 +744,8 @@ void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 			int const f = cruisn::adapt_motor_byte(int(int8_t(data & 0xff)),
 				s_gain, s_slew, s_clamp, s_prev);
 			m_wheel_motor = uint8_t(int8_t(f));
+			if (!strcmp(machine().system().name,"crusnexo"))
+				midv_ffb_game_active(cruisn::exotica_driving(m_ram_base.target(),m_ram_base.bytes()/4));
 			midv_ffb_source(int(int8_t(data & 0xff)), f, m_screen->frame_number(), machine().time().as_double());
 			midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)
 			break;
@@ -945,13 +948,8 @@ uint32_t crusnexo_state::analog_r(offs_t offset)
 			LOGMASKED(LOG_INPUT, "%06X:analog_r(%X)\n", m_maincpu->pc(), offset);
 	}
 	uint32_t val = m_io_analog[offset & 3]->read();
-	// POC (env-gated, inert unset): MIDZ_WHEEL_INVERT=1 goes with the
-	// "Wheel Invert" DIP switched ON. That DIP is what makes the TRANS
-	// SELECT screen interactive at all (with it off the game confirms
-	// AUTO immediately, whatever the wheel is doing - the long-standing
-	// "Exotica always picks automatic"), but it also mirrors the wheel
-	// for driving. Mirroring the steering value here cancels that, so
-	// the car steers the way it always did and only the menu changes.
+	// Explicit diagnostic ADC mirror, independent of the motor/shifter DIP.
+	// Launcher default is off: coupling this to Wheel Invert reversed driving.
 	static int s_invert = -1;
 	if (s_invert < 0)
 	{
@@ -1737,6 +1735,7 @@ uint32_t crusnexo_state::telemetry_screen_update(screen_device &screen, bitmap_r
 		if (!strcmp(machine().system().name,"crusnexo")) {
 			drivetrain=cruisn::exotica_drivetrain(m_ram_base.target(),m_ram_base.bytes()/4);
 			mph=cruisn::exotica_hud_mph(m_ram_base.target(),m_ram_base.bytes()/4);
+			midv_ffb_game_active(cruisn::exotica_driving(m_ram_base.target(),m_ram_base.bytes()/4));
 		}
 		midv_game_speed(machine(),screen.frame_number(),mph);
 		midv_drivetrain_frame(machine(),screen.frame_number(),float(std::max(0,mph)),drivetrain,0);
