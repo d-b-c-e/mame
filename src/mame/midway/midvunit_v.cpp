@@ -2509,6 +2509,68 @@ void midv_ffb_write(int f)
 	mvffb::s_cv.notify_one();
 }
 
+void midv_game_speed(running_machine &machine, uint64_t frame, int mph)
+{
+	telem_notify("speed",std::max(0,mph),nullptr);
+	telem_notify("speed_source",mph>=0?2:0,nullptr);
+	if (s_signal_trace)
+		fprintf(s_signal_trace,"%.9f,%llu,%d,%d,%.9f,%llu,%.9f\n",machine.time().as_double(),
+			(unsigned long long)frame,int(mph>=0?dbce::telemetry::Source::numeric_hud:dbce::telemetry::Source::unavailable),
+			int(mph>=0?dbce::telemetry::Quality::fresh:dbce::telemetry::Quality::invalid),
+			mph>=0?machine.time().as_double():0.0,(unsigned long long)(mph>=0?frame:0),std::max(0,mph)*.44704);
+}
+
+void midv_drivetrain_frame(running_machine &machine, uint64_t frame, float telem_mph,
+	cruisn::Drivetrain const &drivetrain, int gear)
+{
+	static bool const arcade_rpm = !std::getenv("MIDV_TELEM_ARCADE_RPM") ||
+		atoi(std::getenv("MIDV_TELEM_ARCADE_RPM")) != 0;
+	bool const rpm_valid = drivetrain.valid && arcade_rpm;
+	float const rpm = rpm_valid ? drivetrain.rpm : 0.0f;
+	int gear_source=gear?1:0;
+	if (drivetrain.valid) { gear=drivetrain.gear; gear_source=3; } // game state
+	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace) {
+		telem_notify("gear", gear, nullptr);
+		telem_notify("gear_source", gear_source, nullptr);
+		telem_notify("rpm_status", rpm_valid ? 1 : 0, nullptr);
+		telem_notify("rpm_estimated", rpm_valid ? 1 : 0, nullptr);
+		telem_notify("rpm_source", rpm_valid ? 3 : 0, nullptr);
+		telem_notify("rpm", s32(rpm+0.5f), nullptr);
+		telem_notify("tach_percent", drivetrain.valid ? s32(drivetrain.fraction*100.0f+0.5f) : -1, nullptr);
+	}
+	if (s_drivetrain_trace)
+		fprintf(s_drivetrain_trace, "%.9f,%llu,%u,%d,%d,%.9f,%.9f,%.3f,%d\n",
+			machine.time().as_double(), (unsigned long long)frame,
+			drivetrain.player,gear,gear_source,drivetrain.rev,drivetrain.fraction,rpm,rpm_valid?1:0);
+
+	// Forza Horizon Data Out (324 bytes). Its legacy schema has no source or
+	// validity fields; JSON/CSV explicitly identify the game-derived RPM scale.
+	if (s_forza_n > 0 && s_telem_sock != INVALID_SOCKET)
+	{
+		uint8_t pkt[324] = { 0 };
+		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
+		const int32_t one = 1;
+		const float spd_ms = telem_mph * 0.44704f;
+		s_forza_ms += 17;
+		put32(0, &one);
+		put32(4, &s_forza_ms);
+		if (arcade_rpm && (!strcmp(machine.system().name, "crusnusa") ||
+			!strcmp(machine.system().name, "crusnwld24") || !strcmp(machine.system().name, "crusnwld") ||
+			!strcmp(machine.system().name, "crusnexo") || !strcmp(machine.system().name,"offroadc"))) {
+			// Stable gauge limits through boot/menus; only CurrentRpm goes zero.
+			float const maximum=8000.0f, idle=900.0f;
+			put32(8, &maximum); put32(12, &idle); put32(16, &rpm);
+		}
+		put32(40, &spd_ms);
+		put32(256, &spd_ms);
+		pkt[319] = gear ? gear : 1;
+		for (int fi = 0; fi < s_forza_n; fi++)
+			sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
+					(const sockaddr *)&s_forza_addr[fi], sizeof(s_forza_addr[fi]));
+	}
+
+}
+
 void midv_telemetry_start(running_machine &machine)
 {
 	static bool s_started = false;
@@ -2833,6 +2895,16 @@ void midvunit_base_state::observe_numeric_hud()
 		s_numeric_seconds[pg] = machine().time().as_double();
 		s_numeric_seen[pg] = true;
 	}
+	if (!strcmp(machine().system().name,"offroadc") && dq[0]==0x900 && dq[1]==0x2200 &&
+		dq[14]==0x18a7 && dq[3]==23 && dq[7]==54 && dq[2]>=220 && dq[4]<=285 &&
+		cruisn::offroad_drivetrain_code(m_ram_base.target(),m_ram_base.bytes()/4)) {
+		int const pg=(m_page_control&4)?1:0;
+		s_numeric_mph[pg]=cruisn::offroad_hud_mph(m_ram_base.target(),m_ram_base.bytes()/4);
+		s_numeric_frame[pg]=m_screen->frame_number();
+		s_numeric_seconds[pg]=machine().time().as_double();
+		s_numeric_seen[pg]=true;
+	}
+
 }
 
 void midvunit_renderer::process_dma_queue()
@@ -3223,6 +3295,9 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		Sleep(15);
 	}
 
+	// Partial screen updates must not advance signal age or emit extra UDP frames.
+	if (cliprect.max_y >= screen.visible_area().max_y)
+	{
 	// Telemetry Phase B: mirror the car speed (MPH) as a UDP datagram each
 	// frame, alongside the Phase-A output mirror. Only when telemetry is on
 	// and this game's speed word has been hunted.
@@ -3298,57 +3373,19 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	cruisn::UsaDrivetrain drivetrain;
 	if (numeric_mph >= 0 && !strcmp(machine().system().name, "crusnusa"))
 		drivetrain=cruisn::usa_drivetrain(m_ram_base.target(),m_ram_base.bytes()/4);
-	static bool const arcade_rpm = !std::getenv("MIDV_TELEM_ARCADE_RPM") ||
-		atoi(std::getenv("MIDV_TELEM_ARCADE_RPM")) != 0;
-	bool const rpm_valid = drivetrain.valid && arcade_rpm;
-	float const rpm = rpm_valid ? drivetrain.rpm : 0.0f;
-	// Other games retain their existing latched-shifter fallback. A zero gear
-	// in JSON is neutral/unknown; the legacy Forza mapping uses first for it.
-	int gear = 0, gear_source = 0;
-	if (auto *mvs = dynamic_cast<midvunit_state *>(this))
+	if (!strcmp(machine().system().name,"crusnwld24") || !strcmp(machine().system().name,"crusnwld"))
+		drivetrain=cruisn::world_drivetrain(m_ram_base.target(),m_ram_base.bytes()/4,
+			!strcmp(machine().system().name,"crusnwld"));
+	if (numeric_mph>=0 && !strcmp(machine().system().name,"offroadc"))
+		drivetrain=cruisn::offroad_drivetrain(m_ram_base.target(),m_ram_base.bytes()/4);
+	int gear=0;
+	if (auto *mvs=dynamic_cast<midvunit_state *>(this))
 		switch (mvs->shifter_state()) {
 			case 0x2000: gear=1; break; case 0x1000: gear=2; break;
 			case 0x0800: gear=3; break; case 0x0400: gear=4; break;
 			default: break;
 		}
-	if (gear) gear_source=1; // input, not an observed automatic transmission
-	if (drivetrain.valid) { gear=drivetrain.gear; gear_source=3; } // game state
-	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace) {
-		telem_notify("gear", gear, nullptr);
-		telem_notify("gear_source", gear_source, nullptr);
-		telem_notify("rpm_status", rpm_valid ? 1 : 0, nullptr);
-		telem_notify("rpm_estimated", rpm_valid ? 1 : 0, nullptr);
-		telem_notify("rpm_source", rpm_valid ? 3 : 0, nullptr);
-		telem_notify("rpm", s32(rpm+0.5f), nullptr);
-		telem_notify("tach_percent", drivetrain.valid ? s32(drivetrain.fraction*100.0f+0.5f) : -1, nullptr);
-	}
-	if (s_drivetrain_trace)
-		fprintf(s_drivetrain_trace, "%.9f,%llu,%u,%d,%d,%.9f,%.9f,%.3f,%d\n",
-			machine().time().as_double(), (unsigned long long)screen.frame_number(),
-			drivetrain.player,gear,gear_source,drivetrain.rev,drivetrain.fraction,rpm,rpm_valid?1:0);
-
-	// Forza Horizon Data Out (324 bytes). Its legacy schema has no source or
-	// validity fields; JSON/CSV explicitly identify the game-derived RPM scale.
-	if (s_forza_n > 0 && s_telem_sock != INVALID_SOCKET)
-	{
-		uint8_t pkt[324] = { 0 };
-		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
-		const int32_t one = 1;
-		const float spd_ms = telem_mph * 0.44704f;
-		s_forza_ms += 17;
-		put32(0, &one);
-		put32(4, &s_forza_ms);
-		if (arcade_rpm && !strcmp(machine().system().name, "crusnusa")) {
-			// Stable gauge limits through boot/menus; only CurrentRpm goes zero.
-			float const maximum=8000.0f, idle=900.0f;
-			put32(8, &maximum); put32(12, &idle); put32(16, &rpm);
-		}
-		put32(40, &spd_ms);
-		put32(256, &spd_ms);
-		pkt[319] = gear ? gear : 1;
-		for (int fi = 0; fi < s_forza_n; fi++)
-			sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
-					(const sockaddr *)&s_forza_addr[fi], sizeof(s_forza_addr[fi]));
+	midv_drivetrain_frame(machine(),screen.frame_number(),telem_mph,drivetrain,gear);
 	}
 
 	// live bridge: palette/texture must flow even before any quad is drawn -

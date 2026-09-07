@@ -28,6 +28,7 @@ The Grid         v1.2   10/18/2000
 
 #include "emu.h"
 #include "cruisn/motor_signal.h"
+#include "cruisn/hud_drivetrain.h"
 
 #include <algorithm>
 
@@ -173,6 +174,7 @@ private:
 	void crusnexo_leds_w(offs_t offset, uint32_t data);
 	void keypad_select_w(offs_t offset, uint32_t data);
 	uint32_t analog_r(offs_t offset);
+	uint32_t telemetry_screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
 	void analog_w(uint32_t data);
 
 	void crusnexo_map(address_map &map) ATTR_COLD;
@@ -1720,9 +1722,32 @@ void midzeus2_state::midzeus2(machine_config &config)
 	m_fw_link->phy_write().set(m_fw_phy, FUNC(ibm21s851_device::write));
 }
 
+// The Zeus device owns rendering; the driver owns the game memory layout.
+// Send telemetry once per completed emulated frame even when CPU rasterization
+// is skipped by the live GL renderer.
+void midv_drivetrain_frame(running_machine &machine, uint64_t frame, float mph,
+	cruisn::Drivetrain const &drivetrain, int gear);
+void midv_game_speed(running_machine &machine, uint64_t frame, int mph);
+uint32_t crusnexo_state::telemetry_screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
+{
+	uint32_t const result=m_zeus->screen_update(screen,bitmap,cliprect);
+	if (cliprect.max_y>=screen.visible_area().max_y) {
+		cruisn::Drivetrain drivetrain;
+		int mph=-1;
+		if (!strcmp(machine().system().name,"crusnexo")) {
+			drivetrain=cruisn::exotica_drivetrain(m_ram_base.target(),m_ram_base.bytes()/4);
+			mph=cruisn::exotica_hud_mph(m_ram_base.target(),m_ram_base.bytes()/4);
+		}
+		midv_game_speed(machine(),screen.frame_number(),mph);
+		midv_drivetrain_frame(machine(),screen.frame_number(),float(std::max(0,mph)),drivetrain,0);
+	}
+	return result;
+}
+
 void crusnexo_state::crusnexo(machine_config &config)
 {
 	midzeus2(config);
+	m_screen->set_screen_update(FUNC(crusnexo_state::telemetry_screen_update));
 	m_maincpu->set_addrmap(AS_PROGRAM, &crusnexo_state::crusnexo_map);
 
 	m_ioasic->set_upper(472 /* or 476,477,478,110 */ );
