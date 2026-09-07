@@ -15,6 +15,7 @@
 #include "cruisn/motor_signal.h"
 #include "cruisn/tjunctions.h"
 #include "cruisn/retained_texture.h"
+#include "cruisn/cpu_upload_spans.h"
 
 #include "williamssound.h"
 
@@ -167,6 +168,9 @@ struct midv_live
 		uint32_t const need = (8 + l1 + l2 + 7) & ~7u;
 		uint64_t const w = ring_load(wpos);
 		uint64_t r = ring_load(rpos);
+		uint64_t const initial_r = r;
+		bool const blocked = need <= capacity && w - r + need > capacity;
+		uint64_t const started = blocked ? GetTickCount64() : 0;
 		// Every message mutates persistent state, including quads and CPU writes.
 		// Backpressure is lossless; a dead consumer fails the entire stream.
 		for (int wait = 0; need <= capacity && w - r + need > capacity && wait < 500; ++wait)
@@ -174,12 +178,19 @@ struct midv_live
 			Sleep(1);
 			r = ring_load(rpos);
 		}
+		if (blocked && std::getenv("MIDV_GL_LOG") && GetTickCount64() - started >= 50)
+			osd_printf_info("MIDV stream wait: frame=%u type=%u need=%u queued=%llu consumer_bytes=%llu wait_ms=%llu\n",
+				last_frame, type, need, (unsigned long long)(w-r),
+				(unsigned long long)(r-initial_r), (unsigned long long)(GetTickCount64()-started));
 		if (need > capacity || w - r + need > capacity)
 		{
 			InterlockedIncrement64((volatile LONG64 *)dropped);
 			InterlockedExchange((volatile LONG *)(base + 32), 1);
 			enabled = false;
-			osd_printf_error("MIDV render stream failed: consumer timeout; native presentation fallback\n");
+			osd_printf_error("MIDV render stream failed: consumer timeout; native presentation fallback; "
+				"frame=%u type=%u need=%u queued=%llu capacity=%u consumer_bytes=%llu wait_ms=%llu\n",
+				last_frame, type, need, (unsigned long long)(w-r), capacity,
+				(unsigned long long)(r-initial_r), (unsigned long long)(blocked ? GetTickCount64()-started : 0));
 			return false;
 		}
 		auto put = [&](uint64_t at, const void *src, uint32_t len)
@@ -1085,7 +1096,8 @@ void thread_main()
 
 	uint prog = link(gl, MVGL_VS, MVGL_FS);
 	uint pal = link(gl, MVGL_PAL_VS, MVGL_PAL_FS);
-	if (!prog || !pal) return;
+	uint cpu_copy = link(gl, MVGL_PAL_VS, MVGL_CPU_FS);
+	if (!prog || !pal || !cpu_copy) return;
 
 	gl.PixelStorei(0x0CF5 /*GL_UNPACK_ALIGNMENT*/, 1);
 	auto make_tex = [&](int w, int h, unsigned ifmt) -> uint
@@ -1103,6 +1115,8 @@ void thread_main()
 	};
 	uint texram = make_tex(4096, 2048, R8UI);
 	uint paltex = make_tex(256, 128, R32UI);
+	uint cpu_index = make_tex(512, H, R16UI);
+	uint cpu_dirty_tex = make_tex(512, H, R8UI);
 	uint pageTex[2] = { make_tex(fw, fh, R16UI), make_tex(fw, fh, R16UI) };
 	// crack-fill mask: attachment 1 flags pixels the CURRENT scene wrote;
 	// the palette pass fills unwritten slivers (hardware quad cracks that
@@ -1152,6 +1166,12 @@ void thread_main()
 		gl.VertexAttribIPointer(loc, 4, 0x1405 /*UNSIGNED_INT*/, 16, nullptr);
 	}
 
+	gl.UseProgram(cpu_copy);
+	gl.Uniform1i(gl.GetUniformLocation(cpu_copy, "cpuIndex"), 4);
+	gl.Uniform1i(gl.GetUniformLocation(cpu_copy, "cpuDirty"), 5);
+	gl.Uniform1i(gl.GetUniformLocation(cpu_copy, "uScale"), S);
+	gl.Uniform1i(gl.GetUniformLocation(cpu_copy, "uMargin"), MARGIN);
+	gl.Uniform1i(gl.GetUniformLocation(cpu_copy, "uHeight"), H);
 	gl.UseProgram(prog);
 	gl.Uniform2f(gl.GetUniformLocation(prog, "uCanvas"), float(WIDE), float(H));
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uScale"), S);
@@ -1236,6 +1256,11 @@ void thread_main()
 	uint16_t run_pc = 0xffff, active_pc = 0xffff;
 	int scene_axis[2] = {}, cpu_written[2] = {};
 	static uint16_t shadow[2][MAXH * 512];
+	cruisn::cpu_upload_spans cpu_dirty(512, H);
+	bool const batch_cpu = !std::getenv("MIDV_GL_BATCH_VRAM") || atoi(std::getenv("MIDV_GL_BATCH_VRAM")) != 0;
+	uint64_t n_cpu_uploads = 0, n_cpu_blits = 0, n_cpu_pixels = 0;
+	std::vector<uint16_t> cpu_pixels;
+	std::vector<uint8_t> cpu_mask;
 	bool quad_fresh[2] = {};
 	bool crop2d[2] = {};
 	int quad_count[2] = {};
@@ -1337,6 +1362,53 @@ void thread_main()
 		quad_fresh[pg] = true;
 		if (new_scene) ++n_scenes;
 		run.clear();
+	};
+
+	// CPU-shadow data is valid only where a CPU write actually occurred. Keep
+	// holes intact, and flush before every following ordered non-CPU message.
+	auto flush_cpu = [&]()
+	{
+		if (batch_cpu)
+		{
+			for (unsigned pg = 0; pg < 2; ++pg)
+			{
+				if (!cpu_dirty.pending(pg)) continue;
+				// Boot RAM tests scatter writes across many rows. One masked GPU
+				// copy preserves untouched quad pixels without one upload per span.
+				gl.ActiveTexture(TEXTURE0 + 4);
+				gl.BindTexture(0x0DE1, cpu_index);
+				gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, H, RED_INTEGER, 0x1403, shadow[pg]);
+				gl.ActiveTexture(TEXTURE0 + 5);
+				gl.BindTexture(0x0DE1, cpu_dirty_tex);
+				gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, H, RED_INTEGER, 0x1401, cpu_dirty.mask(pg));
+				gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
+				gl.Viewport(0, 0, fw, fh);
+				gl.UseProgram(cpu_copy);
+				gl.BindVertexArray(vao_empty);
+				gl.DrawArrays(0x0004 /*TRIANGLES*/, 0, 3);
+				gl.BindFramebuffer(FRAMEBUFFER, 0);
+				cpu_dirty.clear(pg);
+				++n_cpu_blits; n_cpu_pixels += uint64_t(H) * 512;
+			}
+			return;
+		}
+		cpu_dirty.flush([&](unsigned pg, unsigned at, unsigned count)
+		{
+			int const x = at % 512, y = at / 512;
+			cpu_pixels.resize(count * S * S);
+			cpu_mask.assign(count * S * S, 1);
+			for (int yy = 0; yy < S; ++yy)
+				for (unsigned xx = 0; xx < count * S; ++xx)
+					cpu_pixels[yy * count * S + xx] = shadow[pg][at + xx / S];
+			gl.ActiveTexture(TEXTURE0 + 1);
+			gl.BindTexture(0x0DE1, pageTex[pg]);
+			gl.TexSubImage2D(0x0DE1, 0, (MARGIN + x) * S, (H - 1 - y) * S,
+				count * S, S, RED_INTEGER, 0x1403, cpu_pixels.data());
+			gl.BindTexture(0x0DE1, maskTex[pg]);
+			gl.TexSubImage2D(0x0DE1, 0, (MARGIN + x) * S, (H - 1 - y) * S,
+				count * S, S, RED_INTEGER, 0x1401, cpu_mask.data());
+			++n_cpu_uploads; n_cpu_pixels += count;
+		});
 	};
 
 	while (IsWindow(parent) && !s_stop.load())
@@ -1451,6 +1523,7 @@ void thread_main()
 				memcpy(&last_received_frame, staging.data(), 4);
 			r += (8 + len + 7) & ~7u;
 			ring_store(lv.rpos, r);
+			if (type != 5) flush_cpu();
 			switch (type)
 			{
 			case 1:
@@ -1499,27 +1572,8 @@ void thread_main()
 				{
 					uint32_t end = std::min(rel + n, uint32_t(H) * 512);
 					memcpy(&shadow[pg][rel], staging.data() + 12, (end - rel) * 2);
-					// CPU pixels and quads mutate the same persistent indexed page.
-					// Upload only this span, with nearest expansion and the same Y flip.
-					gl.ActiveTexture(TEXTURE0 + 1);
-					std::vector<uint16_t> pixels;
-					std::vector<uint8_t> mask;
-					for (uint32_t at = rel; at < end; )
-					{
-						int const x = at % 512, y = at / 512;
-						int const count = std::min(end - at, uint32_t(512 - x));
-						pixels.resize(count * S * S); mask.assign(count * S * S, 1);
-						for (int yy = 0; yy < S; ++yy)
-							for (int xx = 0; xx < count * S; ++xx)
-								pixels[yy * count * S + xx] = shadow[pg][at + xx / S];
-						gl.BindTexture(0x0DE1, pageTex[pg]);
-						gl.TexSubImage2D(0x0DE1, 0, (MARGIN + x) * S, (H - 1 - y) * S,
-							count * S, S, RED_INTEGER, 0x1403, pixels.data());
-						gl.BindTexture(0x0DE1, maskTex[pg]);
-						gl.TexSubImage2D(0x0DE1, 0, (MARGIN + x) * S, (H - 1 - y) * S,
-							count * S, S, RED_INTEGER, 0x1401, mask.data());
-						at += count;
-					}
+					cpu_dirty.mark(pg, rel, end - rel);
+					if (!batch_cpu) flush_cpu(); // explicit immediate-upload control
 					cpu_written[pg] += end - rel;
 					if (cpu_written[pg] >= H * 512 * 7 / 10)
 						quad_fresh[pg] = false, active_pc = 0xffff;
@@ -1538,6 +1592,7 @@ void thread_main()
 		// must still present and process selection/CRT/resume without that fence.
 		if (!frame_complete && !menu_open && !ui_changed) { Sleep(1); continue; }
 
+		flush_cpu(); // also covers a menu redraw without a new frame fence
 		// ---- present ----
 		int const cw = rc.right, ch = rc.bottom;
 		gl.Viewport(0, 0, cw, ch);
@@ -1699,6 +1754,9 @@ void thread_main()
 			fclose(f);
 		}
 	}
+	logf("CPU uploads batch=%d messages=%llu spans=%llu blits=%llu pixels=%llu", int(batch_cpu),
+		(unsigned long long)n_vram, (unsigned long long)n_cpu_uploads,
+		(unsigned long long)n_cpu_blits, (unsigned long long)n_cpu_pixels);
 	logf("T-junction alignment enabled=%d vertices=%llu", int(align_joins), (unsigned long long)n_aligned);
 	logf("%s after %llu presents, %d snaps",
 		s_stop.load() ? "machine exit" : "parent gone or failed stream",

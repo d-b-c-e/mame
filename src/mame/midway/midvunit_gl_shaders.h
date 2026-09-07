@@ -405,6 +405,28 @@ static const char *MVGL_PAL_FS =
 	"}\n"
 	"\n";
 
+static const char *MVGL_CPU_FS =
+	"\n"
+	"#version 430\n"
+	"uniform usampler2D cpuIndex;\n"
+	"uniform usampler2D cpuDirty;\n"
+	"uniform int uScale;\n"
+	"uniform int uMargin;\n"
+	"uniform int uHeight;\n"
+	"layout(location = 0) out uint outIndex;\n"
+	"layout(location = 1) out uint outMask;\n"
+	"void main() {\n"
+	"    ivec2 native = ivec2(gl_FragCoord.xy) / uScale;\n"
+	"    native.x -= uMargin;\n"
+	"    native.y = uHeight - 1 - native.y;\n"
+	"    if (native.x < 0 || native.x >= 512 || native.y < 0 || native.y >= uHeight)\n"
+	"        discard;\n"
+	"    if (texelFetch(cpuDirty, native, 0).r == 0u) discard;\n"
+	"    outIndex = texelFetch(cpuIndex, native, 0).r;\n"
+	"    outMask = 1u;\n"
+	"}\n"
+	"\n";
+
 static const char *MVGL_MENU_VS =
 	"\n"
 	"#version 430\n"
