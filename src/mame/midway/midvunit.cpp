@@ -87,12 +87,12 @@ void midvunit_base_state::world_distance_start()
 	char *end = nullptr;
 	unsigned long far = strtoul(far_text, &end, 10);
 	if (!*far_text || *end || !valid_far(far) || strcmp(machine().system().name, "crusnwld24") || m_scenery_mode)
-		fatalerror("MIDV_WORLD_FAR requires World 2.4, scenery off, and 80000/100000/160000\n");
+		fatalerror("MIDV_WORLD_FAR requires World 2.4, scenery off, and 80000/100000/160000/240000\n");
 	m_distance_far = far;
 	if (const char *lead = std::getenv("MIDV_WORLD_LEAD"))
 	{
 		unsigned long value = strtoul(lead, &end, 10);
-		if (!*lead || *end || value > 8) fatalerror("MIDV_WORLD_LEAD must be 0..8\n");
+		if (!*lead || *end || value > maximum_lead) fatalerror("MIDV_WORLD_LEAD must be 0..12\n");
 		m_distance_lead = value;
 	}
 	if (const char *clock = std::getenv("MIDV_WORLD_CPU_PERCENT"))
