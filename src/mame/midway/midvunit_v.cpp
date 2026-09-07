@@ -12,6 +12,7 @@
 #include "midvunit_hud_ocr.h"
 #include "cruisn/hud_speed_filter.h"
 #include "cruisn/hud_numeric_speed.h"
+#include "cruisn/hud_drivetrain.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/tjunctions.h"
 #include "cruisn/retained_texture.h"
@@ -535,9 +536,8 @@ static const SpeedAddr s_speed_addr[] = {
 };
 static uint32_t s_speed_word = 0;   // resolved at telem_init
 
-// No validated engine-RPM producer exists yet. USA RAM word E632 is packed
-// decimal speed text, as established by its formatter and HUD submissions.
-// The retired low-16-bit correlation was not an RPM measurement.
+// USA E632 is packed decimal speed text, never RPM. The drivetrain producer
+// uses the separately traced player rev/gear fields (see hud_drivetrain.h).
 
 // TMS320C3x 32-bit float -> host float: [exp 8b two's-comp][sign][frac 23b]
 static float c3x_to_float(uint32_t w)
@@ -2485,6 +2485,7 @@ static void start(running_machine &machine)
 
 static FILE *s_force_source = nullptr;
 static FILE *s_signal_trace = nullptr;
+static FILE *s_drivetrain_trace = nullptr;
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
 {
 	mvffb::s_raw_level.store(cruisn::motor_level(raw, mvffb::s_invert));
@@ -2530,6 +2531,13 @@ void midv_telemetry_start(running_machine &machine)
 			machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () {
 				fclose(s_signal_trace); s_signal_trace = nullptr;
 			}));
+			s_drivetrain_trace = fopen("drivetrain.csv", "w");
+			if (s_drivetrain_trace) {
+				fprintf(s_drivetrain_trace, "seconds,frame,player,gear,gear_source,rev_value,tach_fraction,rpm,rpm_estimated\n");
+				machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () {
+					fclose(s_drivetrain_trace); s_drivetrain_trace = nullptr;
+				}));
+			}
 		}
 	}
 	mvffb::start(machine);   // POC built-in force feedback (MIDV_FFB=1)
@@ -3221,8 +3229,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	// Gating (found live on the rig): OUTSIDE races the DSP words hold
 	// unrelated data - the "speed" word spiked to ~990 in menus/transitions
 	// (pegging SimHub gauges). Unreadable speed uses bounded held/invalid state.
-	// RPM is unavailable until a real producer is validated; never derive it
-	// from the speed formatter's packed ASCII buffer.
+	// USA rev/gear use a guarded player-state producer below; E632 is speed text.
 	float telem_mph = 0.0f;
 	if (s_speed_word)
 	{
@@ -3285,40 +3292,60 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 		telem_notify("speed_status", s_hud ? s_hud_speed.status() : 0, nullptr);
 		telem_notify("speed_age_frames", s_hud ? s_hud_speed.age_frames : 0, nullptr);
 	}
-	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace)
-		telem_notify("rpm_status", 0, nullptr); // unavailable, not a measured zero
+	// The USA tach palette routine (9E53..9E61) and gear-glyph routine
+	// (9D86..9D89) read this same player pointer. Fresh numeric HUD submissions
+	// gate its lifetime, so menus can't reinterpret an old car object as revs.
+	cruisn::UsaDrivetrain drivetrain;
+	if (numeric_mph >= 0 && !strcmp(machine().system().name, "crusnusa"))
+		drivetrain=cruisn::usa_drivetrain(m_ram_base.target(),m_ram_base.bytes()/4);
+	static bool const arcade_rpm = !std::getenv("MIDV_TELEM_ARCADE_RPM") ||
+		atoi(std::getenv("MIDV_TELEM_ARCADE_RPM")) != 0;
+	bool const rpm_valid = drivetrain.valid && arcade_rpm;
+	float const rpm = rpm_valid ? drivetrain.rpm : 0.0f;
+	// Other games retain their existing latched-shifter fallback. A zero gear
+	// in JSON is neutral/unknown; the legacy Forza mapping uses first for it.
+	int gear = 0, gear_source = 0;
+	if (auto *mvs = dynamic_cast<midvunit_state *>(this))
+		switch (mvs->shifter_state()) {
+			case 0x2000: gear=1; break; case 0x1000: gear=2; break;
+			case 0x0800: gear=3; break; case 0x0400: gear=4; break;
+			default: break;
+		}
+	if (gear) gear_source=1; // input, not an observed automatic transmission
+	if (drivetrain.valid) { gear=drivetrain.gear; gear_source=3; } // game state
+	if (s_telem_sock != INVALID_SOCKET || s_ffb_trace) {
+		telem_notify("gear", gear, nullptr);
+		telem_notify("gear_source", gear_source, nullptr);
+		telem_notify("rpm_status", rpm_valid ? 1 : 0, nullptr);
+		telem_notify("rpm_estimated", rpm_valid ? 1 : 0, nullptr);
+		telem_notify("rpm_source", rpm_valid ? 3 : 0, nullptr);
+		telem_notify("rpm", s32(rpm+0.5f), nullptr);
+		telem_notify("tach_percent", drivetrain.valid ? s32(drivetrain.fraction*100.0f+0.5f) : -1, nullptr);
+	}
+	if (s_drivetrain_trace)
+		fprintf(s_drivetrain_trace, "%.9f,%llu,%u,%d,%d,%.9f,%.9f,%.3f,%d\n",
+			machine().time().as_double(), (unsigned long long)screen.frame_number(),
+			drivetrain.player,gear,gear_source,drivetrain.rev,drivetrain.fraction,rpm,rpm_valid?1:0);
 
-	// Telemetry Phase C: Forza Horizon 4/5 "Data Out" packet (324 bytes),
-	// so SimHub / dash apps consume us as Forza with stock profiles.
-	// Layout: FM7 sled (0-231) + 12-byte Horizon block + dash section.
-	// RPM fields remain zero: this legacy packet has no per-signal validity
-	// field. JSON/diagnostics publish rpm_status=0 and omit the RPM value.
+	// Forza Horizon Data Out (324 bytes). Its legacy schema has no source or
+	// validity fields; JSON/CSV explicitly identify the game-derived RPM scale.
 	if (s_forza_n > 0 && s_telem_sock != INVALID_SOCKET)
 	{
-		float const mph = telem_mph;   // gated above
 		uint8_t pkt[324] = { 0 };
 		auto put32 = [&pkt](int off, const void *v) { memcpy(pkt + off, v, 4); };
 		const int32_t one = 1;
-		const float spd_ms = mph * 0.44704f;
+		const float spd_ms = telem_mph * 0.44704f;
 		s_forza_ms += 17;
-		put32(0, &one);              // IsRaceOn
-		put32(4, &s_forza_ms);       // TimestampMS
-		put32(40, &spd_ms);          // VelocityZ (forward, m/s)
-		put32(256, &spd_ms);         // Speed (m/s, FH dash offset)
-		// Gear: mirror the REAL latched shifter (driver-maintained state,
-		// fed by both the 4-position shifter and the sequential buttons).
-		// Neutral shows 1st - Forza has no neutral code and 0 means reverse.
-		uint8_t gear = 1;
-		if (auto *mvs = dynamic_cast<midvunit_state *>(this))
-			switch (mvs->shifter_state())
-			{
-				case 0x2000: gear = 1; break;
-				case 0x1000: gear = 2; break;
-				case 0x0800: gear = 3; break;
-				case 0x0400: gear = 4; break;
-				default: break;
-			}
-		pkt[319] = gear;
+		put32(0, &one);
+		put32(4, &s_forza_ms);
+		if (arcade_rpm && !strcmp(machine().system().name, "crusnusa")) {
+			// Stable gauge limits through boot/menus; only CurrentRpm goes zero.
+			float const maximum=8000.0f, idle=900.0f;
+			put32(8, &maximum); put32(12, &idle); put32(16, &rpm);
+		}
+		put32(40, &spd_ms);
+		put32(256, &spd_ms);
+		pkt[319] = gear ? gear : 1;
 		for (int fi = 0; fi < s_forza_n; fi++)
 			sendto(s_telem_sock, (const char *)pkt, sizeof(pkt), 0,
 					(const sockaddr *)&s_forza_addr[fi], sizeof(s_forza_addr[fi]));
