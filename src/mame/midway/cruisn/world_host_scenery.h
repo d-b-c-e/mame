@@ -21,7 +21,9 @@ struct Scene
     std::vector<Object> objects;
 };
 inline bool pointer(uint32_t p,uint32_t n)
-{return p>=0x1000 && n<=4096 && uint64_t(p)+n<=0x1000000;}
+// Static geometry/materials must reside in the mapped ROM region. A corrupt
+// pointer must never make this read-only adapter touch side-effecting I/O.
+{return p>=0xc00000 && n<=4096 && uint64_t(p)+n<=0x1000000;}
 
 template<class Read> bool build(Read read,Scene &scene)
 {
