@@ -186,6 +186,7 @@ protected:
 	FILE *m_usa_distance_log = nullptr;
 	memory_passthrough_handler m_offroad_far_tap, m_offroad_clip_tap, m_offroad_ceiling_tap, m_offroad_table_tap;
 	uint32_t m_offroad_multiplier = 0;
+	uint64_t m_offroad_last_frame = uint64_t(-1);
 	std::vector<uint32_t> m_offroad_reciprocal;
 	uint64_t m_offroad_far_tests = 0, m_offroad_stock_rejects = 0, m_offroad_rejects = 0, m_offroad_extra = 0;
 	uint64_t m_offroad_clip_reads = 0, m_offroad_ceiling_reads = 0;

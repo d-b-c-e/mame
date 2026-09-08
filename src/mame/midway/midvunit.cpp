@@ -366,6 +366,7 @@ void midvunit_base_state::offroad_distance_start()
 
 void midvunit_base_state::offroad_distance_reset()
 {
+	m_offroad_last_frame=uint64_t(-1);
 	m_offroad_far_tests=m_offroad_stock_rejects=m_offroad_rejects=m_offroad_extra=0;
 	m_offroad_clip_reads=m_offroad_ceiling_reads=0;
 	for (auto &c:m_offroad_counts) c=offroad_projection_count{};
@@ -376,6 +377,9 @@ void midvunit_base_state::offroad_distance_tick()
 	using namespace cruisn::offroad_distance;
 	if (!m_offroad_log) return;
 	const auto frame=(unsigned long long)m_screen->frame_number();
+	// A partial startup screen update can repeat this callback within a frame.
+	// Leave any subsequent counters pending for the next frame's single row.
+	if (frame==m_offroad_last_frame) return;
 	if (fprintf(m_offroad_log,"%llu,%u,%d,%llu,%llu,%llu,%llu,%llu,%llu\n",frame,m_offroad_multiplier,
 		code_matches(m_ram_base,m_ram_base.bytes()/4),(unsigned long long)m_offroad_far_tests,
 		(unsigned long long)m_offroad_stock_rejects,(unsigned long long)m_offroad_rejects,
@@ -390,6 +394,7 @@ void midvunit_base_state::offroad_distance_tick()
 			fatalerror("Off Road projection log write failed\n");
 	}
 	offroad_distance_reset();
+	m_offroad_last_frame=frame;
 }
 
 void midvunit_base_state::offroad_distance_exit()
