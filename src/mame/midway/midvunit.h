@@ -106,6 +106,10 @@ protected:
 	void usa_distance_start();
 	void usa_distance_tick();
 	void usa_distance_exit();
+	void offroad_distance_start();
+	void offroad_distance_tick();
+	void offroad_distance_reset();
+	void offroad_distance_exit();
 
 	void cmos_protect_w(uint32_t data);
 	void dma_queue_w(uint32_t data);
@@ -180,6 +184,17 @@ protected:
 	uint64_t m_usa_far_tests = 0, m_usa_extra_tests = 0, m_usa_reads = 0, m_usa_effect_reads = 0;
 	uint64_t m_usa_pending = 0, m_usa_removal = 0;
 	FILE *m_usa_distance_log = nullptr;
+	memory_passthrough_handler m_offroad_far_tap, m_offroad_clip_tap, m_offroad_ceiling_tap, m_offroad_table_tap;
+	uint32_t m_offroad_multiplier = 0;
+	std::vector<uint32_t> m_offroad_reciprocal;
+	uint64_t m_offroad_far_tests = 0, m_offroad_stock_rejects = 0, m_offroad_rejects = 0, m_offroad_extra = 0;
+	uint64_t m_offroad_clip_reads = 0, m_offroad_ceiling_reads = 0;
+	struct offroad_projection_count {
+		uint64_t reads = 0, extended = 0, upper = 0;
+		int32_t minimum = INT32_MAX, maximum = INT32_MIN;
+	};
+	std::array<offroad_projection_count,59> m_offroad_counts{};
+	FILE *m_offroad_log = nullptr, *m_offroad_projection_log = nullptr;
 };
 
 class midvunit_state : public midvunit_base_state

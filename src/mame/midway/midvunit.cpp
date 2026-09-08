@@ -34,6 +34,7 @@
 #include "cruisn/world_scenery.h"
 #include "cruisn/world_distance.h"
 #include "cruisn/usa_distance.h"
+#include "cruisn/offroad_distance.h"
 
 #include "cpu/adsp2100/adsp2100.h"
 #include "cpu/tms320c3x/tms320c3x.h"
@@ -78,6 +79,7 @@ void midvunit_base_state::machine_start()
 	scenery_start();
 	world_distance_start();
 	usa_distance_start();
+	offroad_distance_start();
 }
 
 // Developer-only global projection/residency experiment. The matching checked
@@ -279,6 +281,123 @@ void midvunit_base_state::usa_distance_tick()
 void midvunit_base_state::usa_distance_exit()
 {
 	if (m_usa_distance_log) { fclose(m_usa_distance_log); m_usa_distance_log=nullptr; }
+}
+
+// Off Road's C31 float far/clip limits and ROM reciprocal table are independent
+// of the World/USA layouts. Only verified consumers see substituted values;
+// race-transition initializers, stored limits and all resource bytes stay intact.
+void midvunit_base_state::offroad_distance_start()
+{
+	using namespace cruisn::offroad_distance;
+	const char *text=std::getenv("MIDV_OFFROAD_DISTANCE");
+	if (!text || !strcmp(text,"0")) return;
+	char *end=nullptr;
+	unsigned long multiplier=strtoul(text,&end,10);
+	if (!*text || *end || !valid_multiplier(multiplier) || strcmp(machine().system().name,"offroadc"))
+		fatalerror("MIDV_OFFROAD_DISTANCE requires Off Road 1.63 and 0/1/2/3\n");
+	m_offroad_multiplier=multiplier;
+	static_assert(std::size(projection_sites)==59,"update Off Road counter capacity");
+	for (uint32_t i=original_clip;i<=maximum_index(multiplier);++i)
+		m_offroad_reciprocal.push_back(reciprocal(i));
+	m_offroad_log=fopen("offroad-native.csv","w");
+	m_offroad_projection_log=fopen("offroad-native-projection.csv","w");
+	if (!m_offroad_log || !m_offroad_projection_log) fatalerror("Off Road distance logs could not be opened\n");
+	setvbuf(m_offroad_log,nullptr,_IOFBF,65536);
+	setvbuf(m_offroad_projection_log,nullptr,_IOFBF,65536);
+	fprintf(m_offroad_log,"frame,multiplier,profile_ok,far_tests,stock_rejects,far_rejects,extra_admissions,clip_reads,ceiling_reads\n");
+	fprintf(m_offroad_projection_log,"frame,pc,opcode,reads,extended_reads,minimum_index,maximum_index,upper_clamps\n");
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::offroad_distance_exit,this));
+	machine().save().register_postload(save_prepost_delegate(FUNC(midvunit_base_state::offroad_distance_reset),this));
+	address_space &s=m_maincpu->space(AS_PROGRAM);
+	m_offroad_far_tap=s.install_read_tap(0x1b724,0x1b724,"offroad_global_far",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			using namespace cruisn::offroad_distance;
+			if (machine().side_effects_disabled() || !far_pc(m_maincpu->state_int(TMS320C3X_PC))) return;
+			if (data!=far_word(1) || !code_matches(m_ram_base,m_ram_base.bytes()/4))
+			{ midv_ffb_cancel();fatalerror("Off Road far limit/instruction guard failed\n"); }
+			uint32_t bits=m_maincpu->state_int(TMS320C3X_R0F);float depth;std::memcpy(&depth,&bits,4);
+			if (!std::isfinite(depth)) { midv_ffb_cancel();fatalerror("Off Road culler depth is not finite\n"); }
+			++m_offroad_far_tests;
+			if (depth>=original_far) ++m_offroad_stock_rejects;
+			if (depth>=original_far*m_offroad_multiplier) ++m_offroad_rejects;
+			else if (depth>=original_far) ++m_offroad_extra;
+			data=far_word(m_offroad_multiplier);
+		});
+	m_offroad_clip_tap=s.install_read_tap(0x1b725,0x1b725,"offroad_global_clip",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			using namespace cruisn::offroad_distance;
+			if (machine().side_effects_disabled() || !clip_pc(m_maincpu->state_int(TMS320C3X_PC))) return;
+			if (data!=clip_word(1) || !code_matches(m_ram_base,m_ram_base.bytes()/4))
+			{ midv_ffb_cancel();fatalerror("Off Road clip limit/instruction guard failed\n"); }
+			data=clip_word(m_offroad_multiplier);++m_offroad_clip_reads;
+		});
+	m_offroad_ceiling_tap=s.install_read_tap(0x111a8,0x111a8,"offroad_global_table_ceiling",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			using namespace cruisn::offroad_distance;
+			if (machine().side_effects_disabled() || !ceiling_pc(m_maincpu->state_int(TMS320C3X_PC))) return;
+			if (data!=maximum_index(1) || !code_matches(m_ram_base,m_ram_base.bytes()/4))
+			{ midv_ffb_cancel();fatalerror("Off Road projection ceiling/instruction guard failed\n"); }
+			data=maximum_index(m_offroad_multiplier);++m_offroad_ceiling_reads;
+		});
+	m_offroad_table_tap=s.install_read_tap(table_base+minimum_index,0xffffff,"offroad_global_projection",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			using namespace cruisn::offroad_distance;
+			if (machine().side_effects_disabled() || !indexed_read(offset,m_maincpu->state_int(TMS320C3X_AR0),
+				m_maincpu->state_int(TMS320C3X_IR0))) return;
+			uint32_t pc=m_maincpu->state_int(TMS320C3X_PC);
+			const auto *site=projection_site(pc);
+			int32_t index=int32_t(offset)-int32_t(table_base);
+			if (!site || index<minimum_index || index>int32_t(maximum_index(m_offroad_multiplier))
+				|| !code_matches(m_ram_base,m_ram_base.bytes()/4))
+			{ midv_ffb_cancel();fatalerror("Off Road projection guard failed: pc=%x index=%d\n",pc,index); }
+			auto &count=m_offroad_counts[site-projection_sites];
+			++count.reads;count.minimum=std::min(count.minimum,index);count.maximum=std::max(count.maximum,index);
+			if (index==int32_t(maximum_index(m_offroad_multiplier))) ++count.upper;
+			if (index>=int32_t(original_clip))
+			{ data=m_offroad_reciprocal[index-original_clip];++count.extended; }
+		});
+	osd_printf_info("MIDV_OFFROAD_DISTANCE=%u: global Off Road 1.63 trial, far=%u clip=%u; no guest writes\n",
+		m_offroad_multiplier,original_far*m_offroad_multiplier,original_clip*m_offroad_multiplier);
+}
+
+void midvunit_base_state::offroad_distance_reset()
+{
+	m_offroad_far_tests=m_offroad_stock_rejects=m_offroad_rejects=m_offroad_extra=0;
+	m_offroad_clip_reads=m_offroad_ceiling_reads=0;
+	for (auto &c:m_offroad_counts) c=offroad_projection_count{};
+}
+
+void midvunit_base_state::offroad_distance_tick()
+{
+	using namespace cruisn::offroad_distance;
+	if (!m_offroad_log) return;
+	const auto frame=(unsigned long long)m_screen->frame_number();
+	if (fprintf(m_offroad_log,"%llu,%u,%d,%llu,%llu,%llu,%llu,%llu,%llu\n",frame,m_offroad_multiplier,
+		code_matches(m_ram_base,m_ram_base.bytes()/4),(unsigned long long)m_offroad_far_tests,
+		(unsigned long long)m_offroad_stock_rejects,(unsigned long long)m_offroad_rejects,
+		(unsigned long long)m_offroad_extra,(unsigned long long)m_offroad_clip_reads,
+		(unsigned long long)m_offroad_ceiling_reads)<0) fatalerror("Off Road distance log write failed\n");
+	for (size_t i=0;i<m_offroad_counts.size();++i)
+	{
+		const auto &c=m_offroad_counts[i];
+		if (c.reads && fprintf(m_offroad_projection_log,"%llu,%x,%08x,%llu,%llu,%d,%d,%llu\n",frame,
+			projection_sites[i].address+1,projection_sites[i].value,(unsigned long long)c.reads,
+			(unsigned long long)c.extended,c.minimum,c.maximum,(unsigned long long)c.upper)<0)
+			fatalerror("Off Road projection log write failed\n");
+	}
+	offroad_distance_reset();
+}
+
+void midvunit_base_state::offroad_distance_exit()
+{
+	bool failed=false;
+	if (m_offroad_log) { failed=fclose(m_offroad_log)!=0;m_offroad_log=nullptr; }
+	if (m_offroad_projection_log) { failed=(fclose(m_offroad_projection_log)!=0)||failed;m_offroad_projection_log=nullptr; }
+	if (failed) fatalerror("Off Road distance log close failed\n");
 }
 
 // Narrow, opt-in distance extension for attributed World 2.4 scenery only.
@@ -532,6 +651,7 @@ void midv_patches_tick(uint32_t *ram)
 
 void midvunit_base_state::machine_reset()
 {
+	offroad_distance_reset();
 	m_scenery_tree = 0;
 	reset_display_assets();
 	m_dcs->reset_w(0);
