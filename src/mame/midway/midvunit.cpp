@@ -33,6 +33,8 @@
 #include "cruisn/checked_patch.h"
 #include "cruisn/world_scenery.h"
 #include "cruisn/world_distance.h"
+#include "cruisn/world_host_scenery.h"
+#include <chrono>
 #include "cruisn/usa_distance.h"
 #include "cruisn/offroad_distance.h"
 
@@ -80,6 +82,72 @@ void midvunit_base_state::machine_start()
 	world_distance_start();
 	usa_distance_start();
 	offroad_distance_start();
+	world_host_start();
+}
+
+// Diagnostic host-only scenery: snapshot already resident pending objects at the
+// checked scene boundary. Never transfer them, execute guest code, change the CPU
+// clock, write VRAM or add to the hardware DMA stream. Disabled installs no tap.
+void midvunit_base_state::world_host_start()
+{
+	const char *mode=std::getenv("MIDV_WORLD_HOST_SCENERY");
+	if(!mode || !strcmp(mode,"0"))return;
+	if(strcmp(mode,"1") && strcmp(mode,"2"))fatalerror("MIDV_WORLD_HOST_SCENERY requires 0/1(observe)/2(draw)\n");
+	if(strcmp(machine().system().name,"crusnwld24") || m_scenery_mode || m_distance_far)
+		fatalerror("Host scenery requires World 2.4 and stock distance/activation\n");
+	m_host_mode=uint32_t(mode[0]-'0');
+	for(auto pair:{std::make_pair("MIDV_WORLD_HOST_FIRST",&m_host_first),std::make_pair("MIDV_WORLD_HOST_LAST",&m_host_last)})
+		if(const char *text=std::getenv(pair.first))
+		{
+			char *end=nullptr;unsigned long value=strtoul(text,&end,10);
+			if(!*text || *end || *text=='-')fatalerror("Invalid host scenery frame bound\n");
+			*pair.second=uint32_t(value);
+		}
+	if(m_host_first>m_host_last)fatalerror("Host scenery frame bounds reversed\n");
+	m_host_scene_log=fopen("world-host-scenes.csv","w");
+	m_host_quad_log=fopen("world-host-quads.csv","w");
+	if(!m_host_scene_log || !m_host_quad_log)fatalerror("Cannot create host scenery evidence\n");
+	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);setvbuf(m_host_quad_log,nullptr,_IOFBF,65536);
+	fprintf(m_host_scene_log,"frame,page,mode,pending,unsupported,distance,decoded,quads,microseconds\n");
+	fprintf(m_host_quad_log,"frame,page,object,model,depth,section,flags,palette,x0,y0,x1,y1,x2,y2,x3,y3,uv0,uv1,uv2,uv3,texture,word15\n");
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::world_host_exit,this));
+	auto &space=m_maincpu->space(AS_PROGRAM);
+	m_host_scene_tap=space.install_read_tap(0x61ee,0x61ee,"world_host_scene",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6a)return;
+			uint64_t frame=m_screen->frame_number();
+			if(frame<m_host_first || frame>m_host_last)return;
+			const auto started=std::chrono::steady_clock::now();
+			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,24) ||
+				m_ram_base[0x69]!=0x082861ee || m_ram_base[0x7b55]!=0x082861ec ||
+				m_ram_base[0x7b5c]!=0x1ae03000 || m_ram_base[0xd58c]!=11)
+				fatalerror("World host scenery exact-revision/stock-distance guard failed\n");
+			cruisn::world_host::Scene scene;
+			auto &s=m_maincpu->space(AS_PROGRAM);
+			// Reads never cover this tap's 61EE address; no transient guest state.
+			if(!cruisn::world_host::build([&](uint32_t p){return s.read_dword(p);},scene))
+				fatalerror("World host scenery pointer/model/projection guard failed\n");
+			std::vector<std::array<uint16_t,16>> quads;
+			for(const auto &o:scene.objects)for(const auto &q:o.quads)
+			{
+				quads.push_back(q);
+				fprintf(m_host_quad_log,"%llu,%u,%u,%u,%d,%u",(unsigned long long)frame,m_page_control,o.id,o.model,o.depth,o.section);
+				for(auto word:q)fprintf(m_host_quad_log,",%u",word);
+				fputc('\n',m_host_quad_log);
+			}
+			if(m_host_mode==2)world_host_submit(quads);
+			double us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
+			fprintf(m_host_scene_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%.3f\n",(unsigned long long)frame,m_page_control,
+				m_host_mode,scene.pending,scene.unsupported,scene.distance,scene.decoded,unsigned(quads.size()),us);
+		});
+	osd_printf_info("World host scenery mode=%u frames=%u..%u: guest simulation unchanged, stock far, pending static codecs only\n",m_host_mode,m_host_first,m_host_last);
+}
+
+void midvunit_base_state::world_host_exit()
+{
+	if(m_host_scene_log){fclose(m_host_scene_log);m_host_scene_log=nullptr;}
+	if(m_host_quad_log){fclose(m_host_quad_log);m_host_quad_log=nullptr;}
 }
 
 // Developer-only global projection/residency experiment. The matching checked

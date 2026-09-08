@@ -103,6 +103,9 @@ protected:
 	void world_distance_start();
 	void world_distance_tick();
 	void world_distance_exit();
+	void world_host_start();
+	void world_host_exit();
+	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads);
 	void usa_distance_start();
 	void usa_distance_tick();
 	void usa_distance_exit();
@@ -177,6 +180,9 @@ protected:
 	std::vector<uint32_t> m_distance_reciprocal;
 	uint64_t m_distance_far_tests = 0, m_distance_extra_tests = 0, m_distance_reads = 0, m_distance_pending = 0;
 	FILE *m_distance_log = nullptr;
+	memory_passthrough_handler m_host_scene_tap;
+	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr;
+	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff;
 	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
 	uint32_t m_usa_far = 0, m_usa_max_index = 0;
 	bool m_usa_residency = false;

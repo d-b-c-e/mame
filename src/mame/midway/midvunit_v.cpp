@@ -2938,6 +2938,18 @@ void midvunit_base_state::observe_numeric_hud()
 
 }
 
+void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_t,16>> &quads)
+{
+	if(!live().enabled)fatalerror("World host scenery drawing requires the live GL renderer\n");
+	if(quads.empty())return;
+	const uint32_t frame=uint32_t(m_screen->frame_number());
+	live().last_frame=frame;
+	live().sync_state(frame,m_paletteram.target(),uint32_t(m_paletteram.bytes()),
+		m_textureram.target(),uint32_t(m_textureram.bytes()));
+	struct {uint32_t frame;uint16_t pc,pad;} h={frame,m_page_control,0};
+	for(const auto &q:quads)live().write_msg(1,&h,8,q.data(),32);
+}
+
 void midvunit_renderer::process_dma_queue()
 {
 	m_state.observe_numeric_hud();
