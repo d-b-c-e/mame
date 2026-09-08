@@ -33,6 +33,7 @@
 #include "cruisn/checked_patch.h"
 #include "cruisn/world_scenery.h"
 #include "cruisn/world_distance.h"
+#include "cruisn/usa_distance.h"
 
 #include "cpu/adsp2100/adsp2100.h"
 #include "cpu/tms320c3x/tms320c3x.h"
@@ -76,6 +77,7 @@ void midvunit_base_state::machine_start()
 	save_item(NAME(m_scenery_tree));
 	scenery_start();
 	world_distance_start();
+	usa_distance_start();
 }
 
 // Developer-only global projection/residency experiment. The matching checked
@@ -179,6 +181,104 @@ void midvunit_base_state::world_distance_tick()
 void midvunit_base_state::world_distance_exit()
 {
 	if (m_distance_log) { fclose(m_distance_log); m_distance_log = nullptr; }
+}
+
+
+// USA has a depth-based active/pending window, unlike World's section lookahead.
+// The guest still transfers objects. Only guarded reads see extended limits.
+void midvunit_base_state::usa_distance_start()
+{
+	using namespace cruisn::usa_distance;
+	const char *text=std::getenv("MIDV_USA_FAR");
+	if (!text) return;
+	char *end=nullptr;
+	unsigned long far=strtoul(text,&end,10);
+	if (!*text || *end || !valid_far(far) || strcmp(machine().system().name,"crusnusa"))
+		fatalerror("MIDV_USA_FAR requires USA 4.5 and 80000/100000/160000/240000\n");
+	m_usa_far=far;
+	const char *residency=std::getenv("MIDV_USA_RESIDENCY");
+	if (residency && strcmp(residency,"0") && strcmp(residency,"1"))
+		fatalerror("MIDV_USA_RESIDENCY must be 0 or 1\n");
+	m_usa_residency=!residency || !strcmp(residency,"1");
+	if (maximum_index(far)>=first_extra)
+	{
+		m_usa_reciprocal.resize(maximum_index(far)-first_extra+1);
+		for (uint32_t i=first_extra; i<=maximum_index(far); ++i)
+			m_usa_reciprocal[i-first_extra]=reciprocal(i,far);
+	}
+	m_usa_distance_log=fopen("usa-distance.csv","w");
+	if (!m_usa_distance_log) fatalerror("USA distance log could not be opened\n");
+	setvbuf(m_usa_distance_log,nullptr,_IOFBF,65536);
+	fprintf(m_usa_distance_log,"frame,far,residency,profile_ok,far_tests,extra_far_tests,extended_reads,effect_reads,maximum_index,pending_comparisons,removal_comparisons\n");
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::usa_distance_exit,this));
+	address_space &s=m_maincpu->space(AS_PROGRAM);
+	m_usa_far_tap=s.install_read_tap(0x55,0x55,"usa_global_far_observe",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			using namespace cruisn::usa_distance;
+			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0xcc) return;
+			if (!code_matches(m_ram_base,m_ram_base.bytes()/4,m_usa_far))
+				fatalerror("USA distance guard failed: missing or incompatible checked patch\n");
+			++m_usa_far_tests;
+			int32_t depth=int32_t(m_maincpu->state_int(TMS320C3X_R3));
+			if (depth>80000 && depth<=int32_t(data)) ++m_usa_extra_tests;
+		});
+	if (!m_usa_reciprocal.empty())
+		m_usa_reciprocal_tap=s.install_read_tap(reciprocal_base+first_extra,0x1ffff,"usa_global_projection",
+			[this](offs_t offset,uint32_t &data,uint32_t mask)
+			{
+				using namespace cruisn::usa_distance;
+				uint32_t pc=m_maincpu->state_int(TMS320C3X_PC);
+				if (machine().side_effects_disabled() || !projection_pc(pc)) return;
+				if (!projection_base(pc,offset,m_maincpu->state_int(TMS320C3X_AR2),
+					m_maincpu->state_int(TMS320C3X_AR3),m_maincpu->state_int(TMS320C3X_R5))) return;
+				uint32_t index=offset-reciprocal_base;
+				if (index>maximum_index(m_usa_far) || !code_matches(m_ram_base,m_ram_base.bytes()/4,m_usa_far))
+				{
+					midv_ffb_cancel();
+					fatalerror("USA projection guard failed: pc=%x index=%u far=%u\n",pc,index,m_usa_far);
+				}
+				data=m_usa_reciprocal[index-first_extra];
+				++m_usa_reads;
+				if (pc==0xa729) ++m_usa_effect_reads;
+				m_usa_max_index=std::max(m_usa_max_index,index);
+			});
+	// Always observe both consumers, including the stock-residency control.
+	m_usa_residency_tap=s.install_read_tap(0x727d,0x727e,"usa_global_residency",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			using namespace cruisn::usa_distance;
+			uint32_t pc=m_maincpu->state_int(TMS320C3X_PC);
+			bool admission=offset==0x727d && pc==0x729c;
+			bool removal=offset==0x727e && pc==0x7281;
+			if (machine().side_effects_disabled() || (!admission && !removal)) return;
+			if (!residency_matches(m_ram_base,m_ram_base.bytes()/4)
+				|| !code_matches(m_ram_base,m_ram_base.bytes()/4,m_usa_far))
+			{
+				midv_ffb_cancel(); fatalerror("USA residency instruction signature failed\n");
+			}
+			if (admission) ++m_usa_pending; else ++m_usa_removal;
+			if (m_usa_residency) data=admission ? admission_limit(m_usa_far) : m_usa_far;
+		});
+	osd_printf_info("MIDV_USA_FAR=%u residency=%d: global USA 4.5 experiment, no model allowlist\n",m_usa_far,m_usa_residency);
+}
+
+void midvunit_base_state::usa_distance_tick()
+{
+	if (m_usa_distance_log && fprintf(m_usa_distance_log,"%llu,%u,%d,%d,%llu,%llu,%llu,%llu,%u,%llu,%llu\n",
+		(unsigned long long)m_screen->frame_number(),m_usa_far,m_usa_residency,
+		cruisn::usa_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,m_usa_far),
+		(unsigned long long)m_usa_far_tests,(unsigned long long)m_usa_extra_tests,
+		(unsigned long long)m_usa_reads,(unsigned long long)m_usa_effect_reads,m_usa_max_index,
+		(unsigned long long)m_usa_pending,(unsigned long long)m_usa_removal)<0)
+		fatalerror("USA distance log write failed\n");
+	m_usa_far_tests=m_usa_extra_tests=m_usa_reads=m_usa_effect_reads=m_usa_pending=m_usa_removal=0;
+	m_usa_max_index=0;
+}
+
+void midvunit_base_state::usa_distance_exit()
+{
+	if (m_usa_distance_log) { fclose(m_usa_distance_log); m_usa_distance_log=nullptr; }
 }
 
 // Narrow, opt-in distance extension for attributed World 2.4 scenery only.

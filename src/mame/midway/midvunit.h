@@ -103,6 +103,9 @@ protected:
 	void world_distance_start();
 	void world_distance_tick();
 	void world_distance_exit();
+	void usa_distance_start();
+	void usa_distance_tick();
+	void usa_distance_exit();
 
 	void cmos_protect_w(uint32_t data);
 	void dma_queue_w(uint32_t data);
@@ -170,6 +173,13 @@ protected:
 	std::vector<uint32_t> m_distance_reciprocal;
 	uint64_t m_distance_far_tests = 0, m_distance_extra_tests = 0, m_distance_reads = 0, m_distance_pending = 0;
 	FILE *m_distance_log = nullptr;
+	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
+	uint32_t m_usa_far = 0, m_usa_max_index = 0;
+	bool m_usa_residency = false;
+	std::vector<uint32_t> m_usa_reciprocal;
+	uint64_t m_usa_far_tests = 0, m_usa_extra_tests = 0, m_usa_reads = 0, m_usa_effect_reads = 0;
+	uint64_t m_usa_pending = 0, m_usa_removal = 0;
+	FILE *m_usa_distance_log = nullptr;
 };
 
 class midvunit_state : public midvunit_base_state

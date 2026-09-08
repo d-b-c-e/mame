@@ -3305,6 +3305,7 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	midv_patches_tick(m_ram_base);
 	scenery_tick();
 	world_distance_tick();
+	usa_distance_tick();
 	if (live().enabled)
 		live().speed_pct = float(machine().video().speed_percent() * 100.0);
 	midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half (every frame)
