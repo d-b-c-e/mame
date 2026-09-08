@@ -12,6 +12,7 @@
 #include "luaengine.ipp"
 
 #include "mame.h"
+#include "cheat.h"
 #include "pluginopts.h"
 #include "ui/pluginopt.h"
 #include "ui/ui.h"
@@ -2295,6 +2296,48 @@ void lua_engine::initialize()
 	mame_manager_type["ui"] = sol::property(&mame_machine_manager::ui);
 	mame_manager_type["options"] = sol::property(&mame_machine_manager::options);
 	mame_manager_type["plugins"] = sol::property([] (mame_machine_manager &m) { return plugin_options_plugins(m.plugins()); });
+	// Collection UI/diagnostics use the native cheat interpreter. Return copied
+	// metadata rather than pointers that a cheat reload could invalidate.
+	mame_manager_type["cheat_entries"] = [this] (mame_machine_manager &m)
+		{
+			auto result = sol().create_table();
+			if (!m.machine() || !m.machine()->options().cheat()) return result;
+			int index = 0;
+			for (auto const &entry : m.cheat().entries())
+			{
+				std::string description, state; uint32_t flags;
+				entry->menu_text(description, state, flags);
+				auto row = sol().create_table();
+				row["index"] = ++index;
+				row["description"] = description;
+				row["comment"] = entry->comment();
+				row["state"] = state;
+				row["active"] = entry->state() != SCRIPT_STATE_OFF;
+				row["kind"] = entry->is_text_only() ? "text" : entry->is_oneshot() ? "oneshot" :
+					entry->is_onoff() ? "toggle" : entry->is_oneshot_parameter() ? "oneshot_parameter" : "parameter";
+				result[index] = row;
+			}
+			return result;
+		};
+	mame_manager_type["cheat_command"] = [] (mame_machine_manager &m, int index,
+			std::string const &description, std::string const &action)
+		{
+			if (!m.machine() || !m.machine()->options().cheat()) throw sol::error("Cheat engine is disabled");
+			auto const &entries = m.cheat().entries();
+			if (index < 1 || size_t(index) > entries.size()) throw sol::error("Invalid cheat index");
+			auto &entry = *entries[index - 1];
+			std::string current, state; uint32_t flags;
+			entry.menu_text(current, state, flags);
+			if (description != current) throw sol::error("Cheat description changed; refresh the menu");
+			bool changed = false;
+			if (action == "off") changed = entry.select_default_state();
+			else if (action == "next") changed = entry.select_next_state();
+			else if (action == "previous") changed = entry.select_previous_state();
+			else if (action == "activate") changed = entry.activate();
+			else throw sol::error("Unknown cheat action");
+			osd_printf_info("Collection cheat: %d %s %s changed=%d\n", index, description, action, changed);
+			return changed;
+		};
 	sol()["manager"] = std::ref(*mame_machine_manager::instance());
 	sol()["mame_manager"] = std::ref(*mame_machine_manager::instance());
 
