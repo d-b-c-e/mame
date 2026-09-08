@@ -96,6 +96,13 @@ void midvunit_base_state::world_host_start()
 	if(strcmp(machine().system().name,"crusnwld24") || m_scenery_mode || m_distance_far)
 		fatalerror("Host scenery requires World 2.4 and stock distance/activation\n");
 	m_host_mode=uint32_t(mode[0]-'0');
+	if(const char *far=std::getenv("MIDV_WORLD_HOST_FAR"))
+	{
+		if(!strcmp(far,"80000"))m_host_far=80000;
+		else if(!strcmp(far,"160000"))m_host_far=160000;
+		else if(!strcmp(far,"240000"))m_host_far=240000;
+		else fatalerror("MIDV_WORLD_HOST_FAR requires 80000/160000/240000\n");
+	}
 	for(auto pair:{std::make_pair("MIDV_WORLD_HOST_FIRST",&m_host_first),std::make_pair("MIDV_WORLD_HOST_LAST",&m_host_last)})
 		if(const char *text=std::getenv(pair.first))
 		{
@@ -108,7 +115,7 @@ void midvunit_base_state::world_host_start()
 	m_host_quad_log=fopen("world-host-quads.csv","w");
 	if(!m_host_scene_log || !m_host_quad_log)fatalerror("Cannot create host scenery evidence\n");
 	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);setvbuf(m_host_quad_log,nullptr,_IOFBF,65536);
-	fprintf(m_host_scene_log,"frame,page,mode,pending,unsupported,distance,decoded,quads,microseconds\n");
+	fprintf(m_host_scene_log,"frame,page,mode,pending,unsupported,distance,decoded,quads,microseconds,host_far\n");
 	fprintf(m_host_quad_log,"frame,page,object,model,depth,section,flags,palette,x0,y0,x1,y1,x2,y2,x3,y3,uv0,uv1,uv2,uv3,texture,word15\n");
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::world_host_exit,this));
 	auto &space=m_maincpu->space(AS_PROGRAM);
@@ -126,7 +133,7 @@ void midvunit_base_state::world_host_start()
 			cruisn::world_host::Scene scene;
 			auto &s=m_maincpu->space(AS_PROGRAM);
 			// Reads never cover this tap's 61EE address; no transient guest state.
-			if(!cruisn::world_host::build([&](uint32_t p){return s.read_dword(p);},scene))
+			if(!cruisn::world_host::build([&](uint32_t p){return s.read_dword(p);},scene,m_host_far))
 				fatalerror("World host scenery pointer/model/projection guard failed\n");
 			std::vector<std::array<uint16_t,16>> quads;
 			for(const auto &o:scene.objects)for(const auto &q:o.quads)
@@ -138,10 +145,10 @@ void midvunit_base_state::world_host_start()
 			}
 			if(m_host_mode==2)world_host_submit(quads);
 			double us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
-			fprintf(m_host_scene_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%.3f\n",(unsigned long long)frame,m_page_control,
-				m_host_mode,scene.pending,scene.unsupported,scene.distance,scene.decoded,unsigned(quads.size()),us);
+			fprintf(m_host_scene_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%.3f,%u\n",(unsigned long long)frame,m_page_control,
+				m_host_mode,scene.pending,scene.unsupported,scene.distance,scene.decoded,unsigned(quads.size()),us,m_host_far);
 		});
-	osd_printf_info("World host scenery mode=%u frames=%u..%u: guest simulation unchanged, stock far, pending static codecs only\n",m_host_mode,m_host_first,m_host_last);
+	osd_printf_info("World host scenery mode=%u frames=%u..%u host_far=%u: guest simulation/far unchanged, pending static codecs only\n",m_host_mode,m_host_first,m_host_last,m_host_far);
 }
 
 void midvunit_base_state::world_host_exit()
