@@ -3306,9 +3306,6 @@ uint32_t midvunit_base_state::screen_update(screen_device &screen, bitmap_ind16 
 	world_distance_tick();
 	if (live().enabled)
 		live().speed_pct = float(machine().video().speed_percent() * 100.0);
-	if (!strcmp(machine().system().name,"crusnwld24") || !strcmp(machine().system().name,"crusnwld"))
-		midv_ffb_game_active(cruisn::world_driving(m_ram_base.target(),m_ram_base.bytes()/4,
-			!strcmp(machine().system().name,"crusnwld")));
 	midv_trace_wheelpos(machine(), ":WHEEL");   // POC: FFB trace, input half (every frame)
 
 	// Esc options menu pause: block the emu thread here while the menu is
