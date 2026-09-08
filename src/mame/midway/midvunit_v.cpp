@@ -2500,12 +2500,13 @@ static FILE *s_force_source = nullptr;
 static FILE *s_force_gate = nullptr;
 static FILE *s_signal_trace = nullptr;
 static FILE *s_drivetrain_trace = nullptr;
-void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
+void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds, bool game_invert)
 {
-	mvffb::s_raw_level.store(mvffb::s_game_active.load()?cruisn::motor_level(raw, mvffb::s_invert):0);
+	mvffb::s_raw_level.store(mvffb::s_game_active.load()?cruisn::motor_level(raw, mvffb::s_invert, game_invert):0);
 	if (s_force_gate)
-		fprintf(s_force_gate,"%.9f,%llu,%d,%d,%d\n",seconds,(unsigned long long)frame,
-			int(mvffb::s_game_active.load()),raw,mvffb::s_game_active.load()?cruisn::motor_level(adapted,mvffb::s_invert):0);
+		fprintf(s_force_gate,"%.9f,%llu,%d,%d,%d,%d,%d\n",seconds,(unsigned long long)frame,
+			int(mvffb::s_game_active.load()),raw,mvffb::s_game_active.load()?cruisn::motor_level(adapted,mvffb::s_invert,game_invert):0,
+			int(game_invert),int(mvffb::s_invert));
 	if (s_force_source)
 		fprintf(s_force_source, "%.9f,%llu,%d,%d\n", seconds,
 			(unsigned long long)frame, raw, adapted);
@@ -2513,11 +2514,11 @@ void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds)
 
 // Motor byte from the drivers (signed, after gain/slew/clamp). Any thread.
 void midv_ffb_cancel() { mvffb::s_raw_level.store(0); mvffb::s_cancel_impact.store(true); midv_ffb_write(0); }
-void midv_ffb_write(int f)
+void midv_ffb_write(int f, bool game_invert)
 {
 	if (!mvffb::s_running.load())
 		return;
-	int const level = mvffb::s_game_active.load()?cruisn::motor_level(f, mvffb::s_invert):0;
+	int const level = mvffb::s_game_active.load()?cruisn::motor_level(f, mvffb::s_invert,game_invert):0;
 	if (mvffb::s_loglevel >= 2)
 		mvffb::flog("write %d -> level %d", f, level);
 	mvffb::s_level.store(level);
@@ -2609,7 +2610,7 @@ void midv_telemetry_start(running_machine &machine)
 		if (s_force_source) {
 			fprintf(s_force_source, "# schema=1 game=%s units=signed_motor_byte clock=emulated\nseconds,frame,raw,adapted\n", machine.system().name);
 			s_force_gate=fopen("force-gate.csv","w");
-			if (s_force_gate) fprintf(s_force_gate,"seconds,frame,enabled,raw,requested_level\n");
+			if (s_force_gate) fprintf(s_force_gate,"seconds,frame,enabled,raw,requested_level,game_invert,device_invert\n");
 			machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () {
 				fclose(s_force_source); s_force_source = nullptr;
 				if (s_force_gate) { fclose(s_force_gate); s_force_gate=nullptr; }

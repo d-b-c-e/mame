@@ -230,9 +230,9 @@ private:
  *************************************/
 
 void midv_telemetry_start(running_machine &machine);   // midvunit_v.cpp (POC)
-void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds);
+void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds, bool game_invert = false);
 void midv_ffb_game_active(bool active);
-void midv_ffb_write(int f);                             // midvunit_v.cpp (POC built-in FFB)
+void midv_ffb_write(int f, bool game_invert = false);    // midvunit_v.cpp (POC built-in FFB)
 
 void midzeus_state::machine_start()
 {
@@ -746,8 +746,17 @@ void crusnexo_state::crusnexo_leds_w(offs_t offset, uint32_t data)
 			m_wheel_motor = uint8_t(int8_t(f));
 			if (!strcmp(machine().system().name,"crusnexo"))
 				midv_ffb_game_active(cruisn::exotica_driving(m_ram_base.target(),m_ram_base.bytes()/4));
-			midv_ffb_source(int(int8_t(data & 0xff)), f, m_screen->frame_number(), machine().time().as_double());
-			midv_ffb_write(f);   // POC built-in FFB (MIDV_FFB=1)
+			// Wheel Invert changes the cabinet motor signal, not vehicle steering.
+			// Read the actual switch so imported settings and live DIP changes agree.
+			bool const game_invert = !strcmp(machine().system().name,"crusnexo")
+				&& cruisn::exotica_motor_inverted(ioport("DIPS")->read());
+			static int s_polarity = -1;
+			if (!strcmp(machine().system().name,"crusnexo") && s_polarity != int(game_invert)) {
+				s_polarity = int(game_invert);
+				osd_printf_info("Exotica force polarity: cabinet motor inversion=%d; steering input unchanged\n",s_polarity);
+			}
+			midv_ffb_source(int(int8_t(data & 0xff)), f, m_screen->frame_number(), machine().time().as_double(), game_invert);
+			midv_ffb_write(f, game_invert);   // POC built-in FFB (MIDV_FFB=1)
 			break;
 		}
 
