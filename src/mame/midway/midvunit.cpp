@@ -88,8 +88,11 @@ void midvunit_base_state::world_distance_start()
 	if (!far_text) return;
 	char *end = nullptr;
 	unsigned long far = strtoul(far_text, &end, 10);
-	if (!*far_text || *end || !valid_far(far) || strcmp(machine().system().name, "crusnwld24") || m_scenery_mode)
-		fatalerror("MIDV_WORLD_FAR requires World 2.4, scenery off, and 80000/100000/160000/240000\n");
+	m_distance_revision = !strcmp(machine().system().name, "crusnwld24") ? 24 :
+		!strcmp(machine().system().name, "crusnwld") ? 25 : 0;
+	const auto *profile = layout_for_revision(m_distance_revision);
+	if (!*far_text || *end || !valid_far(far) || !profile || m_scenery_mode)
+		fatalerror("MIDV_WORLD_FAR requires World 2.4/2.5, scenery off, and 80000/100000/160000/240000\n");
 	m_distance_far = far;
 	if (const char *lead = std::getenv("MIDV_WORLD_LEAD"))
 	{
@@ -120,22 +123,23 @@ void midvunit_base_state::world_distance_start()
 		[this](offs_t offset, uint32_t &data, uint32_t mask)
 		{
 			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC) != 0xa1) return;
-			if (!cruisn::world_distance::code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far))
+			if (!cruisn::world_distance::code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far, m_distance_revision))
 				fatalerror("World global distance guard failed: missing or incompatible checked game patch\n");
 			++m_distance_far_tests;
 			int32_t depth = int32_t(m_maincpu->state_int(TMS320C3X_R3));
 			if (depth > 80000 && depth <= int32_t(data)) ++m_distance_extra_tests;
 		});
 	if (!m_distance_reciprocal.empty())
-		m_distance_reciprocal_tap = s.install_read_tap(reciprocal_base+first_extra, 0x1ffff, "world_global_projection",
+		m_distance_reciprocal_tap = s.install_read_tap(profile->table+first_extra, 0x1ffff, "world_global_projection",
 			[this](offs_t offset, uint32_t &data, uint32_t mask)
 			{
 				using namespace cruisn::world_distance;
+				const uint32_t table = layout_for_revision(m_distance_revision)->table;
 				uint32_t pc = m_maincpu->state_int(TMS320C3X_PC);
 				if (machine().side_effects_disabled() || !projection_pc(pc)
-					|| (pc != 0xb4 && m_maincpu->state_int(TMS320C3X_AR2) != reciprocal_base)) return;
-				uint32_t index = offset-reciprocal_base;
-				if (index > maximum_index(m_distance_far) || !code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far))
+					|| (pc != 0xb4 && m_maincpu->state_int(TMS320C3X_AR2) != table)) return;
+				uint32_t index = offset-table;
+				if (index > maximum_index(m_distance_far) || !code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far, m_distance_revision))
 				{
 					midv_ffb_cancel();
 					fatalerror("World global projection guard failed: pc=%x index=%u far=%u\n", pc, index, m_distance_far);
@@ -144,18 +148,18 @@ void midvunit_base_state::world_distance_start()
 				++m_distance_reads; m_distance_max_index = std::max(m_distance_max_index, index);
 			});
 	if (m_distance_lead)
-		m_distance_pending_tap = s.install_read_tap(0xd58c, 0xd58c, "world_global_pending",
+		m_distance_pending_tap = s.install_read_tap(profile->pending_limit, profile->pending_limit, "world_global_pending",
 			[this](offs_t offset, uint32_t &data, uint32_t mask)
 			{
-				if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC) != 0x7b51) return;
-				if (data != 11 || !cruisn::world_distance::pending_matches(m_ram_base, m_ram_base.bytes()/4))
+				if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC) != cruisn::world_distance::layout_for_revision(m_distance_revision)->pending_pc) return;
+				if (data != 11 || !cruisn::world_distance::pending_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_revision))
 				{
 					midv_ffb_cancel(); fatalerror("World global pending-list signature failed\n");
 				}
 				data += m_distance_lead; ++m_distance_pending;
 			});
-	osd_printf_info("MIDV_WORLD_FAR=%u lead=%u CPU=%.0f%%: global World 2.4 experiment, no model allowlist\n",
-		m_distance_far, m_distance_lead, m_maincpu->clock_scale()*100);
+	osd_printf_info("MIDV_WORLD_FAR=%u lead=%u CPU=%.0f%%: global World 2.%u experiment, table=%x pending=%x, no model allowlist\n",
+		m_distance_far, m_distance_lead, m_maincpu->clock_scale()*100, m_distance_revision-20, profile->table, profile->pending_limit);
 }
 
 void midvunit_base_state::world_distance_tick()
@@ -163,7 +167,7 @@ void midvunit_base_state::world_distance_tick()
 	if (m_distance_log && fprintf(m_distance_log, "%llu,%u,%u,%.0f,%d,%llu,%llu,%llu,%u,%llu\n",
 		(unsigned long long)m_screen->frame_number(), m_distance_far, m_distance_lead,
 		m_maincpu->clock_scale()*100,
-		cruisn::world_distance::code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far),
+		cruisn::world_distance::code_matches(m_ram_base, m_ram_base.bytes()/4, m_distance_far, m_distance_revision),
 		(unsigned long long)m_distance_far_tests,
 		(unsigned long long)m_distance_extra_tests, (unsigned long long)m_distance_reads,
 		m_distance_max_index, (unsigned long long)m_distance_pending) < 0)
