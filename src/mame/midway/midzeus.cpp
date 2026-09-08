@@ -29,6 +29,7 @@ The Grid         v1.2   10/18/2000
 #include "emu.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/hud_drivetrain.h"
+#include "cruisn/exotica_visibility.h"
 
 #include <algorithm>
 
@@ -167,9 +168,31 @@ protected:
 
 		save_item(NAME(m_keypad_select));
 		save_item(NAME(m_crusnexo_leds_select));
+		visibility_start();
+	}
+
+	virtual void machine_reset() override
+	{
+		midzeus2_state::machine_reset();
+		visibility_reset();
 	}
 
 private:
+	void visibility_start();
+	void visibility_guard();
+	void visibility_tick();
+	void visibility_reset();
+	void visibility_exit();
+	bool m_visibility_projection=false, m_visibility_margins=false;
+	std::string m_visibility_mode;
+	std::vector<uint32_t> m_visibility_reciprocal;
+	FILE *m_visibility_log=nullptr;
+	memory_passthrough_handler m_visibility_far_tap, m_visibility_projection_tap;
+	memory_passthrough_handler m_visibility_lower_tap, m_visibility_upper_tap, m_visibility_accept_tap;
+	uint64_t m_visibility_far_tests=0, m_visibility_far_rejects=0, m_visibility_extended=0;
+	uint64_t m_visibility_lower=0, m_visibility_upper=0, m_visibility_accepted=0;
+	uint32_t m_visibility_maximum=0;
+
 	uint32_t crusnexo_leds_r(offs_t offset);
 	void crusnexo_leds_w(offs_t offset, uint32_t data);
 	void keypad_select_w(offs_t offset, uint32_t data);
@@ -233,6 +256,108 @@ void midv_telemetry_start(running_machine &machine);   // midvunit_v.cpp (POC)
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds, bool game_invert = false);
 void midv_ffb_game_active(bool active);
 void midv_ffb_write(int f, bool game_invert = false);    // midvunit_v.cpp (POC built-in FFB)
+
+// Opt-in CPU sphere admission. No guest writes, extra simulation or model allowlist.
+// The far plane and Zeus projection remain unchanged. Backing RAM reads avoid
+// recursive address-space taps and need no transient object cache across loads.
+void midv_ffb_cancel();
+void crusnexo_state::visibility_guard()
+{
+	if (!cruisn::exotica_visibility::code_matches(m_ram_base.target(),m_ram_base.bytes()/4)) {
+		midv_ffb_cancel();
+		fatalerror("Exotica visibility instruction/table signature failed\n");
+	}
+}
+
+void crusnexo_state::visibility_start()
+{
+	using namespace cruisn::exotica_visibility;
+	const char *mode=std::getenv("MIDZ_VISIBILITY");
+	if (!mode || !strcmp(mode,"off")) return;
+	m_visibility_projection=!strcmp(mode,"projection") || !strcmp(mode,"both");
+	m_visibility_margins=!strcmp(mode,"margins") || !strcmp(mode,"both");
+	if ((!m_visibility_projection && !m_visibility_margins && strcmp(mode,"stock"))
+		|| strcmp(machine().system().name,"crusnexo"))
+		fatalerror("MIDZ_VISIBILITY requires Exotica2.4: off/stock/projection/margins/both\n");
+	m_visibility_mode=mode;
+	if (m_visibility_projection) {
+		m_visibility_reciprocal.resize(maximum_index-original_index);
+		for (uint32_t i=original_index+1;i<=maximum_index;++i)
+			m_visibility_reciprocal[i-original_index-1]=reciprocal(i);
+	}
+	m_visibility_log=fopen("exotica-visibility.csv","w");
+	if (!m_visibility_log) fatalerror("Cannot create Exotica visibility log\n");
+	setvbuf(m_visibility_log,nullptr,_IOFBF,65536);
+	fprintf(m_visibility_log,"frame,mode,profile_ok,far_tests,far_rejects,extended_reads,maximum_index,lower_reads,upper_reads,accepted\n");
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::visibility_exit,this));
+	machine().save().register_postload(save_prepost_delegate(FUNC(crusnexo_state::visibility_reset),this));
+	auto &space=m_maincpu->space(AS_PROGRAM);
+	m_visibility_far_tap=space.install_read_tap(0x67da,0x67da,"exotica_visibility_far",
+		[this](offs_t offset,uint32_t &data,uint32_t mask) {
+			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6888) return;
+			visibility_guard();++m_visibility_far_tests;
+			if (int32_t(m_maincpu->state_int(TMS320C3X_R2))>int32_t(data)) ++m_visibility_far_rejects;
+		});
+	if (m_visibility_projection)
+		m_visibility_projection_tap=space.install_read_tap(table_base+original_index,table_base+original_index,"exotica_visibility_projection",
+			[this](offs_t offset,uint32_t &data,uint32_t mask) {
+				using namespace cruisn::exotica_visibility;
+				if (machine().side_effects_disabled() || !projection_consumer(m_maincpu->state_int(TMS320C3X_PC),
+					m_maincpu->state_int(TMS320C3X_AR3),m_maincpu->state_int(TMS320C3X_IR0))) return;
+				visibility_guard();
+				auto pose=read_sample(m_ram_base.target(),m_ram_base.bytes()/4,
+					m_maincpu->state_int(TMS320C3X_AR7),m_maincpu->state_int(TMS320C3X_R2));
+				if (!pose.valid || data!=0xf851bf7b) {
+					midv_ffb_cancel();fatalerror("Exotica visibility object/factor guard failed\n");
+				}
+				if (extends(pose)) {
+					data=m_visibility_reciprocal[pose.index-original_index-1];
+					++m_visibility_extended;m_visibility_maximum=std::max(m_visibility_maximum,pose.index);
+				}
+			});
+	m_visibility_lower_tap=space.install_read_tap(0x67d0,0x67d0,"exotica_visibility_lower",
+		[this](offs_t offset,uint32_t &data,uint32_t mask) {
+			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6898) return;
+			visibility_guard();++m_visibility_lower;
+			if (m_visibility_margins) data=cruisn::exotica_visibility::wide_center;
+		});
+	m_visibility_upper_tap=space.install_read_tap(0x67ce,0x67ce,"exotica_visibility_upper",
+		[this](offs_t offset,uint32_t &data,uint32_t mask) {
+			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x689c) return;
+			visibility_guard();++m_visibility_upper;
+			if (m_visibility_margins) data=cruisn::exotica_visibility::wide_upper;
+		});
+	m_visibility_accept_tap=space.install_read_tap(0x67d9,0x67d9,"exotica_visibility_accepted",
+		[this](offs_t offset,uint32_t &data,uint32_t mask) {
+			if (machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x68a4) return;
+			++m_visibility_accepted;
+		});
+	osd_printf_info("MIDZ_VISIBILITY=%s: Exotica2.4 CPU sphere experiment; far plane unchanged\n",mode);
+}
+
+void crusnexo_state::visibility_reset()
+{
+	m_visibility_far_tests=m_visibility_far_rejects=m_visibility_extended=0;
+	m_visibility_lower=m_visibility_upper=m_visibility_accepted=0;m_visibility_maximum=0;
+}
+
+void crusnexo_state::visibility_tick()
+{
+	if (!m_visibility_log) return;
+	if (fprintf(m_visibility_log,"%llu,%s,%d,%llu,%llu,%llu,%u,%llu,%llu,%llu\n",
+		(unsigned long long)m_screen->frame_number(),m_visibility_mode.c_str(),
+		cruisn::exotica_visibility::code_matches(m_ram_base.target(),m_ram_base.bytes()/4),
+		(unsigned long long)m_visibility_far_tests,(unsigned long long)m_visibility_far_rejects,
+		(unsigned long long)m_visibility_extended,m_visibility_maximum,
+		(unsigned long long)m_visibility_lower,(unsigned long long)m_visibility_upper,
+		(unsigned long long)m_visibility_accepted)<0) fatalerror("Exotica visibility log write failed\n");
+	visibility_reset();
+}
+
+void crusnexo_state::visibility_exit()
+{
+	if (m_visibility_log) { fclose(m_visibility_log);m_visibility_log=nullptr; }
+}
 
 void midzeus_state::machine_start()
 {
@@ -1739,6 +1864,7 @@ uint32_t crusnexo_state::telemetry_screen_update(screen_device &screen, bitmap_r
 {
 	uint32_t const result=m_zeus->screen_update(screen,bitmap,cliprect);
 	if (cliprect.max_y>=screen.visible_area().max_y) {
+		visibility_tick();
 		cruisn::Drivetrain drivetrain;
 		int mph=-1;
 		if (!strcmp(machine().system().name,"crusnexo")) {
