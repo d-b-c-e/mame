@@ -103,6 +103,7 @@ void midvunit_base_state::usa_host_start()
 		m_host_future=!strcmp(future,"1");
 	}
 	m_usa_future_cache.clear();
+	m_usa_model_cache.clear();
 	for(auto pair:{std::make_pair("MIDV_USA_HOST_FIRST",&m_host_first),std::make_pair("MIDV_USA_HOST_LAST",&m_host_last)})
 	{
 		const char *text=std::getenv(pair.first);char *end=nullptr;
@@ -163,10 +164,12 @@ void midvunit_base_state::usa_host_start()
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::usa_future::Stats future_stats;
 			std::vector<cruisn::usa_host::Descriptor> future;
+			const auto previous_track=m_usa_future_cache.track;
 			if(m_host_future && !cruisn::usa_future::collect(read,m_usa_future_cache,future,future_stats))
 				fatalerror("USA future scene/material/upload guard failed\n");
+			if(previous_track!=m_usa_future_cache.track)m_usa_model_cache.clear();
 			cruisn::usa_host::Scene scene;
-			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr))fatalerror("USA host scene/model guard failed\n");
+			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_future?&m_usa_model_cache:nullptr))fatalerror("USA host scene/model guard failed\n");
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;
