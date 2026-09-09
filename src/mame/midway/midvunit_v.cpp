@@ -60,6 +60,7 @@
 #include <SDL2/SDL_joystick.h>
 #include "midvunit_gl_shaders.h"
 #include "midvunit_menu_assets.h"
+#include "cruisn/pause_cheats_win.h"
 #endif
 
 namespace {
@@ -1237,6 +1238,12 @@ void thread_main()
 	Label lb_crt_off = make_label(MVMENU_CRT_OFF, MVMENU_CRT_OFF_W, MVMENU_CRT_OFF_H);
 	Label lb_exit = make_label(MVMENU_EXIT, MVMENU_EXIT_W, MVMENU_EXIT_H);
 	Label lb_hint = make_label(MVMENU_HINT, MVMENU_HINT_W, MVMENU_HINT_H);
+	auto cheat_title = cruisn::menu_text_bitmap("CHEATS");
+	Label lb_cheats = make_label(cheat_title.pixels.data(), cheat_title.width, cheat_title.height);
+	cruisn::pause_cheats cheat_menu;
+	Label text_labels[16]{};
+	std::string text_values[16];
+	bool left_prev = false, right_prev = false;
 	int const mRect = gl.GetUniformLocation(menuprog, "uRect");
 	int const mScreen = gl.GetUniformLocation(menuprog, "uScreen");
 	int const mColor = gl.GetUniformLocation(menuprog, "uColor");
@@ -1277,9 +1284,10 @@ void thread_main()
 	bool stalled = false;
 	// Explicit, output-free menu regression: exercise the same key edges as the
 	// player without injecting global Windows input. Game captures stay separate.
+	bool const menu_test_cheats = std::getenv("MIDV_CHEAT_MENU_TEST_FRAME") != nullptr;
 	int const menu_test_frame = (std::getenv("MIDV_FFB") &&
-		strcmp(std::getenv("MIDV_FFB"), "0") == 0 && std::getenv("MIDV_GL_MENU_TEST_FRAME"))
-		? atoi(std::getenv("MIDV_GL_MENU_TEST_FRAME")) : -1;
+		strcmp(std::getenv("MIDV_FFB"), "0") == 0 && (menu_test_cheats || std::getenv("MIDV_GL_MENU_TEST_FRAME")))
+		? atoi(std::getenv(menu_test_cheats ? "MIDV_CHEAT_MENU_TEST_FRAME" : "MIDV_GL_MENU_TEST_FRAME")) : -1;
 	int menu_test_step = -1, menu_test_saved = -1;
 	ULONGLONG menu_test_next = 0;
 	uint32_t completed_frame = 0;
@@ -1423,11 +1431,13 @@ void thread_main()
 		bool ui_changed = false;
 		int menu_test_key = 0;
 		if (menu_test_frame >= 0 && completed_frame >= uint32_t(menu_test_frame) &&
-			menu_test_step < 8 && GetTickCount64() >= menu_test_next)
+			menu_test_step < 9 && GetTickCount64() >= menu_test_next)
 		{
 			static int const keys[] = { VK_ESCAPE, VK_DOWN, VK_RETURN, VK_UP,
-				VK_RETURN, VK_ESCAPE, VK_DOWN, VK_DOWN, VK_RETURN };
-			menu_test_key = keys[++menu_test_step];
+				VK_RETURN, VK_ESCAPE, VK_DOWN, VK_DOWN, VK_DOWN, VK_RETURN };
+			static int const cheat_keys[] = { VK_ESCAPE, VK_DOWN, VK_DOWN, VK_RETURN, VK_RIGHT,
+				VK_ESCAPE, VK_ESCAPE, VK_ESCAPE, VK_DOWN, VK_RETURN };
+			menu_test_key = (menu_test_cheats ? cheat_keys : keys)[++menu_test_step];
 			menu_test_next = GetTickCount64() + 350;
 			logf("menu test step=%d key=%d completed_frame=%u", menu_test_step, menu_test_key, completed_frame);
 		}
@@ -1453,36 +1463,31 @@ void thread_main()
 				prev = down;
 				return e || menu_test_key == vk;
 			};
-			if (edge(VK_ESCAPE, esc_prev) && menuprog)
-			{
-				ui_changed = true;
-				menu_open = !menu_open;
-				if (menu_open)
-					midv_ffb_cancel();   // POC: drop the wheel force the moment the menu opens
-			}
-			bool const up = edge(VK_UP, up_prev);
-			bool const dn = edge(VK_DOWN, down_prev);
+			bool const escape = edge(VK_ESCAPE, esc_prev);
+			bool const up = edge(VK_UP, up_prev), dn = edge(VK_DOWN, down_prev);
 			bool const ok = edge(VK_RETURN, ret_prev);
-			if (menu_open)
-			{
-				ui_changed = ui_changed || up || dn || ok;
-				if (up) menu_sel = (menu_sel + 2) % 3;
-				if (dn) menu_sel = (menu_sel + 1) % 3;
-				if (ok)
-				{
-					if (menu_sel == 0)
-						menu_open = false;
-					else if (menu_sel == 1)
-					{
-						crt = !crt;
-						gl.UseProgram(pal);
-						gl.Uniform1i(uCrt, crt ? 1 : 0);
-					}
-					else
-					{
-						PostMessageA(parent, WM_CLOSE, 0, 0);
-						menu_open = false;
-					}
+			bool const left = edge(VK_LEFT, left_prev), right = edge(VK_RIGHT, right_prev);
+			ui_changed = ui_changed || escape || up || dn || ok || left || right;
+			if (escape && menuprog) {
+				if (menu_open && cheat_menu.open) cheat_menu.open = false;
+				else {
+					menu_open = !menu_open;
+					if (menu_open) { cheat_menu.begin_pause(); midv_ffb_cancel(); }
+					else cheat_menu.resume();
+				}
+			}
+			if (menu_open && cheat_menu.open) {
+				if (up) cheat_menu.move(-1);
+				if (dn) cheat_menu.move(1);
+				if (left || right || ok) cheat_menu.change(left ? -1 : right ? 1 : 0, ok);
+			} else if (menu_open) {
+				if (up) menu_sel = (menu_sel + 3) % 4;
+				if (dn) menu_sel = (menu_sel + 1) % 4;
+				if (ok) {
+					if (menu_sel == 0) { cheat_menu.resume(); menu_open = false; }
+					else if (menu_sel == 1) { crt = !crt; gl.UseProgram(pal); gl.Uniform1i(uCrt, crt ? 1 : 0); }
+					else if (menu_sel == 2) cheat_menu.open = true;
+					else { cheat_menu.cancel(); PostMessageA(parent, WM_CLOSE, 0, 0); menu_open = false; }
 				}
 			}
 			s_menu_pause.store(menu_open ? 1 : 0);
@@ -1652,15 +1657,35 @@ void thread_main()
 			};
 			float const sc = ch / 1080.0f;
 			mrect(nullptr, 0, 0, float(cw), float(ch), 0, 0, 0, 0.55f);
+			if (cheat_menu.open) {
+				int slot = 0;
+				cruisn::draw_pause_cheats(cheat_menu, [&](std::string const &value, float y, float px, bool selected) {
+					auto &label = text_labels[slot];
+					if (!label.tex || text_values[slot] != value) {
+						auto bitmap = cruisn::menu_text_bitmap(value);
+						if (!label.tex) label = make_label(bitmap.pixels.data(), bitmap.width, bitmap.height);
+						else {
+							gl.ActiveTexture(TEXTURE0); gl.BindTexture(0x0DE1, label.tex);
+							gl.TexImage2D(0x0DE1, 0, 0x8229, bitmap.width, bitmap.height, 0, 0x1903, 0x1401, bitmap.pixels.data());
+							label.w = bitmap.width; label.h = bitmap.height;
+						}
+						text_values[slot] = value;
+					}
+					++slot;
+					float const height = std::min(px * sc, float(cw) * .90f * label.h / label.w);
+					mlabel(label, ch * y, height, selected ? 1.f : .85f, selected ? .72f : .85f, selected ? .20f : .90f);
+				});
+			} else {
 			mlabel(lb_title, ch * 0.24f, 72 * sc, 1.0f, 0.72f, 0.20f);
-			Label const *items[3] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_exit };
-			for (int i = 0; i < 3; i++)
+			Label const *items[4] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_cheats, &lb_exit };
+			for (int i = 0; i < 4; i++)
 			{
 				bool const s = (i == menu_sel);
-				mlabel(*items[i], ch * (0.42f + 0.10f * i), 44 * sc,
+				mlabel(*items[i], ch * (0.42f + 0.09f * i), 44 * sc,
 					s ? 1.0f : 0.85f, s ? 0.72f : 0.85f, s ? 0.20f : 0.90f);
 			}
 			mlabel(lb_hint, ch * 0.86f, 22 * sc, 0.75f, 0.75f, 0.80f);
+			}
 			gl.Disable(0x0BE2);
 			gl.ActiveTexture(TEXTURE0);
 			gl.BindTexture(0x0DE1, texram);   // restore for the quad pass
@@ -1676,7 +1701,7 @@ void thread_main()
 				(unsigned long long)n_flips,
 				(unsigned long long)(ring_load(lv.wpos) - ring_load(lv.rpos)), visible,
 				int(quad_fresh[visible]), quad_count[visible], gl.GetError(), double(lv.speed_pct));
-		bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 8 && menu_test_saved != menu_test_step;
+		bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 9 && menu_test_saved != menu_test_step;
 		if (snapdir && (menu_test_capture || (frame_complete && !menu_open &&
 			(last_received_frame % snap_every) == 0 &&
 			int(last_received_frame) >= snap_first &&
@@ -1722,6 +1747,7 @@ void thread_main()
 				if (menu_test_capture)
 				{
 					menu_test_saved = menu_test_step;
+					logf("cheat menu snapshot step=%d submenu=%d entries=%u pending=%u", menu_test_step, int(cheat_menu.open), unsigned(cheat_menu.rows.size()), unsigned(cheat_menu.pending.size()));
 					logf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
 						menu_test_step, int(menu_open), menu_sel, int(crt), completed_frame, int(frame_complete));
 				}

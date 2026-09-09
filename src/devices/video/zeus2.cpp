@@ -24,6 +24,7 @@
 #include <vector>
 #include "zeus2_gl_shaders.h"
 #include "../../mame/midway/midvunit_menu_assets.h"
+#include "../../mame/midway/cruisn/pause_cheats_win.h"
 namespace mzgl { void start(); void stop(); }
 void midv_trace_wheelpos(running_machine &machine, const char *tag);   // midvunit_v.cpp (POC)
 #endif
@@ -738,6 +739,12 @@ void thread_main()
 	Label lb_crt_off = make_label(MVMENU_CRT_OFF, MVMENU_CRT_OFF_W, MVMENU_CRT_OFF_H);
 	Label lb_exit = make_label(MVMENU_EXIT, MVMENU_EXIT_W, MVMENU_EXIT_H);
 	Label lb_hint = make_label(MVMENU_HINT, MVMENU_HINT_W, MVMENU_HINT_H);
+	auto cheat_title = cruisn::menu_text_bitmap("CHEATS");
+	Label lb_cheats = make_label(cheat_title.pixels.data(), cheat_title.width, cheat_title.height);
+	cruisn::pause_cheats cheat_menu;
+	Label text_labels[16]{};
+	std::string text_values[16];
+	bool left_prev = false, right_prev = false;
 	int const mRect = gl.GetUniformLocation(menuprog, "uRect");
 	int const mScreen = gl.GetUniformLocation(menuprog, "uScreen");
 	int const mColor = gl.GetUniformLocation(menuprog, "uColor");
@@ -898,11 +905,24 @@ void thread_main()
     }
 	zlogf("MZGL up: scale %d fb %dx%d crt=%d", S, fw, fh, int(crt));
 
+	int const menu_test_frame = (std::getenv("MIDV_FFB") && strcmp(std::getenv("MIDV_FFB"), "0") == 0 &&
+		std::getenv("MIDV_CHEAT_MENU_TEST_FRAME")) ? atoi(std::getenv("MIDV_CHEAT_MENU_TEST_FRAME")) : -1;
+	int menu_test_step = -1, menu_test_saved = -1;
+	ULONGLONG menu_test_next = 0;
 	while (IsWindow(parent) && !s_stopz.load())
 	{
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
 
+		int menu_test_key = 0;
+		if (menu_test_frame >= 0 && completed_frame >= uint32_t(menu_test_frame) &&
+			menu_test_step < 9 && GetTickCount64() >= menu_test_next) {
+			static int const keys[] = { VK_ESCAPE, VK_DOWN, VK_DOWN, VK_RETURN, VK_RIGHT,
+				VK_ESCAPE, VK_ESCAPE, VK_ESCAPE, VK_DOWN, VK_RETURN };
+			menu_test_key = keys[++menu_test_step]; menu_test_next = GetTickCount64() + 350;
+			zlogf("menu test step=%d key=%d completed_frame=%u", menu_test_step, menu_test_key, completed_frame);
+		}
+		bool ui_changed = false;
 		bool const f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
 		if (f9 && !f9_prev)
 			crt = !crt;
@@ -914,28 +934,33 @@ void thread_main()
 				bool const down = fg && (GetAsyncKeyState(vk) & 0x8000) != 0;
 				bool const e = down && !prev;
 				prev = down;
-				return e;
+				return e || menu_test_key == vk;
 			};
-			if (edge(VK_ESCAPE, esc_prev) && menuprog)
-				menu_open = !menu_open;
-			bool const up = edge(VK_UP, up_prev);
-			bool const dn = edge(VK_DOWN, down_prev);
+			bool const escape = edge(VK_ESCAPE, esc_prev);
+			bool const up = edge(VK_UP, up_prev), dn = edge(VK_DOWN, down_prev);
 			bool const ok = edge(VK_RETURN, ret_prev);
-			if (menu_open)
-			{
-				if (up) menu_sel = (menu_sel + 2) % 3;
-				if (dn) menu_sel = (menu_sel + 1) % 3;
-				if (ok)
-				{
-					if (menu_sel == 0)
-						menu_open = false;
-					else if (menu_sel == 1)
-						crt = !crt;
-					else
-					{
-						PostMessageA(parent, WM_CLOSE, 0, 0);
-						menu_open = false;
-					}
+			bool const left = edge(VK_LEFT, left_prev), right = edge(VK_RIGHT, right_prev);
+			ui_changed = ui_changed || escape || up || dn || ok || left || right;
+			if (escape && menuprog) {
+				if (menu_open && cheat_menu.open) cheat_menu.open = false;
+				else {
+					menu_open = !menu_open;
+					if (menu_open) { cheat_menu.begin_pause();  }
+					else cheat_menu.resume();
+				}
+			}
+			if (menu_open && cheat_menu.open) {
+				if (up) cheat_menu.move(-1);
+				if (dn) cheat_menu.move(1);
+				if (left || right || ok) cheat_menu.change(left ? -1 : right ? 1 : 0, ok);
+			} else if (menu_open) {
+				if (up) menu_sel = (menu_sel + 3) % 4;
+				if (dn) menu_sel = (menu_sel + 1) % 4;
+				if (ok) {
+					if (menu_sel == 0) { cheat_menu.resume(); menu_open = false; }
+					else if (menu_sel == 1) { crt = !crt; }
+					else if (menu_sel == 2) cheat_menu.open = true;
+					else { cheat_menu.cancel(); PostMessageA(parent, WM_CLOSE, 0, 0); menu_open = false; }
 				}
 			}
 			s_zpause.store(menu_open ? 1 : 0);
@@ -1075,7 +1100,7 @@ void thread_main()
 		s_rr.store(r, std::memory_order_release);
 		flush();
 
-		if (!frame_ready && !menu_open) { Sleep(1); continue; }
+		if (!frame_ready && !menu_open && !ui_changed) { Sleep(1); continue; }
         if (frame_ready && stop_frame >= 0 && completed_frame >= uint32_t(stop_frame)) {
             zlogf("diagnostic consumer stop at completed frame %u",completed_frame);
             break;
@@ -1149,15 +1174,35 @@ void thread_main()
 			};
 			float const sc = ch / 1080.0f;
 			mrect(nullptr, 0, 0, float(cw), float(ch), 0, 0, 0, 0.55f);
+			if (cheat_menu.open) {
+				int slot = 0;
+				cruisn::draw_pause_cheats(cheat_menu, [&](std::string const &value, float y, float px, bool selected) {
+					auto &label = text_labels[slot];
+					if (!label.tex || text_values[slot] != value) {
+						auto bitmap = cruisn::menu_text_bitmap(value);
+						if (!label.tex) label = make_label(bitmap.pixels.data(), bitmap.width, bitmap.height);
+						else {
+							gl.ActiveTexture(TEXTURE0); gl.BindTexture(0x0DE1, label.tex);
+							gl.TexImage2D(0x0DE1, 0, 0x8229, bitmap.width, bitmap.height, 0, 0x1903, 0x1401, bitmap.pixels.data());
+							label.w = bitmap.width; label.h = bitmap.height;
+						}
+						text_values[slot] = value;
+					}
+					++slot;
+					float const height = std::min(px * sc, float(cw) * .90f * label.h / label.w);
+					mlabel(label, ch * y, height, selected ? 1.f : .85f, selected ? .72f : .85f, selected ? .20f : .90f);
+				});
+			} else {
 			mlabel(lb_title, ch * 0.24f, 72 * sc, 1.0f, 0.72f, 0.20f);
-			Label const *items[3] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_exit };
-			for (int i = 0; i < 3; i++)
+			Label const *items[4] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_cheats, &lb_exit };
+			for (int i = 0; i < 4; i++)
 			{
 				bool const sel = (i == menu_sel);
-				mlabel(*items[i], ch * (0.42f + 0.10f * i), 44 * sc,
+				mlabel(*items[i], ch * (0.42f + 0.09f * i), 44 * sc,
 					sel ? 1.0f : 0.85f, sel ? 0.72f : 0.85f, sel ? 0.20f : 0.90f);
 			}
 			mlabel(lb_hint, ch * 0.86f, 22 * sc, 0.75f, 0.75f, 0.80f);
+			}
 			gl.Disable(0x0BE2);
 		}
 
@@ -1193,14 +1238,16 @@ void thread_main()
 			s_snap_base = presents;
 		int const first_frame = envi("MIDZ_GL_SNAP_FIRST",nullptr,0);
         int const last_frame = envi("MIDZ_GL_SNAP_LAST",nullptr,2147483647);
-        if (snapdir && snap_index && frame_ready && s_snap_base >= 0 && presents >= s_snap_from &&
+        bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 9 && menu_test_saved != menu_test_step;
+        if (snapdir && (menu_test_capture || (!menu_open && snap_index && frame_ready && s_snap_base >= 0 && presents >= s_snap_from &&
             completed_frame >= uint32_t(first_frame) && completed_frame <= uint32_t(last_frame) &&
-            (completed_frame % s_snap_every) == 0 && snap_n < s_snap_max)
+            (completed_frame % s_snap_every) == 0 && snap_n < s_snap_max)))
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0, 0x1401, px.data());
 			char path[512];
-			snprintf(path, sizeof(path), "%s\\mzgl_%03d.bmp", snapdir, snap_n++);
+			if (menu_test_capture) snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
+			else snprintf(path, sizeof(path), "%s\\mzgl_%03d.bmp", snapdir, snap_n++);
 			FILE *f = fopen(path, "wb");
 			if (f)
 			{
@@ -1223,10 +1270,18 @@ void thread_main()
 					fwrite(rowbuf.data(), 1, rowsz, f);
 				}
                 fclose(f);
+                if (menu_test_capture) {
+                    menu_test_saved = menu_test_step;
+                    zlogf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
+                        menu_test_step,int(menu_open),menu_sel,int(crt),completed_frame,int(frame_ready));
+                    zlogf("cheat menu snapshot step=%d submenu=%d entries=%u pending=%u",
+                        menu_test_step,int(cheat_menu.open),unsigned(cheat_menu.rows.size()),unsigned(cheat_menu.pending.size()));
+                } else {
                 fprintf(snap_index,"mzgl_%03d.bmp,%llu,%u,%d,%d,%llu,%u,%u\n", snap_n-1,
                     (unsigned long long)presents,completed_frame,cw,ch,(unsigned long long)n_quads,
                     s_drops_quad.load()+s_drops_state.load(),completed_frame);
                 fflush(snap_index);
+                }
 			}
 		}
 		SwapBuffers(dc);

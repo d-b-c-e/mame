@@ -13,6 +13,7 @@
 
 #include "mame.h"
 #include "cheat.h"
+#include "../../mame/midway/cruisn/pause_cheats.h"
 #include "pluginopts.h"
 #include "ui/pluginopt.h"
 #include "ui/ui.h"
@@ -2337,6 +2338,37 @@ void lua_engine::initialize()
 			else throw sol::error("Unknown cheat action");
 			osd_printf_info("Collection cheat: %d %s %s changed=%d\n", index, description, action, changed);
 			return changed;
+		};
+	// The render thread only edits metadata. MAME/Lua consumes the queue on
+	// Resume at a frame boundary, so one-shots are recorded and replayable.
+	mame_manager_type["cheat_menu_publish"] = [] (mame_machine_manager &, sol::table catalog, bool readonly)
+		{
+			std::vector<cruisn::cheat_row> rows;
+			if (catalog.size() > 128) throw sol::error("Cheat menu is too large");
+			for (size_t index = 1; index <= catalog.size(); ++index)
+			{
+				sol::table value = catalog[index];
+				cruisn::cheat_row row;
+				row.index = value["index"]; row.steps = value["steps"];
+				row.description = value["description"]; row.comment = value["comment"];
+				row.kind = value["kind"];
+				sol::table choices = value["choices"];
+				for (size_t i = 1; i <= choices.size(); ++i) row.choices.push_back(choices[i]);
+				if (row.index < 1 || row.index > 128 || row.choices.empty() || row.choices.size() > 65 ||
+					row.steps < 0 || size_t(row.steps) >= row.choices.size()) throw sol::error("Invalid cheat menu row");
+				rows.push_back(std::move(row));
+			}
+			cruisn::cheat_bus().publish(std::move(rows), readonly);
+		};
+	mame_manager_type["cheat_menu_take"] = [this] (mame_machine_manager &)
+		{
+			auto result = sol().create_table(); int i = 0;
+			for (auto const &request : cruisn::cheat_bus().take()) {
+				auto row = sol().create_table(); row["index"] = request.index;
+				row["steps"] = request.steps; row["activate"] = request.activate;
+				result[++i] = row;
+			}
+			return result;
 		};
 	sol()["manager"] = std::ref(*mame_machine_manager::instance());
 	sol()["mame_manager"] = std::ref(*mame_machine_manager::instance());
