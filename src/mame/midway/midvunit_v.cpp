@@ -916,7 +916,7 @@ static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			f[14] = us[2]; f[15] = vs[2]; f[16] = us[3]; f[17] = vs[3];
 			for (int i = 0; i < 4; i++) f[18 + i] = bounds[i];
 			uint32_t *u = &udata[(q * 6 + k) * 4];
-			u[0] = pixdata; u[1] = mode; u[2] = dither; u[3] = uint32_t(dma[14]) * 256;
+			u[0] = pixdata; u[1] = mode; u[2] = dither | ((quads[q].pad & 1) ? 8u : 0u); u[3] = uint32_t(dma[14]) * 256;
 		}
 	}
 	return joined.aligned;
@@ -1200,6 +1200,7 @@ void thread_main()
 	int const uCrt = gl.GetUniformLocation(pal, "uCrt");
 	int const uSrcH = gl.GetUniformLocation(pal, "uSrcH");
 	int const uFillR = gl.GetUniformLocation(pal, "uFillR");
+	int const uHostLayers = gl.GetUniformLocation(pal, "uHostLayers");
 	bool crt = std::getenv("MIDV_GL_CRT") && atoi(std::getenv("MIDV_GL_CRT")) != 0;
 	// Local crack fill remains a cosmetic option; missing geometry and
 	// intentional gaps cannot be distinguished by coverage alone.
@@ -1270,6 +1271,7 @@ void thread_main()
 	std::vector<uint8_t> cpu_mask;
 	bool quad_fresh[2] = {};
 	bool crop2d[2] = {};
+	bool host_layers[2] = {};
 	int quad_count[2] = {};
 	int visible = 0;
 	std::vector<uint8_t> staging(8 << 20);
@@ -1305,9 +1307,8 @@ void thread_main()
 		if (run.empty()) return;
 		int const pg = (run_pc & 4) ? 1 : 0;
 		bool const new_scene = active_pc != run_pc;
-		if (new_scene) { quad_count[pg] = 0; scene_axis[pg] = 0; active_pc = run_pc; }
+		if (new_scene) { quad_count[pg] = 0; scene_axis[pg] = 0; host_layers[pg] = false; active_pc = run_pc; }
 		n_aligned += build_vertices(run, float(MARGIN), fdata, udata, align_joins);
-		quad_count[pg] += int(run.size());
 		cpu_written[pg] = 0;
 		// 2D screens (menus, high scores) are drawn almost entirely from
 		// axis-aligned rectangles; 3D scenes almost never are. Quad-count
@@ -1315,6 +1316,11 @@ void thread_main()
 		int axis = 0;
 		for (auto const &q : run)
 		{
+			if (q.pad & 1) host_layers[pg] = true;
+			// The split trial also keeps auxiliary geometry out of the game's
+			// 2D/3D classification. Ordinary recordings retain the old batching.
+			if (q.pad & 2) continue;
+			++quad_count[pg];
 			int16_t const x0 = int16_t(q.dma[2]), y0 = int16_t(q.dma[3]);
 			int16_t const x1 = int16_t(q.dma[4]), y1 = int16_t(q.dma[5]);
 			int16_t const x2 = int16_t(q.dma[6]), y2 = int16_t(q.dma[7]);
@@ -1535,7 +1541,8 @@ void thread_main()
 			{
 				QuadMsg q;
 				memcpy(&q, staging.data(), sizeof(q));
-				if (run_pc != 0xffff && q.pc != run_pc) complete_run();
+				if (run_pc != 0xffff && (q.pc != run_pc ||
+					(!run.empty() && ((q.pad ^ run.back().pad) & 2)))) complete_run();
 				run_pc = q.pc;
 				run.push_back(q);
 				++n_quads;
@@ -1610,6 +1617,7 @@ void thread_main()
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
 		gl.UseProgram(pal);
 		gl.Uniform1i(uCrop, !wide3d ? MARGIN * S : 0);
+		gl.Uniform1i(uHostLayers, host_layers[visible] ? 1 : 0);
 		// fill radius: live 3D scenes get the full crack fill; 2D screens
 		// (menus, track select) get a tight 1-px pass only - their bitmap
 		// tiles leave hairline unwritten seams (offroadc track select's
@@ -2972,7 +2980,7 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 	live().last_frame=frame;
 	live().sync_state(frame,m_paletteram.target(),uint32_t(m_paletteram.bytes()),
 		m_textureram.target(),uint32_t(m_textureram.bytes()));
-	struct {uint32_t frame;uint16_t pc,pad;} h={frame,m_page_control,0};
+	struct {uint32_t frame;uint16_t pc,pad;} h={frame,m_page_control,m_host_layer};
 	for(const auto &q:quads)live().write_msg(1,&h,8,q.data(),32);
 }
 

@@ -102,6 +102,11 @@ void midvunit_base_state::world_host_start()
 		m_host_future=!strcmp(future,"1");
 	}
 	m_host_future_cache.clear();
+	if(const char *layer=std::getenv("MIDV_WORLD_HOST_LAYER"))
+	{
+		if(strlen(layer)!=1 || layer[0]<'0' || layer[0]>'3')fatalerror("MIDV_WORLD_HOST_LAYER requires 0..3\n");
+		m_host_layer=uint16_t(layer[0]-'0');
+	}
 	if(const char *far=std::getenv("MIDV_WORLD_HOST_FAR"))
 	{
 		if(!strcmp(far,"80000"))m_host_far=80000;
