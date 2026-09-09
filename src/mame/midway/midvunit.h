@@ -13,6 +13,7 @@
 #include "midwayic.h"
 #include "cruisn/world_future_sections.h"
 #include "cruisn/usa_future_sections.h"
+#include "cruisn/offroad_host_scenery.h"
 
 #include "dcs.h"
 
@@ -107,6 +108,7 @@ protected:
 	void world_distance_exit();
 	void world_host_start();
 	void usa_host_start();
+	void offroad_host_start();
 	void world_host_exit();
 	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads);
 	void usa_distance_start();
@@ -193,6 +195,8 @@ protected:
 	cruisn::world_future::Cache m_host_future_cache;
 	cruisn::usa_future::Cache m_usa_future_cache;
 	cruisn::usa_host::ModelCache m_usa_model_cache;
+	cruisn::offroad_host::Cache m_offroad_host_cache;
+	uint32_t m_offroad_host_multiplier = 1;
 	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
 	uint32_t m_usa_far = 0, m_usa_max_index = 0;
 	bool m_usa_residency = false;
