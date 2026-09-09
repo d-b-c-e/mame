@@ -111,12 +111,23 @@ void midvunit_base_state::world_host_start()
 			*pair.second=uint32_t(value);
 		}
 	if(m_host_first>m_host_last)fatalerror("Host scenery frame bounds reversed\n");
+	bool quad_trace=true;
+	if(const char *trace=std::getenv("MIDV_WORLD_HOST_QUADS"))
+	{
+		if(strcmp(trace,"0") && strcmp(trace,"1"))fatalerror("MIDV_WORLD_HOST_QUADS requires 0/1\n");
+		quad_trace=!strcmp(trace,"1");
+	}
 	m_host_scene_log=fopen("world-host-scenes.csv","w");
-	m_host_quad_log=fopen("world-host-quads.csv","w");
-	if(!m_host_scene_log || !m_host_quad_log)fatalerror("Cannot create host scenery evidence\n");
-	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);setvbuf(m_host_quad_log,nullptr,_IOFBF,65536);
-	fprintf(m_host_scene_log,"frame,page,mode,pending,unsupported,distance,decoded,quads,microseconds,host_far\n");
-	fprintf(m_host_quad_log,"frame,page,object,model,depth,section,flags,palette,x0,y0,x1,y1,x2,y2,x3,y3,uv0,uv1,uv2,uv3,texture,word15\n");
+	if(quad_trace)m_host_quad_log=fopen("world-host-quads.csv","w");
+	if(!m_host_scene_log || (quad_trace && !m_host_quad_log))fatalerror("Cannot create host scenery evidence\n");
+	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);
+	if(m_host_quad_log)
+	{
+		setvbuf(m_host_quad_log,nullptr,_IOFBF,65536);
+		fprintf(m_host_quad_log,"frame,page,object,model,depth,section,flags,palette,x0,y0,x1,y1,x2,y2,x3,y3,uv0,uv1,uv2,uv3,texture,word15\n");
+	}
+	m_host_previous_scene_log_us=0;
+	fprintf(m_host_scene_log,"frame,page,mode,pending,unsupported,distance,decoded,quads,microseconds,host_far,quad_trace,quads_hash,guard_us,prepare_us,pack_us,quad_log_us,submit_us,previous_scene_log_us\n");
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::world_host_exit,this));
 	auto &space=m_maincpu->space(AS_PROGRAM);
 	m_host_scene_tap=space.install_read_tap(0x61ee,0x61ee,"world_host_scene",
@@ -130,23 +141,41 @@ void midvunit_base_state::world_host_start()
 				m_ram_base[0x69]!=0x082861ee || m_ram_base[0x7b55]!=0x082861ec ||
 				m_ram_base[0x7b5c]!=0x1ae03000 || m_ram_base[0xd58c]!=11)
 				fatalerror("World host scenery exact-revision/stock-distance guard failed\n");
+			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::world_host::Scene scene;
 			auto &s=m_maincpu->space(AS_PROGRAM);
 			// Reads never cover this tap's 61EE address; no transient guest state.
 			if(!cruisn::world_host::build([&](uint32_t p){return s.read_dword(p);},scene,m_host_far))
 				fatalerror("World host scenery pointer/model/projection guard failed\n");
+			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
+			size_t count=0;for(const auto &o:scene.objects)count+=o.quads.size();
+			quads.reserve(count);
+			uint64_t hash=cruisn::world_host::hash_seed;
 			for(const auto &o:scene.objects)for(const auto &q:o.quads)
 			{
 				quads.push_back(q);
+				hash=cruisn::world_host::quad_hash(hash,q);
+			}
+			const auto packed=std::chrono::steady_clock::now();
+			if(m_host_quad_log)for(const auto &o:scene.objects)for(const auto &q:o.quads)
+			{
 				fprintf(m_host_quad_log,"%llu,%u,%u,%u,%d,%u",(unsigned long long)frame,m_page_control,o.id,o.model,o.depth,o.section);
 				for(auto word:q)fprintf(m_host_quad_log,",%u",word);
 				fputc('\n',m_host_quad_log);
 			}
+			const auto logged=std::chrono::steady_clock::now();
 			if(m_host_mode==2)world_host_submit(quads);
-			double us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
-			fprintf(m_host_scene_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%.3f,%u\n",(unsigned long long)frame,m_page_control,
-				m_host_mode,scene.pending,scene.unsupported,scene.distance,scene.decoded,unsigned(quads.size()),us,m_host_far);
+			const auto submitted=std::chrono::steady_clock::now();
+			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+			// The current scene row cannot include the duration of writing itself.
+			// Retain that cost on the next row, explicitly attributed as previous.
+			fprintf(m_host_scene_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%.3f,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+				(unsigned long long)frame,m_page_control,m_host_mode,scene.pending,scene.unsupported,scene.distance,
+				scene.decoded,unsigned(quads.size()),us(started,submitted),m_host_far,unsigned(m_host_quad_log!=nullptr),
+				(unsigned long long)hash,us(started,guarded),us(guarded,prepared),us(prepared,packed),
+				us(packed,logged),us(logged,submitted),m_host_previous_scene_log_us);
+			m_host_previous_scene_log_us=us(submitted,std::chrono::steady_clock::now());
 		});
 	osd_printf_info("World host scenery mode=%u frames=%u..%u host_far=%u: guest simulation/far unchanged, pending static codecs only\n",m_host_mode,m_host_first,m_host_last,m_host_far);
 }
