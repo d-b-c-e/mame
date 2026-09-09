@@ -12,6 +12,7 @@
 
 #include "midwayic.h"
 #include "cruisn/world_future_sections.h"
+#include "cruisn/usa_future_sections.h"
 
 #include "dcs.h"
 
@@ -190,6 +191,7 @@ protected:
 	uint32_t m_host_revision = 24;
 	uint16_t m_host_layer = 0;
 	cruisn::world_future::Cache m_host_future_cache;
+	cruisn::usa_future::Cache m_usa_future_cache;
 	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
 	uint32_t m_usa_far = 0, m_usa_max_index = 0;
 	bool m_usa_residency = false;
