@@ -105,6 +105,7 @@ protected:
 	void world_distance_tick();
 	void world_distance_exit();
 	void world_host_start();
+	void usa_host_start();
 	void world_host_exit();
 	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads);
 	void usa_distance_start();

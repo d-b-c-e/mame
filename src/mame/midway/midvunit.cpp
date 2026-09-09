@@ -36,6 +36,7 @@
 #include "cruisn/world_host_scenery.h"
 #include <chrono>
 #include "cruisn/usa_distance.h"
+#include "cruisn/usa_host_scenery.h"
 #include "cruisn/offroad_distance.h"
 
 #include "cpu/adsp2100/adsp2100.h"
@@ -83,6 +84,102 @@ void midvunit_base_state::machine_start()
 	usa_distance_start();
 	offroad_distance_start();
 	world_host_start();
+	usa_host_start();
+}
+
+// USA's pending list and model format are different from World. Reuse only
+// the auxiliary GPU transport; never activate objects or append hardware DMA.
+void midvunit_base_state::usa_host_start()
+{
+	const char *mode=std::getenv("MIDV_USA_HOST_SCENERY");
+	if(!mode || !strcmp(mode,"0"))return;
+	if(strcmp(mode,"1") && strcmp(mode,"2"))fatalerror("MIDV_USA_HOST_SCENERY requires 0/1/2\n");
+	if(strcmp(machine().system().name,"crusnusa") || m_usa_far || m_host_mode)
+		fatalerror("USA host scenery requires USA4.5 and stock guest distance/residency\n");
+	m_host_mode=uint32_t(mode[0]-'0');m_host_layer=3;
+	for(auto pair:{std::make_pair("MIDV_USA_HOST_FIRST",&m_host_first),std::make_pair("MIDV_USA_HOST_LAST",&m_host_last)})
+	{
+		const char *text=std::getenv(pair.first);char *end=nullptr;
+		if(!text || !*text || *text=='-')fatalerror("USA host scenery requires explicit frame bounds\n");
+		unsigned long value=strtoul(text,&end,10);
+		if(*end || !value || value>1000000)fatalerror("Invalid USA host scenery frame bound\n");
+		*pair.second=uint32_t(value);
+	}
+	if(m_host_first>m_host_last)fatalerror("USA host frame bounds reversed\n");
+	if(const char *far=std::getenv("MIDV_USA_HOST_FAR"))
+	{
+		if(!strcmp(far,"80000"))m_host_far=80000;
+		else if(!strcmp(far,"160000"))m_host_far=160000;
+		else if(!strcmp(far,"240000"))m_host_far=240000;
+		else fatalerror("USA host far requires 80000/160000/240000\n");
+	}
+	if(const char *layer=std::getenv("MIDV_USA_HOST_LAYER"))
+	{
+		if(strlen(layer)!=1 || *layer<'0' || *layer>'3')fatalerror("Invalid USA host layer\n");
+		m_host_layer=uint16_t(*layer-'0');
+	}
+	bool trace=false;
+	if(const char *text=std::getenv("MIDV_USA_HOST_QUADS"))
+	{
+		if(strcmp(text,"0") && strcmp(text,"1"))fatalerror("Invalid USA host quad trace\n");
+		trace=!strcmp(text,"1");
+	}
+	m_host_scene_log=fopen("usa-host-scenes.csv","w");
+	if(trace)m_host_quad_log=fopen("usa-host-quads.csv","w");
+	if(!m_host_scene_log || (trace && !m_host_quad_log))fatalerror("Cannot create USA host evidence\n");
+	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);
+	fprintf(m_host_scene_log,"frame,time,page,mode,host_far,pending,unsupported,near,far,projection,decoded,quads,quads_hash,guard_us,prepare_us,pack_us,log_us,submit_us,microseconds\n");
+	if(m_host_quad_log)
+	{
+		setvbuf(m_host_quad_log,nullptr,_IOFBF,65536);
+		fprintf(m_host_quad_log,"frame,time,page,object,model,depth,flags,palette,x0,y0,x1,y1,x2,y2,x3,y3,uv0,uv1,uv2,uv3,texture,word15\n");
+	}
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::world_host_exit,this));
+	m_host_scene_tap=m_maincpu->space(AS_PROGRAM).install_read_tap(0x40,0x40,"usa_host_scene",
+		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		{
+			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x81)return;
+			const uint64_t frame=m_screen->frame_number();
+			if(frame<m_host_first || frame>m_host_last)return;
+			const auto cycles=m_maincpu->total_cycles();
+			const auto started=std::chrono::steady_clock::now();
+			if(!cruisn::usa_host::code_matches(m_ram_base,m_ram_base.bytes()/4))
+				fatalerror("USA host scenery revision/stock-code guard failed\n");
+			const auto guarded=std::chrono::steady_clock::now();
+			auto &space=m_maincpu->space(AS_PROGRAM);
+			auto read=[&](uint32_t p)->uint32_t
+			{
+				if(p<0x20000)return m_ram_base[p]; // bypass C93E/C93F cycle-eating handler
+				if(!((p>=0x809800 && p<0x80a000) || (p>=0xc00000 && p<0x1000000)))
+					fatalerror("USA host read outside RAM/ROM contract\n");
+				auto disabled=machine().disable_side_effects();return space.read_dword(p);
+			};
+			cruisn::usa_host::Scene scene;
+			if(!cruisn::usa_host::build(read,scene,m_host_far))fatalerror("USA host scene/model guard failed\n");
+			const auto prepared=std::chrono::steady_clock::now();
+			std::vector<std::array<uint16_t,16>> quads;
+			uint64_t hash=cruisn::world_host::hash_seed;
+			for(const auto &o:scene.objects)for(const auto &q:o.quads)
+			{quads.push_back(q);hash=cruisn::world_host::quad_hash(hash,q);}
+			const auto packed=std::chrono::steady_clock::now();
+			const double time=machine().time().as_double();
+			if(m_host_quad_log)for(const auto &o:scene.objects)for(const auto &q:o.quads)
+			{
+				fprintf(m_host_quad_log,"%llu,%.12f,%u,%u,%u,%d",(unsigned long long)frame,time,m_page_control,o.id,o.model,o.depth);
+				for(auto word:q)fprintf(m_host_quad_log,",%u",word);
+				fputc('\n',m_host_quad_log);
+			}
+			const auto logged=std::chrono::steady_clock::now();
+			if(m_host_mode==2)world_host_submit(quads);
+			if(m_maincpu->total_cycles()!=cycles)fatalerror("USA host inspection changed guest cycles\n");
+			const auto submitted=std::chrono::steady_clock::now();
+			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+			fprintf(m_host_scene_log,"%llu,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+				(unsigned long long)frame,time,m_page_control,m_host_mode,m_host_far,scene.pending,scene.unsupported,
+				scene.near,scene.far,scene.projection,scene.decoded,unsigned(quads.size()),(unsigned long long)hash,
+				us(started,guarded),us(guarded,prepared),us(prepared,packed),us(packed,logged),us(logged,submitted),us(started,submitted));
+		});
+	osd_printf_info("USA host pending scenery mode=%u frames=%u..%u far=%u; guest distance/residency unchanged\n",m_host_mode,m_host_first,m_host_last,m_host_far);
 }
 
 // Diagnostic host-only scenery: snapshot already resident pending objects at the
