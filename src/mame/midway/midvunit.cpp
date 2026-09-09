@@ -161,6 +161,11 @@ void midvunit_base_state::world_host_start()
 			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,m_host_revision) ||
 				!cruisn::world_host::scene_matches([&](uint32_t p){return m_ram_base[p];},m_host_revision))
 				fatalerror("World host scenery exact-revision/stock-distance guard failed\n");
+			if(cruisn::world_host::track_reset([&](uint32_t p){return m_ram_base[p];},m_host_revision))
+			{
+				m_host_future_cache.clear();
+				return;
+			}
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::world_host::Scene scene;
 			auto &s=m_maincpu->space(AS_PROGRAM);
