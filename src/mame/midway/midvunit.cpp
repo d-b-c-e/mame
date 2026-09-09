@@ -93,8 +93,11 @@ void midvunit_base_state::world_host_start()
 	const char *mode=std::getenv("MIDV_WORLD_HOST_SCENERY");
 	if(!mode || !strcmp(mode,"0"))return;
 	if(strcmp(mode,"1") && strcmp(mode,"2"))fatalerror("MIDV_WORLD_HOST_SCENERY requires 0/1(observe)/2(draw)\n");
-	if(strcmp(machine().system().name,"crusnwld24") || m_scenery_mode || m_distance_far)
-		fatalerror("Host scenery requires World 2.4 and stock distance/activation\n");
+	m_host_revision=!strcmp(machine().system().name,"crusnwld24")?24:
+		!strcmp(machine().system().name,"crusnwld")?25:0;
+	const auto *profile=cruisn::world_host::layout(m_host_revision);
+	if(!profile || m_scenery_mode || m_distance_far)
+		fatalerror("Host scenery requires World 2.4/2.5 and stock distance/activation\n");
 	m_host_mode=uint32_t(mode[0]-'0');
 	if(const char *future=std::getenv("MIDV_WORLD_HOST_FUTURE"))
 	{
@@ -107,6 +110,7 @@ void midvunit_base_state::world_host_start()
 		if(strcmp(roads,"0") && strcmp(roads,"1"))fatalerror("MIDV_WORLD_HOST_ROADS requires 0/1\n");
 		m_host_roads=!strcmp(roads,"1");
 	}
+	if(m_host_roads && m_host_revision!=24)fatalerror("Host road decoder requires World 2.4\n");
 	if(const char *layer=std::getenv("MIDV_WORLD_HOST_LAYER"))
 	{
 		if(strlen(layer)!=1 || layer[0]<'0' || layer[0]>'3')fatalerror("MIDV_WORLD_HOST_LAYER requires 0..3\n");
@@ -146,7 +150,7 @@ void midvunit_base_state::world_host_start()
 	fprintf(m_host_scene_log,"frame,page,mode,pending,unsupported,distance,decoded,quads,microseconds,host_far,quad_trace,quads_hash,guard_us,prepare_us,pack_us,quad_log_us,submit_us,previous_scene_log_us,future_enabled,future_sections,future_definitions,future_skipped,future_special,future_unbound,future_ready,future_new_sections,future_stage,future_cursor,future_start,future_us,roads_enabled,road_objects,road_quads\n");
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::world_host_exit,this));
 	auto &space=m_maincpu->space(AS_PROGRAM);
-	m_host_scene_tap=space.install_read_tap(0x61ee,0x61ee,"world_host_scene",
+	m_host_scene_tap=space.install_read_tap(profile->scene,profile->scene,"world_host_scene",
 		[this](offs_t offset,uint32_t &data,uint32_t mask)
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6a)return;
@@ -154,9 +158,8 @@ void midvunit_base_state::world_host_start()
 			if(frame<m_host_first || frame>m_host_last)return;
 			const auto guest_cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
-			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,24) ||
-				m_ram_base[0x69]!=0x082861ee || m_ram_base[0x7b55]!=0x082861ec ||
-				m_ram_base[0x7b5c]!=0x1ae03000 || m_ram_base[0xd58c]!=11)
+			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,m_host_revision) ||
+				!cruisn::world_host::scene_matches([&](uint32_t p){return m_ram_base[p];},m_host_revision))
 				fatalerror("World host scenery exact-revision/stock-distance guard failed\n");
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::world_host::Scene scene;
@@ -177,13 +180,13 @@ void midvunit_base_state::world_host_start()
 			cruisn::world_future::Stats future_stats;
 			if(m_host_future)
 			{
-				if(!cruisn::world_future::code_matches(read) ||
-					!cruisn::world_future::collect(read,m_host_future_cache,future,future_stats,64,m_host_roads))
+				if(!cruisn::world_future::code_matches(read,m_host_revision) ||
+					!cruisn::world_future::collect(read,m_host_future_cache,future,future_stats,64,m_host_roads,m_host_revision))
 					fatalerror("World future section code/pointer/frontier guard failed\n");
 			}
 			const auto future_prepared=std::chrono::steady_clock::now();
-			// Reads never cover this tap's 61EE address; no transient guest state.
-			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads))
+			// Main RAM is read directly: no tap recursion or guest speedup handler.
+			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision))
 				fatalerror("World host scenery pointer/model/projection guard failed\n");
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
@@ -220,7 +223,7 @@ void midvunit_base_state::world_host_start()
 				future_stats.stage,future_stats.cursor,future_stats.start,us(guarded,future_prepared),unsigned(m_host_roads),scene.roads,scene.road_quads);
 			m_host_previous_scene_log_us=us(submitted,std::chrono::steady_clock::now());
 		});
-	osd_printf_info("World host scenery mode=%u frames=%u..%u host_far=%u: guest simulation/far unchanged, pending static codecs only\n",m_host_mode,m_host_first,m_host_last,m_host_far);
+	osd_printf_info("World %u host scenery mode=%u frames=%u..%u host_far=%u: guest simulation/far unchanged, static codecs only\n",m_host_revision,m_host_mode,m_host_first,m_host_last,m_host_far);
 }
 
 void midvunit_base_state::world_host_exit()

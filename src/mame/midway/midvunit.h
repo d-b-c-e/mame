@@ -186,6 +186,7 @@ protected:
 	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff, m_host_far = 80000;
 	double m_host_previous_scene_log_us = 0;
 	bool m_host_future = false, m_host_roads = false;
+	uint32_t m_host_revision = 24;
 	uint16_t m_host_layer = 0;
 	cruisn::world_future::Cache m_host_future_cache;
 	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
