@@ -34,6 +34,8 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/exotica_source_cache.h"
 #include "cruisn/command_ring_fence.h"
 #include "cruisn/zeus_host_materials.h"
+#include "cruisn/exotica_active_capture.h"
+#include "cruisn/zeus_margin_packet.h"
 
 #include <algorithm>
 #include <chrono>
@@ -193,6 +195,8 @@ private:
 	void scene_fence_end();
 	void scene_fence_word(bool empty);
 	void scene_fence_ready(bool immediate);
+	void scene_active_list(uint32_t entry,uint32_t head);
+	void scene_active_ready();
 	uint32_t scene_read(uint32_t address);
 	struct ScenePending {
 		cruisn::exotica_scene::Parameters parameters;
@@ -231,6 +235,14 @@ private:
 	uint64_t m_scene_fence_requests=0,m_scene_fence_completed=0,m_scene_fence_immediate=0,m_scene_fence_scene=0;
 	uint32_t m_scene_fence_scene_frame=0,m_scene_fence_end_frame=0,m_scene_fence_consumer=0,m_scene_fence_words=0;
 	double m_scene_fence_end_time=0;
+	uint32_t m_active_mode=0;
+	cruisn::exotica_active::Capture m_active_capture;
+	cruisn::exotica_scene::Parameters m_active_seed;
+	uint64_t m_active_seed_scene=0,m_active_scenes=0,m_active_quads=0;
+	uint32_t m_active_seed_bank=0;
+	std::set<uint32_t> m_active_submitted,m_active_snapshots;
+	memory_passthrough_handler m_active_submission_tap;
+	FILE *m_active_log=nullptr;
 
 	void visibility_start();
 	void visibility_guard();
@@ -350,6 +362,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
 	m_scene_depth_mode=number("MIDZ_HOST_EARLY_DEPTH",0,2,0);
+	m_active_mode=number("MIDZ_HOST_ACTIVE",0,2,0);
 	if(number("MIDZ_HOST_FENCE",0,1,0)) {
 		m_scene_fence_log=fopen("exotica-host-fences.csv","w");
 		if(!m_scene_fence_log)fatalerror("Cannot create Exotica command-fence log\n");
@@ -401,6 +414,25 @@ void crusnexo_state::scene_observer_start()
 	setvbuf(m_scene_log,nullptr,_IOFBF,65536);
 	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds,materials_us,source_cache,depth_mode,depth_tests,depth_verified,depth_skipped\n");
 	auto &space=m_maincpu->space(AS_PROGRAM);
+	if(m_active_mode) {
+		if(!m_scene_fence_log || !m_scene_material_image || !m_zeus->midz_live)
+			fatalerror("Exotica active margins require command fence, private materials and live GL\n");
+		m_active_snapshots=m_scene_snapshots;
+		m_active_log=fopen("exotica-active-scenes.csv","w");
+		if(!m_active_log)fatalerror("Cannot create Exotica active-scene log\n");
+		setvbuf(m_active_log,nullptr,_IOFBF,65536);
+		fprintf(m_active_log,"scene,scene_frame,frame,ready_frame,objects,candidates,already_submitted,instances,quads,excluded_raster,hash,guest_cycles,assembly_us,materials_us\n");
+		m_active_submission_tap=space.install_write_tap(0x46e,0x46e,"exotica_active_original_submission",
+			[this](offs_t offset,uint32_t &data,uint32_t mask) {
+				if(machine().side_effects_disabled() || !m_scene_open || !m_active_capture.lists() ||
+					m_maincpu->state_int(TMS320C3X_PC)!=0x6970)return;
+				const uint32_t object=uint32_t(m_maincpu->state_int(TMS320C3X_AR7));
+				if(object<0x1000 || object+31>0x40000 || data<0x30000 || data>=0x32000 ||
+					m_active_submitted.size()>=4096)fatalerror("Exotica active original-submission bounds\n");
+				m_active_submitted.insert(object);
+			});
+		fprintf(stderr,"MIDZ_HOST_ACTIVE=%u\n",m_active_mode);
+	}
 	// Native refreshes can split one game's scene. Latch its actual scene/list
 	// boundary, then join only the first supported original scenery submission.
 	m_scene_marker_tap=space.install_write_tap(0xff2,0xff2,"exotica_host_scene_begin",
@@ -409,6 +441,10 @@ void crusnexo_state::scene_observer_start()
 			if(m_scene_open || data!=UINT32_MAX)fatalerror("Exotica host scene begin order\n");
 			m_scene_cpu_frame=uint32_t(m_screen->frame_number());m_scene_cpu_time=machine().time().as_double();
 			m_scene_open=true;m_scene_armed=false;m_scene_fence_selected=false;++m_scene_serial;
+			if(m_active_mode) {
+				if(m_scene_fence.pending())fatalerror("Exotica active previous fence pending\n");
+				m_active_capture.clear();m_active_submitted.clear();m_active_seed_scene=0;
+			}
 			for(unsigned i=0;i<3;++i)m_scene_camera[i]=m_ram_base[0xfeb+i];
 		});
 	m_scene_lists_tap=space.install_read_tap(0xbbb5,0xbbb9,"exotica_host_scene_lists",
@@ -425,6 +461,9 @@ void crusnexo_state::scene_observer_start()
 				if(m_scene_fence_log && m_scene_fence_selected)scene_fence_end();
 				m_scene_open=false;m_scene_armed=false;
 			}
+			if(m_active_mode && m_scene_open && m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last &&
+				((offset==0xbbb5 && pc==0x6820) || (offset==0xbbb6 && pc==0x6824) ||
+				 (offset==0xbbb7 && pc==0x6830) || (offset==0xbbb8 && pc==0x6834)))scene_active_list(offset,data);
 		});
 	m_scene_ready_tap=space.install_read_tap(0xb47d,0xb47d,"exotica_host_ready",
 		[this](offs_t offset,uint32_t &data,uint32_t mask) {
@@ -537,6 +576,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	std::memcpy(c.matrix.data(),z.zeus_matrix,sizeof(z.zeus_matrix));
 	std::copy_n(z.zeus_trans,4,c.translation.begin());std::copy_n(z.zeus_light,3,c.light.begin());
 	std::copy_n(z.m_zeusbase,128,c.regs.begin());std::copy_n(z.m_renderRegs,80,c.render.begin());
+	if(m_active_mode) {m_active_seed=p;m_active_seed_scene=pending.scene;m_active_seed_bank=pending.bank;}
 	cruisn::exotica_future::Result sources;
 	if(m_scene_source_cache) {
 		// Cache lifetime is this machine instance. ROM regions are immutable in
@@ -684,11 +724,151 @@ void crusnexo_state::scene_fence_ready(bool immediate)
 		frame,now,m_scene_fence_consumer,m_scene_fence.target(),m_scene_fence_words,unsigned(immediate),m_zeus->m_renderRegs[4])<0)
 		fatalerror("Exotica command-fence log write\n");
 	++m_scene_fence_completed;m_scene_fence_immediate+=immediate;
+	if(m_active_mode)scene_active_ready();
+}
+
+void crusnexo_state::scene_active_list(uint32_t entry,uint32_t head)
+{
+	const auto cycles=m_maincpu->total_cycles();
+	auto read=[&](uint32_t address){return scene_read(address);};
+	const uint32_t code[][2]={{0x681f,0x082fbbb5},{0x6823,0x082fbbb6},{0x682f,0x082fbbb7},{0x6833,0x082fbbb8}};
+	for(const auto &word:code)if(read(word[0])!=word[1])fatalerror("Exotica active list code signature\n");
+	cruisn::exotica_active::Parameters p;
+	p.mode=read(0x75);p.projection_table=read(0x67cc);p.margin=uint32_t(m_scene_margin);
+	for(unsigned i=0;i<3;++i) {
+		p.camera[i]=read(0xfeb+i);
+		if(p.camera[i]!=m_scene_camera[i])fatalerror("Exotica active list camera changed\n");
+	}
+	for(unsigned i=0;i<9;++i){p.view[i]=read(read(0x67bf)+i);p.alternate[i]=read(read(0x67c0)+i);}
+	for(unsigned i=0;i<14;++i)p.constants[i]=read(0x67ce+i);
+	if(!m_active_capture.capture(entry,head,p,read))
+		fatalerror("Exotica active list rejected at scene%llu frame%u entry%08x\n",(unsigned long long)m_scene_serial,m_scene_cpu_frame,entry);
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active list changed CPU cycles\n");
+}
+
+void crusnexo_state::scene_active_ready()
+{
+	const auto cycles=m_maincpu->total_cycles();const auto started=std::chrono::steady_clock::now();
+	if(m_active_seed_scene!=m_scene_fence_scene || m_active_seed_bank!=(m_disk_asic_jr[5]&3) ||
+		m_active_seed.context.render[4]!=m_zeus->m_renderRegs[4] || m_scene_fence.pending() || !m_zeus->midz_fifo_empty())
+		fatalerror("Exotica active scene/page/bank/fence ownership changed\n");
+	auto read=[&](uint32_t address){return scene_read(address);};
+	auto p=m_active_seed;p.multiplier=1;p.complete_fade=false;p.early_depth=1;
+	for(unsigned i=0;i<3;++i)if(p.camera[i]!=read(0xfeb+i))fatalerror("Exotica active completion camera changed\n");
+	for(unsigned i=0;i<9;++i)if(p.view[i]!=read(read(0x67bf)+i) || p.alternate[i]!=read(read(0x67c0)+i))
+		fatalerror("Exotica active completion view changed\n");
+	for(unsigned i=0;i<12;++i)if(p.setup.constants[i]!=read(0x67d0+i))fatalerror("Exotica active completion constants changed\n");
+	for(unsigned i=0;i<46;++i)if(p.setup.commands[i]!=read(0xb479+i))fatalerror("Exotica active completion commands changed\n");
+	if(p.scale!=read(0x67db) || p.setup.palette_setup!=read(0x15f2))fatalerror("Exotica active completion scale/palette setup changed\n");
+	const uint32_t program_addresses[]={0xe7c1,0xe7c7,0xe7d3,0xe7d9};
+	for(unsigned i=0;i<4;++i) {
+		if(p.setup.programs[i]!=read(program_addresses[i]))fatalerror("Exotica active completion program changed\n");
+		for(unsigned j=0;j<4;++j)if(p.setup.bodies[i][j]!=read(p.setup.programs[i]+j))fatalerror("Exotica active completion program body changed\n");
+	}
+	const uint32_t defaults=read(0xe4);
+	if(uint64_t(read(defaults))+1!=p.setup.defaults.size())fatalerror("Exotica active completion default-state size changed\n");
+	for(unsigned i=0;i<p.setup.defaults.size();++i)if(p.setup.defaults[i]!=read(defaults+1+i))fatalerror("Exotica active completion default state changed\n");
+	cruisn::exotica_active::Selections selected;
+	if(!m_active_capture.finish(read,m_active_submitted,selected))
+		fatalerror("Exotica active completion list/render ownership rejected at frame%u scene%llu\n",p.frame,(unsigned long long)m_scene_fence_scene);
+	const auto &z=*m_zeus;const uint32_t page=p.context.render[4];
+	auto model_read=[&](uint32_t address,uint32_t size,std::vector<uint32_t> &words) {
+		const size_t offset=2*(size_t(address%1024)+size_t((address>>16)%2048)*1024),n=2*(size_t(size)+1);
+		if(offset>4*1024*1024 || n>4*1024*1024-offset)return false;
+		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);return true;
+	};
+	cruisn::exotica_scene::Result scene;size_t excluded=0;
+	for(const auto &list:selected.lists) {
+		const auto &owned=list.parameters;
+		if(owned.camera!=p.camera || owned.view!=p.view || owned.alternate!=p.alternate ||
+			owned.mode!=read(0x75) || owned.projection_table!=read(0x67cc))fatalerror("Exotica active captured list dependencies changed\n");
+		for(unsigned i=0;i<14;++i)if(owned.constants[i]!=read(0x67ce+i))fatalerror("Exotica active captured projection constants changed\n");
+		cruisn::exotica_scene::Result part;
+		if(!cruisn::exotica_scene::build_active(list.sources,p,read,model_read,part))
+			fatalerror("Exotica active current geometry rejected at frame%u scene%llu\n",p.frame,(unsigned long long)m_scene_fence_scene);
+		for(auto instance:part.instances) {
+			bool valid=true;
+			for(size_t j=0;j<instance.quad_count;++j)
+				valid=valid && cruisn::zeus_margin::depth24(part.quads[instance.first_quad+j],p.frame,page);
+			if(!valid){++excluded;continue;}
+			if(scene.instances.size()>=4096 || instance.quad_count>131072-scene.quads.size())fatalerror("Exotica active scene budget\n");
+			const auto first=part.quads.begin()+instance.first_quad;
+			instance.first_quad=scene.quads.size();scene.quads.insert(scene.quads.end(),first,first+instance.quad_count);
+			scene.instances.push_back(instance);
+		}
+	}
+	const auto assembled=std::chrono::steady_clock::now();
+	const auto *wave=reinterpret_cast<const uint8_t *>(z.m_waveram.get());
+	cruisn::zeus_host::PaletteSet palettes;
+	if(!cruisn::zeus_host::palettes(scene.instances,wave,0x1000000,palettes))fatalerror("Exotica active palette ownership rejected\n");
+	cruisn::zeus_margin::Packet packet;auto &material=packet.materials;
+	material.frame=p.frame;material.scene=m_scene_fence_scene;material.snapshot=m_active_snapshots.count(p.frame)!=0;
+	packet.margin=uint32_t(m_scene_margin);packet.page=page;packet.draw=m_active_mode==2;
+	material.rows=std::move(palettes.rows);
+	for(size_t i=0;i<scene.instances.size();++i) {
+		const auto &instance=scene.instances[i];
+		for(size_t j=0;j<instance.quad_count;++j) {
+			cruisn::zeus_margin::Quad q;q.polygon=scene.quads[instance.first_quad+j];q.palette=palettes.instance_rows[i];packet.quads.push_back(q);
+		}
+	}
+	const bool staged=m_scene_material_pages ?
+		m_scene_material_image->stage_selected_pages(wave,0x1000000,m_zeus->midz_host_wave_pages(),material.wave) :
+		m_scene_material_image->stage(wave,0x1000000,material.wave);
+	if(!staged)fatalerror("Exotica active private image staging rejected\n");
+	if(m_scene_material_pages==2) {
+		cruisn::zeus_host::WaveImage::Packet full;std::vector<uint8_t> a,b;
+		if(!m_scene_material_image->stage(wave,0x1000000,full) ||
+			!cruisn::zeus_host::WaveImage::encode(full,a) || !cruisn::zeus_host::WaveImage::encode(material.wave,b) || a!=b)
+			fatalerror("Exotica active written/full pages differ\n");
+		++m_scene_material_verified;
+	}
+	const auto staged_at=std::chrono::steady_clock::now();std::vector<uint8_t> wire,material_wire;
+	if(!cruisn::zeus_margin::encode(packet,wire) || !cruisn::zeus_host::encode(material,material_wire))fatalerror("Exotica active owned packet rejected\n");
+	const auto encoded=std::chrono::steady_clock::now();
+	if(!m_zeus->midz_host_margin(wire.data(),wire.size()))fatalerror("Exotica active owned queue rejected\n");
+	const auto queued=std::chrono::steady_clock::now();
+	if(!m_scene_material_image->apply(material.wave))fatalerror("Exotica active producer image commit rejected\n");
+	if(m_scene_material_pages)m_zeus->midz_host_wave_commit();
+	const auto committed=std::chrono::steady_clock::now();
+	auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+	if(fprintf(m_scene_material_log,"%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f\n",
+		(unsigned long long)material.scene,p.frame,(unsigned long long)material.wave.generation,
+		unsigned(material.wave.pages.size()),unsigned(material.rows.size()),unsigned(material_wire.size()),
+		(unsigned long long)material.wave.result_hash,us(assembled,staged_at),us(staged_at,encoded),us(encoded,queued),us(queued,committed))<0)
+		fatalerror("Exotica active material log write\n");
+	if(material.snapshot) {
+		auto dump=[](const std::string &name,const void *data,size_t bytes) {
+			FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open Exotica active snapshot\n");
+			const bool ok=fwrite(data,1,bytes,f)==bytes;const int closed=fclose(f);if(!ok || closed)fatalerror("Cannot complete Exotica active snapshot\n");
+		};
+		const auto prefix="exotica-active-"+std::to_string(p.frame);
+		const auto parameters=cruisn::exotica_scene::parameter_words(p,m_active_seed_bank,m_scene_loading!=0);
+		const auto instances=cruisn::exotica_scene::instance_words(scene);
+		dump(prefix+"-context.bin",parameters.data(),parameters.size()*4);dump(prefix+"-ram.bin",m_ram_base.target(),m_ram_base.bytes());
+		dump(prefix+"-wave.bin",wave,0x1000000);dump(prefix+"-packet.bin",wire.data(),wire.size());
+		dump(prefix+"-materials.bin",material_wire.data(),material_wire.size());
+		dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));
+		dump(prefix+"-quads.bin",scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
+		m_active_snapshots.erase(p.frame);
+	}
+	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active completion changed CPU cycles\n");
+	if(fprintf(m_active_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0,%.3f,%.3f\n",
+		(unsigned long long)m_scene_fence_scene,m_scene_fence_scene_frame,p.frame,unsigned(m_screen->frame_number()),
+		unsigned(selected.objects),unsigned(selected.candidates),unsigned(selected.already_submitted),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(excluded),
+		(unsigned long long)hash,us(started,assembled),us(assembled,committed))<0)fatalerror("Exotica active scene log write\n");
+	++m_active_scenes;m_active_quads+=scene.quads.size();
 }
 
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_active_log) {
+		const int closed=fclose(m_active_log);m_active_log=nullptr;
+		fprintf(stderr,"MIDZ_HOST_ACTIVE_RESULT complete=%u scenes=%llu quads=%llu remaining=%u\n",
+			unsigned(!closed && m_active_scenes==m_scene_matched && m_active_snapshots.empty()),
+			(unsigned long long)m_active_scenes,(unsigned long long)m_active_quads,unsigned(m_active_snapshots.size()));
+	}
 	if(m_scene_fence_log) {
 		m_zeus->set_midz_fifo_observer({});
 		const int closed=fclose(m_scene_fence_log);m_scene_fence_log=nullptr;

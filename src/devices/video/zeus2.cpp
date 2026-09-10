@@ -12,6 +12,7 @@
 #include "../../mame/midway/cruisn/zeus_margin_clear.h"
 #include "../../mame/midway/cruisn/zeus_sky_repeat.h"
 #include "../../mame/midway/cruisn/zeus_host_materials.h"
+#include "../../mame/midway/cruisn/zeus_margin_packet.h"
 
 #include "screen.h"
 
@@ -417,6 +418,8 @@ struct GL
 	void (WINAPI *VertexAttribIPointer)(uint, int, unsigned, int, const void *);
 	void (WINAPI *GenFramebuffers)(int, uint *);
 	void (WINAPI *BindFramebuffer)(unsigned, uint);
+	void (WINAPI *DeleteFramebuffers)(int,const uint *);
+	void (WINAPI *BlitFramebuffer)(int,int,int,int,int,int,int,int,unsigned,unsigned);
 	void (WINAPI *FramebufferTexture2D)(unsigned, unsigned, unsigned, uint, int);
 	unsigned (WINAPI *CheckFramebufferStatus)(unsigned);
 	void (WINAPI *ActiveTexture)(unsigned);
@@ -443,6 +446,7 @@ struct GL
 		L(Viewport, "glViewport") L(ClearColor, "glClearColor")
 		L(ClearDepth, "glClearDepth") L(Clear, "glClear")
 		L(GenTextures, "glGenTextures") L(BindTexture, "glBindTexture")
+		L(DeleteFramebuffers,"glDeleteFramebuffers") L(BlitFramebuffer,"glBlitFramebuffer")
 		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
 		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
 		L(GetTexImage, "glGetTexImage") L(DeleteTextures, "glDeleteTextures")
@@ -892,17 +896,24 @@ void thread_main()
 	std::unique_ptr<cruisn::zeus_host::WaveImage> private_image;
 	uint private_wave_tex=0,private_palette_tex=0;
 	uint64_t private_scene=0,private_packets=0,private_snapshots=0;
+	uint64_t private_late_scene=0,margin_packets=0,margin_quads=0;
+	uint margin_depth_tex=0,margin_fbo=0;
+	FILE *margin_log=nullptr;
 	uint32_t private_frame=0;
 	FILE *private_log=nullptr;
 	bool private_failed=false;
-	auto private_materials=[&](const std::vector<uint8_t> &wire)->bool {
+	auto private_materials=[&](const std::vector<uint8_t> &wire,bool late=false)->bool {
 		using namespace cruisn::zeus_host;
 		const auto start=std::chrono::steady_clock::now();
 		const char *enabled=std::getenv("MIDZ_HOST_MATERIALS");
 		const char *ffb=std::getenv("MIDV_FFB");
 		if(!enabled || strcmp(enabled,"1") || !ffb || strcmp(ffb,"0"))return false;
 		Packet packet;
-		if(!decode(wire.data(),wire.size(),packet) || packet.scene<=private_scene || packet.frame<private_frame)return false;
+		if(!decode(wire.data(),wire.size(),packet) || packet.frame<private_frame)return false;
+		if(late) {
+			if(packet.scene!=private_scene || packet.frame!=private_frame || packet.scene<=private_late_scene)return false;
+		} else if(packet.scene<=private_scene ||
+			(envi("MIDZ_HOST_ACTIVE",nullptr,0) && private_late_scene!=private_scene))return false;
 		if(!private_image)private_image=std::make_unique<WaveImage>();
 		if(!accept(packet,*private_image))return false;
 		const auto decoded=std::chrono::steady_clock::now();
@@ -960,7 +971,7 @@ void thread_main()
 				const bool written=fwrite(data,1,bytes,file)==bytes;const int closed=fclose(file);
 				return written && !closed;
 			};
-			const auto prefix="exotica-host-"+std::to_string(packet.frame);
+			const auto prefix=std::string(late?"exotica-active-":"exotica-host-")+std::to_string(packet.frame);
 			if(!save(prefix+"-gpu-wave.bin",wave.data(),wave.size()) ||
 				!save(prefix+"-gpu-palettes.bin",palettes.data(),colors.size()*4))return false;
 			++private_snapshots;
@@ -973,6 +984,7 @@ void thread_main()
 			unsigned(packet.wave.pages.size()),unsigned(packet.rows.size()),unsigned(wire.size()),
 			(unsigned long long)packet.wave.result_hash,us(start,decoded),us(decoded,uploaded),us(uploaded,finished))<0)return false;
 		private_scene=packet.scene;private_frame=packet.frame;++private_packets;
+		if(late)private_late_scene=packet.scene;
 		return true;
 	};
 	uint32_t pal_slot = 0;
@@ -1141,6 +1153,122 @@ void thread_main()
 			addr = (addr + take) & (CW * CH - 1);
 			n -= take;
 		}
+	};
+
+	auto private_margin=[&](const std::vector<uint8_t> &wire)->bool {
+		const auto started=std::chrono::steady_clock::now();
+		const int mode=envi("MIDZ_HOST_ACTIVE",nullptr,0);
+		cruisn::zeus_margin::Packet packet;
+		if((mode!=1 && mode!=2) || !cruisn::zeus_margin::decode(wire.data(),wire.size(),packet) ||
+			packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
+		std::vector<uint8_t> material;
+		if(!cruisn::zeus_host::encode(packet.materials,material) || !private_materials(material,true))return false;
+		// Finish all original queued polygons before copying their depth. The
+		// producer sent this record only after the exact original FIFO target.
+		flush();
+		if(gl.GetError())return false;
+		auto texture_bytes=[&](uint texture,unsigned format,unsigned type) {
+			std::vector<uint8_t> data(size_t(fw)*fh*4);
+			gl.ActiveTexture(TEXTURE0+7);gl.BindTexture(0x0DE1,texture);
+			gl.PixelStorei(0x0D05,1);gl.GetTexImage(0x0DE1,0,format,type,data.data());return data;
+		};
+		std::vector<uint8_t> before_color,before_depth;
+		if(packet.materials.snapshot) {
+			before_color=texture_bytes(fbTex,RGBA,0x1401);
+			before_depth=texture_bytes(depthTex,DEPTH_COMPONENT,0x1405);
+			if(gl.GetError())return false;
+		}
+		size_t vertices=0;
+		if(packet.draw && MARGIN && !packet.quads.empty()) {
+			if(!margin_depth_tex) {
+				gl.ActiveTexture(TEXTURE0+7);
+				margin_depth_tex=make_tex(fw,fh,DEPTH_COMPONENT24,DEPTH_COMPONENT,0x1405);
+				gl.GenFramebuffers(1,&margin_fbo);gl.BindFramebuffer(FRAMEBUFFER,margin_fbo);
+				gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0,0x0DE1,fbTex,0);
+				gl.FramebufferTexture2D(FRAMEBUFFER,DEPTH_ATTACHMENT,0x0DE1,margin_depth_tex,0);
+				if(gl.CheckFramebufferStatus(FRAMEBUFFER)!=FRAMEBUFFER_COMPLETE)return false;
+			}
+			gl.Disable(GLSCISSOR_TEST);
+			gl.BindFramebuffer(0x8CA8 /*READ_FRAMEBUFFER*/,fbo);
+			gl.BindFramebuffer(0x8CA9 /*DRAW_FRAMEBUFFER*/,margin_fbo);
+			const int y=int(packet.page)*S,h=DISPH*S;
+			for(int x:{0,(CW+MARGIN)*S})
+				gl.BlitFramebuffer(x,y,x+MARGIN*S,y+h,x,y,x+MARGIN*S,y+h,0x100 /*DEPTH only*/,0x2600 /*NEAREST*/);
+			if(gl.GetError())return false;
+			if(packet.materials.snapshot) {
+				const auto copied=texture_bytes(margin_depth_tex,DEPTH_COMPONENT,0x1405);
+				for(int row=y;row<y+h;++row)for(int x:{0,(CW+MARGIN)*S})
+					if(memcmp(copied.data()+(size_t(row)*fw+x)*4,before_depth.data()+(size_t(row)*fw+x)*4,size_t(MARGIN)*S*4))return false;
+			}
+			std::vector<float> floats;std::vector<uint32_t> integers;std::vector<Batch> own_batches;
+			floats.reserve(packet.quads.size()*42);integers.reserve(packet.quads.size()*60);
+			for(const auto &q:packet.quads) {
+				const auto &s=q.polygon.state;const auto flags=s[9];
+				const bool blend=(flags&2)!=0,dtest=(flags&8)!=0,dwrite=(flags&16)!=0 && !(flags&128);
+				const bool same=!own_batches.empty() && own_batches.back().blend==blend && own_batches.back().dtest==dtest &&
+					own_batches.back().dwrite==dwrite && own_batches.back().rowbase==int(s[11]) &&
+					std::equal(own_batches.back().clip,own_batches.back().clip+4,s.begin()+13);
+				if(!same) {
+					if(!own_batches.empty())own_batches.back().count=int(floats.size()/7)-own_batches.back().first;
+					own_batches.push_back({int(floats.size()/7),0,blend,dtest,dwrite,true,int(s[11]),{int(s[13]),int(s[14]),int(s[15]),int(s[16])}});
+				}
+				const uint32_t meta[10]={flags,(s[3]*8)&0xffffff,s[4],s[2]&0xffff,s[6],s[5],q.palette,s[7],s[8],s[10]};
+				for(unsigned i=2;i<s[1];++i)for(unsigned index:{0u,i-1,i}) {
+					const auto &v=q.polygon.vertices[index];
+					floats.insert(floats.end(),{v[0],v[1],float(s[11]),v[2],v[3],v[4],v[5]});
+					integers.insert(integers.end(),meta,meta+10);
+				}
+			}
+			vertices=floats.size()/7;
+			if(!own_batches.empty())own_batches.back().count=int(vertices)-own_batches.back().first;
+			gl.UseProgram(prog);gl.BindVertexArray(vao);
+			gl.BindBuffer(ARRAY_BUFFER,vbo_f);gl.BufferData(ARRAY_BUFFER,floats.size()*4,floats.data(),STREAM_DRAW);
+			gl.BindBuffer(ARRAY_BUFFER,vbo_u);gl.BufferData(ARRAY_BUFFER,integers.size()*4,integers.data(),STREAM_DRAW);
+			gl.BindFramebuffer(FRAMEBUFFER,margin_fbo);gl.Viewport(0,0,fw,fh);
+			gl.Enable(GLDEPTH_TEST);gl.Enable(GLSCISSOR_TEST);gl.BlendFunc(GLONE,GLSRC_ALPHA);
+			gl.Uniform1i(gl.GetUniformLocation(prog,"waveram"),4);gl.Uniform1i(gl.GetUniformLocation(prog,"palTex"),5);
+			gl.ActiveTexture(TEXTURE0+4);gl.BindTexture(0x0DE1,private_wave_tex);
+			gl.ActiveTexture(TEXTURE0+5);gl.BindTexture(0x0DE1,private_palette_tex);
+			for(const auto &b:own_batches) {
+				if(b.blend)gl.Enable(GLBLEND);else gl.Disable(GLBLEND);
+				gl.DepthFunc(b.dtest?GLLEQUAL:GLALWAYS);gl.DepthMask(b.dwrite);gl.ColorMask(1,1,1,1);
+				for(int x:{0,(CW+MARGIN)*S}) {
+					gl.Scissor(x,(b.rowbase+b.clip[1])*S,MARGIN*S,(b.clip[3]-b.clip[1]+1)*S);
+					gl.DrawArrays(0x0004,b.first,b.count);
+				}
+			}
+			gl.Uniform1i(gl.GetUniformLocation(prog,"waveram"),0);gl.Uniform1i(gl.GetUniformLocation(prog,"palTex"),1);
+			gl.Disable(GLBLEND);gl.Disable(GLSCISSOR_TEST);gl.DepthMask(1);gl.ColorMask(1,1,1,1);
+			gl.BindFramebuffer(FRAMEBUFFER,0);
+			if(gl.GetError())return false;
+		}
+		if(packet.materials.snapshot) {
+			const auto after_color=texture_bytes(fbTex,RGBA,0x1401),after_depth=texture_bytes(depthTex,DEPTH_COMPONENT,0x1405);
+			if(gl.GetError() || before_depth!=after_depth)return false;
+			for(int row=0;row<fh;++row) {
+				const bool active=row>=int(packet.page)*S && row<(int(packet.page)+DISPH)*S;
+				const size_t x=active?size_t(MARGIN)*S:0,n=active?size_t(CW)*S:size_t(fw);
+				if(memcmp(before_color.data()+(size_t(row)*fw+x)*4,after_color.data()+(size_t(row)*fw+x)*4,n*4))return false;
+			}
+			auto save=[](const std::string &name,const std::vector<uint8_t> &data) {
+				FILE *f=fopen(name.c_str(),"wb");if(!f)return false;
+				const bool ok=fwrite(data.data(),1,data.size(),f)==data.size();const int closed=fclose(f);return ok && !closed;
+			};
+			const auto prefix="exotica-active-"+std::to_string(packet.materials.frame);
+			if(!save(prefix+"-gpu-before-color.bin",before_color) || !save(prefix+"-gpu-after-color.bin",after_color) ||
+				!save(prefix+"-gpu-before-depth.bin",before_depth) || !save(prefix+"-gpu-after-depth.bin",after_depth))return false;
+		}
+		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0DE1,waveTex);
+		gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0DE1,palTex);gl.ActiveTexture(TEXTURE0);
+		if(!margin_log) {
+			margin_log=fopen("exotica-active-gpu.csv","w");if(!margin_log)return false;
+			setvbuf(margin_log,nullptr,_IOFBF,65536);
+			fprintf(margin_log,"scene,frame,mode,quads,vertices,width,height,page,margin,snapshot,host_us\n");
+		}
+		const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
+		if(fprintf(margin_log,"%llu,%u,%u,%u,%u,%d,%d,%u,%u,%u,%.3f\n",(unsigned long long)packet.materials.scene,
+			packet.materials.frame,mode,unsigned(packet.quads.size()),unsigned(vertices),fw,fh,packet.page,packet.margin,unsigned(packet.materials.snapshot),elapsed)<0)return false;
+		++margin_packets;margin_quads+=packet.quads.size();return true;
 	};
 
 	std::vector<uint8_t> rec;
@@ -1393,6 +1521,12 @@ void thread_main()
 					zlogf("private material validation/upload failed after %llu packets",(unsigned long long)private_packets);
 				}
 				break;
+			case 8:
+				if(!private_margin(rec)) {
+					private_failed=true;s_stopz.store(true);
+					zlogf("private margin validation/draw failed after %llu packets",(unsigned long long)margin_packets);
+				}
+				break;
 			}
             if(private_failed)break;
             if (frame_ready) break; // never consume the next frame before presenting this one
@@ -1596,6 +1730,13 @@ void thread_main()
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
 
+	if(margin_log) {
+		if(fclose(margin_log))private_failed=true;
+		fprintf(stderr,"MIDZ_HOST_ACTIVE_GPU_RESULT complete=%u scenes=%llu quads=%llu\n",
+			unsigned(!private_failed),(unsigned long long)margin_packets,(unsigned long long)margin_quads);
+	}
+	if(margin_fbo)gl.DeleteFramebuffers(1,&margin_fbo);
+	if(margin_depth_tex)gl.DeleteTextures(1,&margin_depth_tex);
 	if(private_log) {
 		if(fclose(private_log))private_failed=true;
 		fprintf(stderr,"MIDZ_HOST_MATERIALS_GPU_RESULT complete=%u received=%llu snapshots=%llu hash=%016llx\n",
@@ -1701,6 +1842,17 @@ bool zeus2_device::midz_host_materials(const uint8_t *data, size_t size)
 	if(midz_live && enabled && !strcmp(enabled,"1") && ffb && !strcmp(ffb,"0") &&
 		data && size>=cruisn::zeus_host::packet_header_bytes && size<=cruisn::zeus_host::maximum_material_bytes)
 		return mzgl::ring_push2(7,data,uint32_t(size),nullptr,0);
+#endif
+	return false;
+}
+
+bool zeus2_device::midz_host_margin(const uint8_t *data,size_t size)
+{
+#ifdef _WIN32
+	const char *enabled=std::getenv("MIDZ_HOST_ACTIVE"),*ffb=std::getenv("MIDV_FFB");
+	if(midz_live && enabled && (!strcmp(enabled,"1") || !strcmp(enabled,"2")) && ffb && !strcmp(ffb,"0") &&
+		data && size>=cruisn::zeus_margin::header_bytes && size<=cruisn::zeus_margin::maximum_bytes)
+		return mzgl::ring_push2(8,data,uint32_t(size),nullptr,0);
 #endif
 	return false;
 }
