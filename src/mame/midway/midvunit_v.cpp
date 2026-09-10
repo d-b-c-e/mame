@@ -41,6 +41,7 @@
 #include <set>
 #include <vector>
 #include "cruisn/capture_bitmap.h"
+#include "cruisn/capture_writer.h"
 #include <string>
 #ifdef _WIN32
 #include <winsock2.h>
@@ -1006,6 +1007,7 @@ void thread_main()
 		s_log = fopen("midv_gl.log", "w");
 	int const S = std::getenv("MIDV_GL_SCALE") ? atoi(std::getenv("MIDV_GL_SCALE")) : 3;
 	const char *snapdir = std::getenv("MIDV_GL_SNAP");
+	if (snapdir) std::fprintf(stderr, "MIDV_CAPTURE_WRITER_BEGIN\n");
 	int const snap_every = std::getenv("MIDV_GL_SNAP_EVERY")
 		? std::max(1, atoi(std::getenv("MIDV_GL_SNAP_EVERY"))) : 150;
 	int const snap_first = std::getenv("MIDV_GL_SNAP_FIRST")
@@ -1283,7 +1285,8 @@ void thread_main()
 	std::vector<uint32_t> udata;
 	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
 	int snap_n = 0;
-	std::vector<uint8_t> snapshot_bitmap;
+	cruisn::CaptureWriter snapshot_writer;
+	FILE *snapshot_index = nullptr;
 	uint32_t last_received_frame = 0;
 	int const stall_frame = std::getenv("MIDV_GL_STALL_FRAME") ? atoi(std::getenv("MIDV_GL_STALL_FRAME")) : -1;
 	int const stall_ms = std::getenv("MIDV_GL_STALL_MS") ? std::clamp(atoi(std::getenv("MIDV_GL_STALL_MS")), 0, 5000) : 0;
@@ -1294,7 +1297,7 @@ void thread_main()
 	int const menu_test_frame = (std::getenv("MIDV_FFB") &&
 		strcmp(std::getenv("MIDV_FFB"), "0") == 0 && (menu_test_cheats || std::getenv("MIDV_GL_MENU_TEST_FRAME")))
 		? atoi(std::getenv(menu_test_cheats ? "MIDV_CHEAT_MENU_TEST_FRAME" : "MIDV_GL_MENU_TEST_FRAME")) : -1;
-	int menu_test_step = -1, menu_test_saved = -1;
+	int menu_test_step = -1, menu_test_queued = -1;
 	ULONGLONG menu_test_next = 0;
 	uint32_t completed_frame = 0;
 
@@ -1713,7 +1716,7 @@ void thread_main()
 				(unsigned long long)n_flips,
 				(unsigned long long)(ring_load(lv.wpos) - ring_load(lv.rpos)), visible,
 				int(quad_fresh[visible]), quad_count[visible], gl.GetError(), double(lv.speed_pct));
-		bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 9 && menu_test_saved != menu_test_step;
+		bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 9 && menu_test_queued != menu_test_step;
 		if (snapdir && (menu_test_capture || (frame_complete && !menu_open &&
 			(last_received_frame % snap_every) == 0 &&
 			int(last_received_frame) >= snap_first &&
@@ -1733,35 +1736,47 @@ void thread_main()
 				snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
 			else
 				snprintf(path, sizeof(path), "%s\\mvgl_%03d.bmp", snapdir, snap_n++);
-			const bool snapshot_written = cruisn::write_capture_bitmap(path, cw, ch, px.data(), px.size(), snapshot_bitmap);
-			if (!snapshot_written) std::fprintf(stderr, "MIDV screenshot write failed: %s\n", path);
-			if (snapshot_written)
-			{
-				if (menu_test_capture)
-				{
-					menu_test_saved = menu_test_step;
-					logf("cheat menu snapshot step=%d submenu=%d entries=%u pending=%u", menu_test_step, int(cheat_menu.open), unsigned(cheat_menu.rows.size()), unsigned(cheat_menu.pending.size()));
-					logf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
-						menu_test_step, int(menu_open), menu_sel, int(crt), completed_frame, int(frame_complete));
+			cruisn::CaptureWriter::Request request;
+			request.path = path;
+			if (!menu_test_capture) {
+				if (snap_n == 1) {
+					char index_path[512]; snprintf(index_path, sizeof(index_path), "%s\\captures.csv", snapdir);
+					snapshot_index = fopen(index_path, "w");
+					if (snapshot_index) fprintf(snapshot_index, "file,present,last_received_frame,width,height,visible_page,queued_bytes,dropped_messages,completed_frame\n");
 				}
-				// This is the most recently CONSUMED stream frame, not a promise
-				// that the async backbuffer equals a native frame at that instant.
-				// Preserve that distinction and the queue/drop state for analysis.
-				char index_path[512];
-				snprintf(index_path, sizeof(index_path), "%s\\captures.csv", snapdir);
-				if (FILE *index = menu_test_capture ? nullptr : fopen(index_path, snap_n == 1 ? "w" : "a"))
-				{
-					if (snap_n == 1) fprintf(index, "file,present,last_received_frame,width,height,visible_page,queued_bytes,dropped_messages,completed_frame\n");
-					fprintf(index, "mvgl_%03d.bmp,%llu,%u,%d,%d,%d,%llu,%llu,%u\n", snap_n - 1,
-						(unsigned long long)presents, last_received_frame, cw, ch, visible,
-						(unsigned long long)(ring_load(lv.wpos) - ring_load(lv.rpos)), (unsigned long long)ring_load(lv.dropped), last_received_frame);
-					fclose(index);
-				}
+				char row[256];
+				snprintf(row, sizeof(row), "mvgl_%03d.bmp,%llu,%u,%d,%d,%d,%llu,%llu,%u\n", snap_n-1,
+					(unsigned long long)presents, last_received_frame, cw, ch, visible,
+					(unsigned long long)(ring_load(lv.wpos)-ring_load(lv.rpos)), (unsigned long long)ring_load(lv.dropped), last_received_frame);
+				request.row = row; request.index = snapshot_index;
+			}
+			const bool queued = cruisn::encode_capture_bitmap(cw, ch, px.data(), px.size(), request.bitmap)
+				&& snapshot_writer.submit(std::move(request));
+			if (!queued) std::fprintf(stderr, "MIDV screenshot writer rejected: %s\n", path);
+			if (queued && menu_test_capture) {
+				// Avoid resubmitting a menu image while its file is still being written.
+				// The final writer receipt, not this queued marker, certifies completion.
+				menu_test_queued = menu_test_step;
+				logf("cheat menu snapshot step=%d submenu=%d entries=%u pending=%u", menu_test_step, int(cheat_menu.open), unsigned(cheat_menu.rows.size()), unsigned(cheat_menu.pending.size()));
+				logf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
+					menu_test_step, int(menu_open), menu_sel, int(crt), completed_frame, int(frame_complete));
 			}
 		}
 		SwapBuffers(dc);
 		if(frame_complete)s_presented_frame.store(completed_frame);
 	}
+	const auto capture_stats = snapshot_writer.finish();
+	if (snapdir) {
+		std::fprintf(stderr, "MIDV_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu\n",
+			(unsigned long long)capture_stats.submitted, (unsigned long long)capture_stats.written,
+			(unsigned long long)capture_stats.failed, (unsigned long long)capture_stats.rejected,
+			(unsigned long long)capture_stats.peak_bytes, (unsigned long long)capture_stats.write_total_us,
+			(unsigned long long)capture_stats.write_max_us, (unsigned long long)capture_stats.drain_us);
+		if (capture_stats.failed || capture_stats.rejected)
+			std::fprintf(stderr, "MIDV screenshot writer failed: captures incomplete\n");
+	}
+	if (snapshot_index && fclose(snapshot_index)) std::fprintf(stderr, "MIDV screenshot writer failed: index close\n");
+
 	// persist live-toggle state (F9 / Esc-menu CRT) for the launcher: the
 	// collection shell reads this back so its SETTINGS row and the next
 	// launch match what the player last saw on screen
@@ -2695,11 +2710,15 @@ void midvunit_base_state::mvgl_exit()
 		}
 	// POC: a detached GL thread that outlives the machine races teardown
 	// (msvcrt!memcpy AVs logged at roughly every second exit). Flag it down
-	// and give it up to a second to acknowledge before destruction proceeds.
+	// and acknowledge teardown. Diagnostic screenshots get a bounded longer
+	// drain; their owned pixels/index must finish before the process exits.
 	mvgl::s_menu_pause.store(0);
 	mvgl::s_stop.store(true);
-	for (int i = 0; i < 100 && !mvgl::s_done.load(); i++)
+	const int exit_waits = std::getenv("MIDV_GL_SNAP") ? 1000 : 100;
+	for (int i = 0; i < exit_waits && !mvgl::s_done.load(); i++)
 		Sleep(10);
+	if (std::getenv("MIDV_GL_SNAP") && !mvgl::s_done.load())
+		osd_printf_error("MIDV screenshot writer failed: shutdown timeout\n");
 }
 
 void midvunit_base_state::video_start()

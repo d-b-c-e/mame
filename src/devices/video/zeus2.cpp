@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <vector>
 #include "../../mame/midway/cruisn/capture_bitmap.h"
+#include "../../mame/midway/cruisn/capture_writer.h"
 
 // MIDZ_GL in-process renderer (Windows-only, env-gated; see mzgl below)
 #ifdef _WIN32
@@ -656,6 +657,7 @@ void thread_main()
 	int const S = std::max(1, std::min(4, envi("MIDZ_GL_SCALE", "MIDV_GL_SCALE", 3)));
 	bool crt = envi("MIDZ_GL_CRT", "MIDV_GL_CRT", 0) != 0;
 	const char *snapdir = std::getenv("MIDZ_GL_SNAP");
+	if (snapdir) std::fprintf(stderr, "MIDZ_CAPTURE_WRITER_BEGIN\n");
 	// crusnexo touches FB rows 0..800 (pages at 0 and 400); 1024 rows
 	// halve texture memory/traffic vs the full 2048-row address space, and
 	// the masks below wrap the (never-observed) high addresses harmlessly
@@ -893,7 +895,7 @@ void thread_main()
 	uint32_t zb38 = 0x1900000;
 	uint64_t presents = 0, n_quads = 0;
 	int snap_n = 0;
-	std::vector<uint8_t> snapshot_bitmap;
+	cruisn::CaptureWriter snapshot_writer;
 
 	auto vert = [&](float x, float y, float rowbase, const float *p,
 			const uint32_t *meta)
@@ -1072,7 +1074,7 @@ void thread_main()
 
 	int const menu_test_frame = (std::getenv("MIDV_FFB") && strcmp(std::getenv("MIDV_FFB"), "0") == 0 &&
 		std::getenv("MIDV_CHEAT_MENU_TEST_FRAME")) ? atoi(std::getenv("MIDV_CHEAT_MENU_TEST_FRAME")) : -1;
-	int menu_test_step = -1, menu_test_saved = -1;
+	int menu_test_step = -1, menu_test_queued = -1;
 	ULONGLONG menu_test_next = 0;
 	while (IsWindow(parent) && !s_stopz.load())
 	{
@@ -1441,7 +1443,7 @@ void thread_main()
 			s_snap_base = presents;
 		int const first_frame = envi("MIDZ_GL_SNAP_FIRST",nullptr,0);
         int const last_frame = envi("MIDZ_GL_SNAP_LAST",nullptr,2147483647);
-        bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 9 && menu_test_saved != menu_test_step;
+        bool const menu_test_capture = menu_test_step >= 0 && menu_test_step < 9 && menu_test_queued != menu_test_step;
         if (snapdir && (menu_test_capture || (!menu_open && snap_index && frame_ready && s_snap_base >= 0 && presents >= s_snap_from &&
             completed_frame >= uint32_t(first_frame) && completed_frame <= uint32_t(last_frame) &&
             (completed_frame % s_snap_every) == 0 && snap_n < s_snap_max)))
@@ -1457,22 +1459,26 @@ void thread_main()
 			char path[512];
 			if (menu_test_capture) snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
 			else snprintf(path, sizeof(path), "%s\\mzgl_%03d.bmp", snapdir, snap_n++);
-			const bool snapshot_written = cruisn::write_capture_bitmap(path, cw, ch, px.data(), px.size(), snapshot_bitmap);
-			if (!snapshot_written) std::fprintf(stderr, "MIDZ screenshot write failed: %s\n", path);
-			if (snapshot_written)
-			{
-                if (menu_test_capture) {
-                    menu_test_saved = menu_test_step;
-                    zlogf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
-                        menu_test_step,int(menu_open),menu_sel,int(crt),completed_frame,int(frame_ready));
-                    zlogf("cheat menu snapshot step=%d submenu=%d entries=%u pending=%u",
-                        menu_test_step,int(cheat_menu.open),unsigned(cheat_menu.rows.size()),unsigned(cheat_menu.pending.size()));
-                } else {
-                fprintf(snap_index,"mzgl_%03d.bmp,%llu,%u,%d,%d,%llu,%u,%u\n", snap_n-1,
-                    (unsigned long long)presents,completed_frame,cw,ch,(unsigned long long)n_quads,
-                    s_drops_quad.load()+s_drops_state.load(),completed_frame);
-                fflush(snap_index);
-                }
+			cruisn::CaptureWriter::Request request;
+			request.path = path;
+			if (!menu_test_capture) {
+				char row[256];
+				snprintf(row, sizeof(row), "mzgl_%03d.bmp,%llu,%u,%d,%d,%llu,%u,%u\n", snap_n-1,
+					(unsigned long long)presents, completed_frame, cw, ch, (unsigned long long)n_quads,
+					s_drops_quad.load()+s_drops_state.load(), completed_frame);
+				request.row = row; request.index = snap_index;
+			}
+			const bool queued = cruisn::encode_capture_bitmap(cw, ch, px.data(), px.size(), request.bitmap)
+				&& snapshot_writer.submit(std::move(request));
+			if (!queued) std::fprintf(stderr, "MIDZ screenshot writer rejected: %s\n", path);
+			if (queued && menu_test_capture) {
+				// Avoid resubmitting a menu image while its file is still being written.
+				// The final writer receipt, not this queued marker, certifies completion.
+				menu_test_queued = menu_test_step;
+				zlogf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
+					menu_test_step,int(menu_open),menu_sel,int(crt),completed_frame,int(frame_ready));
+				zlogf("cheat menu snapshot step=%d submenu=%d entries=%u pending=%u",
+					menu_test_step,int(cheat_menu.open),unsigned(cheat_menu.rows.size()),unsigned(cheat_menu.pending.size()));
 			}
 			finish_phase(PHASE_FILE, file_began);
 		}
@@ -1484,6 +1490,17 @@ void thread_main()
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
 
+	const auto capture_stats = snapshot_writer.finish();
+	if (snapdir) {
+		std::fprintf(stderr, "MIDZ_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu\n",
+			(unsigned long long)capture_stats.submitted, (unsigned long long)capture_stats.written,
+			(unsigned long long)capture_stats.failed, (unsigned long long)capture_stats.rejected,
+			(unsigned long long)capture_stats.peak_bytes, (unsigned long long)capture_stats.write_total_us,
+			(unsigned long long)capture_stats.write_max_us, (unsigned long long)capture_stats.drain_us);
+		if (capture_stats.failed || capture_stats.rejected)
+			std::fprintf(stderr, "MIDZ screenshot writer failed: captures incomplete\n");
+	}
+
 	if (char const *sf = std::getenv("MIDV_GL_STATEFILE"))
 	{
 		FILE *f = fopen(sf, "w");
@@ -1493,7 +1510,7 @@ void thread_main()
 			fclose(f);
 		}
 	}
-	if (snap_index) fclose(snap_index);
+	if (snap_index && fclose(snap_index)) std::fprintf(stderr, "MIDZ screenshot writer failed: index close\n");
 	if (s_phase_trace)
 		for (unsigned phase = PHASE_READBACK; phase < PHASE_COUNT; ++phase)
 			fprintf(stderr,"MIDZ_GL_TIMING phase=%s calls=%llu total_ms=%llu max_ms=%llu\n",
