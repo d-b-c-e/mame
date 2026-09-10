@@ -899,6 +899,9 @@ void thread_main()
 	uint64_t private_late_scene=0,margin_packets=0,margin_quads=0;
 	uint margin_depth_tex=0,margin_fbo=0;
 	FILE *margin_log=nullptr;
+	// Owned raw diagnostic bytes use the same bounded FIFO writer as BMPs;
+	// no device state or GL calls can reach this background worker.
+	cruisn::CaptureWriter margin_writer;
 	uint32_t private_frame=0;
 	FILE *private_log=nullptr;
 	bool private_failed=false;
@@ -1243,20 +1246,20 @@ void thread_main()
 			if(gl.GetError())return false;
 		}
 		if(packet.materials.snapshot) {
-			const auto after_color=texture_bytes(fbTex,RGBA,0x1401),after_depth=texture_bytes(depthTex,DEPTH_COMPONENT,0x1405);
+			auto after_color=texture_bytes(fbTex,RGBA,0x1401),after_depth=texture_bytes(depthTex,DEPTH_COMPONENT,0x1405);
 			if(gl.GetError() || before_depth!=after_depth)return false;
 			for(int row=0;row<fh;++row) {
 				const bool active=row>=int(packet.page)*S && row<(int(packet.page)+DISPH)*S;
 				const size_t x=active?size_t(MARGIN)*S:0,n=active?size_t(CW)*S:size_t(fw);
 				if(memcmp(before_color.data()+(size_t(row)*fw+x)*4,after_color.data()+(size_t(row)*fw+x)*4,n*4))return false;
 			}
-			auto save=[](const std::string &name,const std::vector<uint8_t> &data) {
-				FILE *f=fopen(name.c_str(),"wb");if(!f)return false;
-				const bool ok=fwrite(data.data(),1,data.size(),f)==data.size();const int closed=fclose(f);return ok && !closed;
+			auto save=[&](const std::string &name,std::vector<uint8_t> &&data) {
+				cruisn::CaptureWriter::Request request;request.path=name;request.bitmap=std::move(data);
+				return margin_writer.submit(std::move(request),capture_paced?10000:0,&s_capture_pacing);
 			};
 			const auto prefix="exotica-active-"+std::to_string(packet.materials.frame);
-			if(!save(prefix+"-gpu-before-color.bin",before_color) || !save(prefix+"-gpu-after-color.bin",after_color) ||
-				!save(prefix+"-gpu-before-depth.bin",before_depth) || !save(prefix+"-gpu-after-depth.bin",after_depth))return false;
+			if(!save(prefix+"-gpu-before-color.bin",std::move(before_color)) || !save(prefix+"-gpu-after-color.bin",std::move(after_color)) ||
+				!save(prefix+"-gpu-before-depth.bin",std::move(before_depth)) || !save(prefix+"-gpu-after-depth.bin",std::move(after_depth)))return false;
 		}
 		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0DE1,waveTex);
 		gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0DE1,palTex);gl.ActiveTexture(TEXTURE0);
@@ -1731,6 +1734,12 @@ void thread_main()
 	}
 
 	if(margin_log) {
+		const auto stats=margin_writer.finish();
+		if(stats.failed || stats.rejected || stats.submitted!=stats.written)private_failed=true;
+		fprintf(stderr,"MIDZ_HOST_ACTIVE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu waits=%llu wait_us=%llu\n",
+			(unsigned long long)stats.submitted,(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected,
+			(unsigned long long)stats.peak_bytes,(unsigned long long)stats.write_total_us,(unsigned long long)stats.write_max_us,(unsigned long long)stats.drain_us,
+			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
 		if(fclose(margin_log))private_failed=true;
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_GPU_RESULT complete=%u scenes=%llu quads=%llu\n",
 			unsigned(!private_failed),(unsigned long long)margin_packets,(unsigned long long)margin_quads);
