@@ -40,7 +40,7 @@ namespace mzgl {
 void start(); void stop();
 struct DepthMirrorSettings {
 	bool enabled=false,wide=false;
-	uint32_t first=0,last=0;
+	uint32_t first=0,last=0,stream_frame=0;
 	std::set<uint32_t> snapshots;
 };
 DepthMirrorSettings depth_mirror_settings()
@@ -69,6 +69,12 @@ DepthMirrorSettings depth_mirror_settings()
 				fatalerror("Invalid Zeus depth mirror snapshot\n");
 			text=*end?end+1:end;if(*end && !*text)fatalerror("Empty Zeus depth mirror snapshot\n");
 		}
+	}
+	if(std::getenv("MIDZ_DEPTH_STREAM_FRAME")) {
+		settings.stream_frame=number("MIDZ_DEPTH_STREAM_FRAME");
+		if(settings.stream_frame<=settings.first || settings.stream_frame>settings.last ||
+			!settings.snapshots.count(settings.stream_frame-1) || !settings.snapshots.count(settings.stream_frame))
+			fatalerror("Zeus command capture requires both boundary snapshots\n");
 	}
 	settings.enabled=true;return settings;
 }
@@ -1370,6 +1376,41 @@ void thread_main()
 	std::vector<uint8_t> rec;
     uint32_t completed_frame = 0;
     double completed_seconds = 0;
+	// One completed-frame consumer journal. Own all input bytes, including the
+	// initial GPU material image and every subsequent upload, before async I/O.
+	cruisn::CaptureWriter stream_writer;
+	std::vector<uint8_t> stream_records;
+	uint64_t stream_count=0,stream_bytes=0;
+	bool stream_active=false,stream_complete=false,stream_failed=false;
+	auto stream_save=[&](const char *suffix,std::vector<uint8_t> data) {
+		cruisn::CaptureWriter::Request request;
+		request.path="zeus-stream-"+std::to_string(depth_mirror.stream_frame)+suffix;
+		request.bitmap=std::move(data);
+		return stream_writer.submit(std::move(request),capture_paced?10000:0,&s_capture_pacing);
+	};
+	auto stream_boundary=[&](uint32_t frame) {
+		if(!depth_mirror.stream_frame)return true;
+		if(frame+1==depth_mirror.stream_frame) {
+			if(stream_active || stream_complete || !sky_quads.empty() || !fdata.empty())return false;
+			uint32_t header[10]={0x3143475a,1,depth_mirror.stream_frame,uint32_t(fw),uint32_t(fh),
+				uint32_t(MARGIN),uint32_t(S),pal_slot,
+				unsigned(sky_enabled)|(unsigned(sky_open)<<1)|(unsigned(margin_page_clear)<<2)|(unsigned(palette_guard)<<3),0};
+			stream_records.assign((const uint8_t *)header,(const uint8_t *)header+sizeof(header));
+			std::vector<uint8_t> wave(wave_mirror,wave_mirror+(16u<<20)),palette(256*256*4);
+			gl.ActiveTexture(TEXTURE0+6);gl.BindTexture(0x0de1,palTex);
+			gl.PixelStorei(0x0d05,1);gl.GetTexImage(0x0de1,0,RED_INTEGER,0x1405,palette.data());
+			if(gl.GetError() || !stream_save("-wave.bin",std::move(wave)) || !stream_save("-palette.bin",std::move(palette)))return false;
+			gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0de1,waveTex);
+			gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0de1,palTex);gl.ActiveTexture(TEXTURE0);
+			stream_active=true;
+		} else if(frame==depth_mirror.stream_frame) {
+			if(!stream_active || !stream_count)return false;
+			stream_bytes=stream_records.size();stream_active=false;
+			if(!stream_save("-records.bin",std::move(stream_records)))return false;
+			stream_complete=true;
+		}
+		return true;
+	};
 	uint32_t mirror_previous=0;
 	auto mirror_frame=[&](uint32_t frame) {
 		if(!mirror_fbo || frame<depth_mirror.first || frame>depth_mirror.last)return true;
@@ -1538,6 +1579,14 @@ void thread_main()
 			rec.resize(hdr[1]);
 			if (hdr[1]) ring_get(rec.data(), hdr[1]);
 			r = (r + 7) & ~7ull;
+			if(stream_active) {
+				if(hdr[0]<1 || hdr[0]>6 || hdr[1]>(16u<<20)+8 || stream_count>=131072 ||
+					stream_records.size()+8+rec.size()>64u*1024u*1024u) {
+					stream_failed=true;s_stopz.store(true);zlogf("Zeus command capture budget/type failure");break;
+				}
+				stream_records.insert(stream_records.end(),(const uint8_t *)hdr,(const uint8_t *)hdr+8);
+				stream_records.insert(stream_records.end(),rec.begin(),rec.end());++stream_count;
+			}
 			// Finish before changing palettes/uploads/pages or presenting. Stored
 			// tiles retain the current material only within this uninterrupted span.
 			if (sky_enabled && hdr[0]!=1 && hdr[0]!=7 && !sky_quads.empty()) finish_sky();
@@ -1687,6 +1736,9 @@ void thread_main()
 
 		if(frame_ready && !mirror_frame(completed_frame)) {
 			mirror_failed=true;s_stopz.store(true);zlogf("depth mirror comparison failed at frame%u",completed_frame);break;
+		}
+		if(frame_ready && !stream_boundary(completed_frame)) {
+			stream_failed=true;s_stopz.store(true);zlogf("Zeus command capture boundary failure");break;
 		}
 		if (!frame_ready && !menu_open && !ui_changed) { Sleep(1); continue; }
         if (frame_ready && !stall_applied && stall_frame > 0 && completed_frame >= uint32_t(stall_frame))
@@ -1896,6 +1948,13 @@ void thread_main()
 			(unsigned long long)stats.submitted,(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected,
 			(unsigned long long)stats.peak_bytes,(unsigned long long)stats.write_total_us,(unsigned long long)stats.write_max_us,(unsigned long long)stats.drain_us,
 			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
+	}
+	if(depth_mirror.stream_frame) {
+		const auto stats=stream_writer.finish();
+		const bool complete=stream_complete && !stream_failed && !stream_active && stats.submitted==3 && stats.written==3 && !stats.failed && !stats.rejected;
+		fprintf(stderr,"MIDZ_DEPTH_STREAM_RESULT complete=%u frame=%u commands=%llu bytes=%llu written=%llu failed=%llu rejected=%llu\n",
+			unsigned(complete),depth_mirror.stream_frame,(unsigned long long)stream_count,(unsigned long long)stream_bytes,
+			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
 	}
 	if(mirror_fbo)gl.DeleteFramebuffers(1,&mirror_fbo);
 	if(mirror_color)gl.DeleteTextures(1,&mirror_color);
