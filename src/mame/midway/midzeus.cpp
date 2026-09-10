@@ -211,6 +211,8 @@ private:
 	bool m_scene_busy=false,m_scene_rom_saved=false;
 	std::unique_ptr<cruisn::zeus_host::WaveImage> m_scene_material_image;
 	FILE *m_scene_material_log=nullptr;
+	uint32_t m_scene_material_pages=0; //0 full scan,1 written pages,2 full-scan comparison
+	uint64_t m_scene_material_verified=0;
 
 	void visibility_start();
 	void visibility_guard();
@@ -329,6 +331,9 @@ void crusnexo_state::scene_observer_start()
 	m_scene_last=number("MIDZ_HOST_LAST",1800,16000,0);
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
+	m_scene_material_pages=number("MIDZ_HOST_MATERIAL_PAGES",0,2,0);
+	if(m_scene_material_pages && !number("MIDZ_HOST_MATERIALS",0,1,0))
+		fatalerror("Exotica written pages require private materials\n");
 	if(number("MIDZ_HOST_MATERIALS",0,1,0)) {
 		m_scene_material_image=std::make_unique<cruisn::zeus_host::WaveImage>();
 		m_scene_material_log=fopen("exotica-host-materials.csv","w");
@@ -336,6 +341,11 @@ void crusnexo_state::scene_observer_start()
 		setvbuf(m_scene_material_log,nullptr,_IOFBF,65536);
 		fprintf(m_scene_material_log,"scene,frame,generation,pages,palettes,bytes,hash,stage_us,encode_us,queue_us,commit_us\n");
 		fprintf(stderr,"MIDZ_HOST_MATERIALS=1\n");
+		if(m_scene_material_pages) {
+			if(!m_zeus->midz_live)fatalerror("Exotica written pages require live GL\n");
+			m_zeus->midz_host_wave_enable();
+			fprintf(stderr,"MIDZ_HOST_MATERIAL_PAGES=%u\n",m_scene_material_pages);
+		}
 	}
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
@@ -514,9 +524,21 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		packet.frame=p.frame;packet.scene=pending.scene;packet.snapshot=m_scene_snapshots.count(p.frame)!=0;
 		const auto *wave=reinterpret_cast<const uint8_t *>(z.m_waveram.get());
 		cruisn::zeus_host::PaletteSet palettes;
-		if(!cruisn::zeus_host::palettes(scene.instances,wave,0x1000000,palettes) ||
-			!m_scene_material_image->stage(wave,0x1000000,packet.wave))
-			fatalerror("Exotica private material ownership rejected\n");
+		if(!cruisn::zeus_host::palettes(scene.instances,wave,0x1000000,palettes))
+			fatalerror("Exotica private palette ownership rejected\n");
+		const bool staged=m_scene_material_pages ?
+			m_scene_material_image->stage_selected_pages(wave,0x1000000,m_zeus->midz_host_wave_pages(),packet.wave) :
+			m_scene_material_image->stage(wave,0x1000000,packet.wave);
+		if(!staged)fatalerror("Exotica private image ownership rejected\n");
+		if(m_scene_material_pages==2) {
+			cruisn::zeus_host::WaveImage::Packet full;
+			std::vector<uint8_t> expected,actual;
+			if(!m_scene_material_image->stage(wave,0x1000000,full) ||
+				!cruisn::zeus_host::WaveImage::encode(full,expected) ||
+				!cruisn::zeus_host::WaveImage::encode(packet.wave,actual) || expected!=actual)
+				fatalerror("Exotica written-page/full-scan mismatch at frame%u\n",p.frame);
+			++m_scene_material_verified;
+		}
 		packet.rows=std::move(palettes.rows);
 		const auto material_staged=std::chrono::steady_clock::now();
 		auto &wire=material_wire;
@@ -525,6 +547,8 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		if(!m_zeus->midz_host_materials(wire.data(),wire.size()))fatalerror("Exotica private material queue rejected\n");
 		const auto material_queued=std::chrono::steady_clock::now();
 		if(!m_scene_material_image->apply(packet.wave))fatalerror("Exotica private material producer commit rejected\n");
+		// No emulated writes can occur between staging and this emulation-thread commit.
+		if(m_scene_material_pages)m_zeus->midz_host_wave_commit();
 		const auto material_committed=std::chrono::steady_clock::now();
 		auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
 		if(fprintf(m_scene_material_log,"%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f\n",
@@ -573,6 +597,8 @@ void crusnexo_state::scene_observer_exit()
 	if(m_scene_material_log) {
 		if(fclose(m_scene_material_log))fatalerror("Exotica material log close\n");
 		m_scene_material_log=nullptr;
+		if(m_scene_material_pages)fprintf(stderr,"MIDZ_HOST_MATERIAL_PAGES_RESULT mode=%u verified=%llu\n",
+			m_scene_material_pages,(unsigned long long)m_scene_material_verified);
 		fprintf(stderr,"MIDZ_HOST_MATERIALS_RESULT queued=%llu hash=%016llx\n",
 			(unsigned long long)m_scene_material_image->generation(),(unsigned long long)m_scene_material_image->image_hash());
 	}

@@ -15,6 +15,7 @@
 
 #include "video/rgbutil.h"
 #include <functional>
+#include "../../mame/midway/cruisn/written_pages.h"
 
 
 /*************************************
@@ -149,6 +150,11 @@ public:
 	{ m_midz_model_observer=std::move(observer); }
 	// Owned, bounded private texture uploads only; no original GPU resource writes.
 	bool midz_host_materials(const uint8_t *data, size_t size);
+	// Emulation-thread-only notifications, independent of original upload spans.
+	void midz_host_wave_enable() { m_host_wave_pages=std::make_unique<cruisn::WrittenPages<0x1000000,4096>>(); }
+	std::vector<uint32_t> midz_host_wave_pages() const { return m_host_wave_pages ? m_host_wave_pages->pages() : std::vector<uint32_t>(); }
+	void midz_host_wave_commit() { if(m_host_wave_pages)m_host_wave_pages->clear(); }
+	void midz_host_wave_postload() { if(m_host_wave_pages)m_host_wave_pages->mark_all(); }
 
 	uint32_t m_zeusbase[0x80];
 	uint32_t m_renderRegs[0x50];
@@ -198,6 +204,7 @@ protected:
 
 private:
 	std::function<void(uint32_t,uint32_t,uint32_t)> m_midz_model_observer;
+	std::unique_ptr<cruisn::WrittenPages<0x1000000,4096>> m_host_wave_pages;
 	TIMER_CALLBACK_MEMBER(int_timer_callback);
 	void zeus2_register32_w(offs_t offset, uint32_t data, int logit);
 	void zeus2_register_update(offs_t offset, uint32_t oldval, int logit);

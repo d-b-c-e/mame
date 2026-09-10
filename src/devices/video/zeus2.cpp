@@ -228,6 +228,8 @@ void zeus2_device::device_start()
 	save_item(NAME(m_fill_color));
 	save_item(NAME(m_fill_depth));
 	save_item(NAME(m_yScale));
+	// State restoration bypasses ordinary writes: invalidate every private page.
+	machine().save().register_postload(save_prepost_delegate(FUNC(zeus2_device::midz_host_wave_postload),this));
 }
 
 void zeus2_device::device_reset()
@@ -1913,6 +1915,7 @@ void zeus2_device::midz_wave_dirty(uint32_t addr41)
 	uint32_t const block = (addr41 % WAVERAM0_WIDTH)
 		+ ((addr41 >> 16) % WAVERAM0_HEIGHT) * WAVERAM0_WIDTH;
 	uint32_t const off = block * 8;
+	if(m_host_wave_pages && !m_host_wave_pages->mark(off,8))fatalerror("Exotica private WaveRAM write outside image\n");
 	if (off < s_wave_lo) s_wave_lo = off;
 	if (off + 8 > s_wave_hi) s_wave_hi = off + 8;
 }
