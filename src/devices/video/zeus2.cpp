@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <map>
 #include <cstdlib>
+#include <vector>
 
 // MIDZ_GL in-process renderer (Windows-only, env-gated; see mzgl below)
 #ifdef _WIN32
@@ -213,6 +214,20 @@ static uint32_t s_cap_fq = 0;     // quads submitted since last screen_update
 static uint32_t s_cap_recq = 0;   // quads recorded so far
 static uint32_t s_cap_frames_rec = 0;
 static FILE *s_cap_rec = nullptr;
+// Optional bounded model-source journal. It copies pre-execution operands and
+// associates them with the existing projected-quad stream, without touching it.
+// Raw WaveRAM/program/material operands are private diagnostic artifacts.
+static FILE *s_cap_models = nullptr;
+static uint32_t s_cap_model_count = 0, s_cap_model_bytes = 0;
+struct midz_model_rec
+{
+	uint32_t version, frame, id, baseaddr, count, quad_size, system, first_quad;
+	uint32_t last_quad, ucode, palette, texture, yscale, zoffset, raw_words, reserved;
+	double time;
+	float matrix[9], translation[4], light[3];
+	uint32_t regs[0x80], render[0x50];
+};
+static_assert(sizeof(midz_model_rec) == 968, "Zeus model journal layout");
 static char s_cap_dir[400];
 static uint32_t s_cap_pal[256];
 static bool s_cap_pal_valid = false;
@@ -1412,6 +1427,16 @@ void zeus2_device::midz_screen_hook(bool completed)
 		char path[512];
 		snprintf(path, sizeof(path), "%s/records.bin", s_cap_dir);
 		s_cap_rec = fopen(path, "wb");
+		if (const char *models = std::getenv("MIDZ_CAPTURE_MODELS"); models && !strcmp(models, "1"))
+		{
+			const char *force = std::getenv("MIDV_FFB");
+			if (m_system != CRUSNEXO || !force || strcmp(force, "0"))
+				fatalerror("Zeus model capture requires Exotica and MIDV_FFB=0");
+			snprintf(path, sizeof(path), "%s/models.bin", s_cap_dir);
+			s_cap_models = fopen(path, "wb");
+			if (!s_cap_models) fatalerror("Cannot create Zeus model journal");
+			s_cap_model_count = s_cap_model_bytes = 0;
+		}
 		s_cap_pal_valid = false;
 		midz_cap = true;
 		s_cap_state = 1;
@@ -1433,6 +1458,18 @@ void zeus2_device::midz_screen_hook(bool completed)
 			s_cap_rec = nullptr;
 		}
 		char path[512];
+		if (s_cap_models)
+		{
+			if (fclose(s_cap_models)) fatalerror("Cannot close Zeus model journal");
+			s_cap_models = nullptr;
+			snprintf(path, sizeof(path), "%s/models.json", s_cap_dir);
+			FILE *f = fopen(path, "w");
+			if (!f) fatalerror("Cannot create Zeus model completion receipt");
+			const int written = fprintf(f, "{\"schema\":1,\"complete\":true,\"models\":%u,\"bytes\":%u,\"quads\":%u}\n",
+				s_cap_model_count, s_cap_model_bytes, s_cap_recq);
+			const int closed = fclose(f);
+			if (written <= 0 || closed) fatalerror("Cannot complete Zeus model receipt");
+		}
 		snprintf(path, sizeof(path), "%s/regs.txt", s_cap_dir);
 		if (FILE *f = fopen(path, "w"))
 		{
@@ -2841,6 +2878,37 @@ bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 
 void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit)
 {
+	midz_model_rec captured;
+	std::vector<uint32_t> captured_words;
+	const bool capture_model = s_cap_models && midz_cap;
+	if (capture_model)
+	{
+		if (++s_cap_model_count > 4096 || count > 0xc800)
+			fatalerror("Zeus model journal exceeds bounded record count");
+		captured = {};
+		captured.version = 1; captured.frame = uint32_t(screen().frame_number());
+		captured.id = s_cap_model_count; captured.baseaddr = baseaddr; captured.count = count;
+		captured.quad_size = zeus_quad_size; captured.system = m_system;
+		captured.first_quad = s_cap_recq; captured.ucode = m_curUCodeSrc;
+		captured.palette = m_curPalTableSrc; captured.texture = zeus_texbase;
+		captured.yscale = m_yScale; captured.zoffset = m_useZOffset;
+		captured.raw_words = baseaddr ? 2 * (uint32_t(count) + 1) : 0;
+		captured.time = machine().time().as_double();
+		memcpy(captured.matrix, zeus_matrix, sizeof(captured.matrix));
+		memcpy(captured.translation, zeus_trans, sizeof(captured.translation));
+		memcpy(captured.light, zeus_light, sizeof(captured.light));
+		for (unsigned i=0;i<0x80;++i) captured.regs[i] = m_zeusbase[i];
+		for (unsigned i=0;i<0x50;++i) captured.render[i] = m_renderRegs[i];
+		const uint32_t block = (baseaddr % WAVERAM0_WIDTH) + ((baseaddr >> 16) % WAVERAM0_HEIGHT) * WAVERAM0_WIDTH;
+		if (uint64_t(block) * 2 + captured.raw_words > uint64_t(WAVERAM0_WIDTH) * WAVERAM0_HEIGHT * 2)
+			fatalerror("Zeus model journal source outside WaveRAM");
+		const uint32_t bytes = 8 + sizeof(captured) + 4 * captured.raw_words;
+		if (uint64_t(s_cap_model_bytes) + bytes > 64 * 1024 * 1024)
+			fatalerror("Zeus model journal exceeds bounded byte count");
+		s_cap_model_bytes += bytes;
+		const uint32_t *source = static_cast<const uint32_t *>(waveram0_ptr_from_expanded_addr(baseaddr));
+		captured_words.assign(source, source + captured.raw_words);
+	}
 	uint32_t databuffer[512];
 	int databufcount = 0;
 	int model_done = false;
@@ -2972,6 +3040,15 @@ void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit
 				logerror("-- Unused data\n");
 			}
 		}
+	}
+	if (capture_model)
+	{
+		captured.last_quad = s_cap_recq;
+		const uint32_t prefix[2] = {0x31534d5a, uint32_t(sizeof(captured) + 4 * captured_words.size())};
+		if (fwrite(prefix, sizeof(prefix), 1, s_cap_models) != 1 ||
+			fwrite(&captured, sizeof(captured), 1, s_cap_models) != 1 ||
+			(!captured_words.empty() && fwrite(captured_words.data(), 4, captured_words.size(), s_cap_models) != captured_words.size()))
+			fatalerror("Cannot write Zeus model journal");
 	}
 }
 
