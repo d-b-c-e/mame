@@ -883,6 +883,14 @@ void thread_main()
 		fprintf(mirror_log,"frame,width,height,batches,vertices,clears,snapshot,color_differences,depth_differences,mirror_us,snapshot_us\n");
 	}
 
+	const bool future_present=envi("MIDZ_HOST_FUTURE_PRESENT",nullptr,0)==1;
+	if(future_present) {
+		if(!mirror_fbo || !depth_mirror.wide || envi("MIDZ_HOST_FUTURE",nullptr,0)!=2) {
+			zlogf("future presentation requires owned draw and wide target");return;
+		}
+		fprintf(stderr,"MIDZ_HOST_FUTURE_PRESENT=1\n");
+	}
+
 	uint vao, vbo_f, vbo_u, vao_empty;
 	gl.GenVertexArrays(1, &vao);
 	gl.GenVertexArrays(1, &vao_empty);
@@ -1881,7 +1889,7 @@ void thread_main()
 		gl.Uniform1f(gl.GetUniformLocation(present, "uSampX0"),
 			wide_mode ? 0.0f : float(MARGIN));
 		gl.ActiveTexture(TEXTURE0 + 3);
-		gl.BindTexture(0x0DE1, fbTex);
+		gl.BindTexture(0x0DE1, future_present?mirror_color:fbTex);
 		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
 		gl.BindVertexArray(vao_empty);
 		gl.DrawArrays(0x0004, 0, 3);

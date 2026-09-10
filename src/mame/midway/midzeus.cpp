@@ -412,6 +412,8 @@ void crusnexo_state::scene_observer_start()
 			fatalerror("Exotica future drawing requires private materials/wide mirror and no late margins/command journal\n");
 		fprintf(stderr,"MIDZ_HOST_FUTURE=%u\n",m_scene_future_mode);
 	}
+	if(number("MIDZ_HOST_FUTURE_PRESENT",0,1,0) && m_scene_future_mode!=2)
+		fatalerror("Exotica future presentation requires explicit future draw mode\n");
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
 		memregion("maindata")->bytes()!=0x800000 || memregion("bankeddata")->bytes()!=0x3000000 ||
