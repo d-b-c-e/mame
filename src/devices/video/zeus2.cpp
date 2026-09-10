@@ -9,6 +9,7 @@
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
 #include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
+#include "../../mame/midway/cruisn/zeus_margin_clear.h"
 
 #include "screen.h"
 
@@ -94,6 +95,16 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+	if (const char *mode = std::getenv("MIDZ_GL_MARGIN_PAGE_CLEAR"))
+	{
+		const char *force = std::getenv("MIDV_FFB");
+		const char *live = std::getenv("MIDZ_GL");
+		if ((mode[0] != '0' && mode[0] != '1') || mode[1] ||
+			strcmp(machine().system().name,"crusnexo") || !force || strcmp(force,"0") ||
+			!live || strcmp(live,"1"))
+			fatalerror("Zeus margin-clear diagnostic requires Exotica, mask0/1, live GL and MIDV_FFB=0");
+		fprintf(stderr,"MIDZ_GL_MARGIN_PAGE_CLEAR=%c\n",mode[0]);
+	}
 	if (const char *mode = std::getenv("MIDZ_PALETTE_GUARD"))
 	{
 		const char *force = std::getenv("MIDV_FFB");
@@ -809,6 +820,9 @@ void thread_main()
 	cruisn::zeus_palette_lifetime palette_life;
 	uint64_t palette_conflicts = 0, palette_flushes = 0, palette_frame_conflicts = 0;
 	unsigned palette_log_frames = 0;
+	bool const margin_trace = std::getenv("MIDZ_GL_MARGIN_PAGE_CLEAR") != nullptr;
+	bool const margin_page_clear = envi("MIDZ_GL_MARGIN_PAGE_CLEAR", nullptr, 0) != 0;
+	uint64_t margin_clears = 0, margin_expansions = 0;
 	uint32_t zb38 = 0x1900000;
 	uint64_t presents = 0, n_quads = 0;
 	int snap_n = 0;
@@ -1077,8 +1091,10 @@ void thread_main()
 				// present; the game really does render past 4:3).
 				if (MARGIN > 0 && p[1] > uint32_t(CW * 4))
 				{
-					uint32_t const row0 = (p[0] & (CW * CH - 1)) / CW;
-					uint32_t const nrows = std::min(p[1] / CW, uint32_t(CH) - row0);
+					auto const span = cruisn::zeus_margin_clear(p[0], p[1], margin_page_clear);
+					uint32_t const row0 = span.row, nrows = span.count;
+					++margin_clears;
+					if (span.expanded) ++margin_expansions;
 					flush();
 					gl.BindFramebuffer(FRAMEBUFFER, fbo);
 					gl.Viewport(0, 0, fw, fh);
@@ -1358,6 +1374,9 @@ void thread_main()
 	if (palette_trace)
 		fprintf(stderr,"MIDZ_PALETTE_RESULT guard=%d conflicts=%llu flushes=%llu\n",
 			int(palette_guard),(unsigned long long)palette_conflicts,(unsigned long long)palette_flushes);
+	if (margin_trace)
+		fprintf(stderr,"MIDZ_MARGIN_RESULT page=%d clears=%llu expanded=%llu\n",
+			int(margin_page_clear),(unsigned long long)margin_clears,(unsigned long long)margin_expansions);
 	s_zpause.store(0);
 	zlogf("ring drops: quads %u, state(spans/pal/tick) %u", s_drops_quad.load(), s_drops_state.load());
 	zlogf("exit after %llu presents, %llu quads",
