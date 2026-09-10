@@ -31,6 +31,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/hud_drivetrain.h"
 #include "cruisn/exotica_visibility.h"
 #include "cruisn/exotica_scene_capture.h"
+#include "cruisn/exotica_source_cache.h"
 #include "cruisn/zeus_host_materials.h"
 
 #include <algorithm>
@@ -213,6 +214,9 @@ private:
 	FILE *m_scene_material_log=nullptr;
 	uint32_t m_scene_material_pages=0; //0 full scan,1 written pages,2 full-scan comparison
 	uint64_t m_scene_material_verified=0;
+	uint32_t m_scene_source_mode=0; //0 rebuild,1 checked cache,2 exact rebuild comparison
+	uint64_t m_scene_source_verified=0;
+	std::unique_ptr<cruisn::exotica_future::CachedSources> m_scene_source_cache;
 
 	void visibility_start();
 	void visibility_guard();
@@ -331,6 +335,11 @@ void crusnexo_state::scene_observer_start()
 	m_scene_last=number("MIDZ_HOST_LAST",1800,16000,0);
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
+	m_scene_source_mode=number("MIDZ_HOST_SOURCE_CACHE",0,2,0);
+	if(m_scene_source_mode) {
+		m_scene_source_cache=std::make_unique<cruisn::exotica_future::CachedSources>();
+		fprintf(stderr,"MIDZ_HOST_SOURCE_CACHE=%u\n",m_scene_source_mode);
+	}
 	m_scene_material_pages=number("MIDZ_HOST_MATERIAL_PAGES",0,2,0);
 	if(m_scene_material_pages && !number("MIDZ_HOST_MATERIALS",0,1,0))
 		fatalerror("Exotica written pages require private materials\n");
@@ -504,7 +513,23 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	std::copy_n(z.zeus_trans,4,c.translation.begin());std::copy_n(z.zeus_light,3,c.light.begin());
 	std::copy_n(z.m_zeusbase,128,c.regs.begin());std::copy_n(z.m_renderRegs,80,c.render.begin());
 	cruisn::exotica_future::Result sources;
-	if(!cruisn::exotica_future::build(read,sources,m_scene_loading!=0))fatalerror("Exotica host live sources rejected\n");
+	if(m_scene_source_cache) {
+		// Cache lifetime is this machine instance. ROM regions are immutable in
+		// this diagnostic path; each bank is a distinct owner. RAM bindings/code
+		// remain checked on every call. Direct external ROM edits are unsupported.
+		if(m_mainbank->base()!=memregion("bankeddata")->base()+size_t(pending.bank)*0x1000000)
+			fatalerror("Exotica cached source ROM mapping changed\n");
+		if(!m_scene_source_cache->build(read,uint64_t(pending.bank)+1,sources,m_scene_loading!=0))
+			fatalerror("Exotica cached live sources rejected\n");
+		if(m_scene_source_mode==2) {
+			cruisn::exotica_future::Result full;
+			if(!cruisn::exotica_future::build(read,full,m_scene_loading!=0) ||
+				!cruisn::exotica_future::equal_sources(full,sources))
+				fatalerror("Exotica cached/full source mismatch at frame%u\n",p.frame);
+			++m_scene_source_verified;
+		}
+	} else if(!cruisn::exotica_future::build(read,sources,m_scene_loading!=0))
+		fatalerror("Exotica host live sources rejected\n");
 	const auto ready=std::chrono::steady_clock::now();
 	auto model_read=[&](uint32_t address,uint32_t size,std::vector<uint32_t> &words) {
 		const size_t offset=2*(size_t(address%1024)+size_t((address>>16)%2048)*1024),n=2*(size_t(size)+1);
@@ -594,6 +619,9 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_scene_source_cache)fprintf(stderr,"MIDZ_HOST_SOURCE_CACHE_RESULT mode=%u verified=%llu hits=%llu misses=%llu\n",
+		m_scene_source_mode,(unsigned long long)m_scene_source_verified,
+		(unsigned long long)m_scene_source_cache->hits,(unsigned long long)m_scene_source_cache->misses);
 	if(m_scene_material_log) {
 		if(fclose(m_scene_material_log))fatalerror("Exotica material log close\n");
 		m_scene_material_log=nullptr;
