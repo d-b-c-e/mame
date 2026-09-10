@@ -3114,6 +3114,7 @@ bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 
 void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit)
 {
+	if (m_midz_model_observer) m_midz_model_observer(baseaddr,count,uint32_t(m_yScale));
 	midz_model_rec captured;
 	std::vector<uint32_t> captured_words;
 	const bool capture_model = s_cap_models && midz_cap;

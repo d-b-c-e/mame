@@ -14,6 +14,7 @@
 #include "video/poly.h"
 
 #include "video/rgbutil.h"
+#include <functional>
 
 
 /*************************************
@@ -142,6 +143,10 @@ public:
 	void midz_cap_clear(uint32_t addr, uint32_t numPixels, uint32_t color, int32_t depth);
 	void midz_capture_framewrite();
 	void midz_wave_dirty(uint32_t addr41);
+	// Optional read-only driver observation before an original model executes.
+	// No observer is installed in ordinary launches.
+	void set_midz_model_observer(std::function<void(uint32_t,uint32_t,uint32_t)> observer)
+	{ m_midz_model_observer=std::move(observer); }
 
 	uint32_t m_zeusbase[0x80];
 	uint32_t m_renderRegs[0x50];
@@ -190,6 +195,7 @@ protected:
 	virtual void device_stop() override ATTR_COLD;
 
 private:
+	std::function<void(uint32_t,uint32_t,uint32_t)> m_midz_model_observer;
 	TIMER_CALLBACK_MEMBER(int_timer_callback);
 	void zeus2_register32_w(offs_t offset, uint32_t data, int logit);
 	void zeus2_register_update(offs_t offset, uint32_t oldval, int logit);
