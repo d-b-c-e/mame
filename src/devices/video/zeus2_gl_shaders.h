@@ -270,3 +270,4 @@ static const char *MZGL_MENU_FS =
 	"    color = vec4(uColor.rgb, uColor.a * a);\n"
 	"}\n"
 	"\n";
+
