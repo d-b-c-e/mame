@@ -36,6 +36,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/zeus_host_materials.h"
 #include "cruisn/exotica_active_capture.h"
 #include "cruisn/zeus_margin_packet.h"
+#include "cruisn/zeus_resource_lease.h"
 
 #include <algorithm>
 #include <chrono>
@@ -240,6 +241,7 @@ private:
 	cruisn::exotica_active::Capture m_active_capture;
 	cruisn::exotica_active::Selections m_active_sealed;
 	std::vector<uint32_t> m_active_ram;
+	std::vector<uint8_t> m_active_wave;
 	std::array<uint32_t,512> m_active_internal{};
 	uint64_t m_active_sealed_scene=0;
 	bool m_active_sealed_loading=false;
@@ -428,8 +430,9 @@ void crusnexo_state::scene_observer_start()
 		m_active_log=fopen("exotica-active-scenes.csv","w");
 		if(!m_active_log)fatalerror("Cannot create Exotica active-scene log\n");
 		setvbuf(m_active_log,nullptr,_IOFBF,65536);
-		fprintf(m_active_log,"scene,scene_frame,frame,ready_frame,objects,candidates,already_submitted,instances,quads,excluded_raster,hash,guest_cycles,assembly_us,materials_us,sealed_frame,camera_advanced,changed_objects,binding_checks,seal_us\n");
+		fprintf(m_active_log,"scene,scene_frame,frame,ready_frame,objects,candidates,already_submitted,instances,quads,excluded_raster,hash,guest_cycles,assembly_us,materials_us,sealed_frame,camera_advanced,changed_objects,binding_checks,seal_us,bindings_advanced,model_checks,model_bytes,palette_checks,texture_pages,lease_us\n");
 		m_active_ram.resize(m_ram_base.bytes()/4);
+		m_active_wave.resize(cruisn::zeus_lease::wave_bytes);
 		m_active_submission_tap=space.install_write_tap(0x46e,0x46e,"exotica_active_original_submission",
 			[this](offs_t offset,uint32_t &data,uint32_t mask) {
 				if(machine().side_effects_disabled() || !m_scene_open || !m_active_capture.lists() ||
@@ -441,6 +444,7 @@ void crusnexo_state::scene_observer_start()
 			});
 		fprintf(stderr,"MIDZ_HOST_ACTIVE=%u\n",m_active_mode);
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_SEALED=1\n");
+		fprintf(stderr,"MIDZ_HOST_ACTIVE_RESOURCE_LEASE=1\n");
 	}
 	// Native refreshes can split one game's scene. Latch its actual scene/list
 	// boundary, then join only the first supported original scenery submission.
@@ -765,6 +769,7 @@ void crusnexo_state::scene_active_seal()
 	if(m_active_sealed_scene || !m_active_capture.finish(read,m_active_submitted,m_active_sealed))
 		fatalerror("Exotica active scene-end list/render ownership rejected at scene%llu\n",(unsigned long long)m_scene_fence_scene);
 	std::copy_n(m_ram_base.target(),m_active_ram.size(),m_active_ram.begin());
+	std::memcpy(m_active_wave.data(),m_zeus->m_waveram.get(),m_active_wave.size());
 	for(unsigned i=0;i<m_active_internal.size();++i)m_active_internal[i]=read(0x87fe00+i);
 	m_active_sealed_scene=m_scene_fence_scene;m_active_sealed_loading=m_scene_loading!=0;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active sealing changed CPU cycles\n");
@@ -800,21 +805,30 @@ void crusnexo_state::scene_active_ready()
 	if(uint64_t(read(defaults))+1!=p.setup.defaults.size())fatalerror("Exotica active completion default-state size changed\n");
 	for(unsigned i=0;i<p.setup.defaults.size();++i)if(p.setup.defaults[i]!=read(defaults+1+i))fatalerror("Exotica active completion default state changed\n");
 	const auto &selected=m_active_sealed;
-	unsigned changed_objects=0,binding_checks=0;bool camera_advanced=false;
+	unsigned changed_objects=0,binding_checks=0,bindings_advanced=0;bool camera_advanced=false;
 	for(unsigned i=0;i<3;++i)camera_advanced=camera_advanced || p.camera[i]!=scene_read(0xfeb+i);
 	for(const auto &list:selected.lists)for(const auto &source:list.sources) {
 		// Position, animation/fade state and linkage belong to the sealed scene.
-		// A changed model or palette binding is not accepted as retained residency.
-		for(unsigned k:{17u,18u})if(source.words[k]!=scene_read(source.source+k))
-			fatalerror("Exotica active material binding changed: scene%llu slot%08x field%u\n",(unsigned long long)m_scene_fence_scene,source.source,k);
+		// Animation may change this RAM slot before the old FIFO finishes. The
+		// owned old binding is usable only if its actual resource bytes survive.
+		bool binding_changed=false;
+		for(unsigned k:{17u,18u})binding_changed=binding_changed || source.words[k]!=scene_read(source.source+k);
+		bindings_advanced+=binding_changed;
 		++binding_checks;bool changed=false;
 		for(unsigned k=0;k<31;++k)if(k!=20)changed=changed || m_active_ram[source.source+k]!=scene_read(source.source+k);
 		changed_objects+=changed;
 	}
 	const auto &z=*m_zeus;const uint32_t page=p.context.render[4];
+	const auto *wave=reinterpret_cast<const uint8_t *>(z.m_waveram.get());
+	size_t model_checks=0,model_bytes=0;double lease_us=0;
 	auto model_read=[&](uint32_t address,uint32_t size,std::vector<uint32_t> &words) {
 		const size_t offset=2*(size_t(address%1024)+size_t((address>>16)%2048)*1024),n=2*(size_t(size)+1);
 		if(offset>4*1024*1024 || n>4*1024*1024-offset)return false;
+		const auto check_started=std::chrono::steady_clock::now();
+		if(!cruisn::zeus_lease::model_equal(m_active_wave.data(),wave,m_active_wave.size(),address,size))
+			fatalerror("Exotica active model bytes changed: scene%llu base%08x count%u\n",(unsigned long long)m_scene_fence_scene,address,size);
+		lease_us+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-check_started).count();
+		++model_checks;model_bytes+=n*4;
 		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);return true;
 	};
 	cruisn::exotica_scene::Result scene;size_t excluded=0;
@@ -837,8 +851,16 @@ void crusnexo_state::scene_active_ready()
 			scene.instances.push_back(instance);
 		}
 	}
+	const auto check_started=std::chrono::steady_clock::now();
+	cruisn::zeus_lease::Coverage coverage;
+	for(const auto &quad:scene.quads)if(!coverage.add(quad))fatalerror("Exotica active texture footprint rejected\n");
+	if(!coverage.equal(m_active_wave.data(),wave,m_active_wave.size()))
+		fatalerror("Exotica active texture bytes changed: scene%llu\n",(unsigned long long)m_scene_fence_scene);
+	for(const auto &instance:scene.instances)
+		if(!cruisn::zeus_lease::palette_equal(m_active_wave.data(),wave,m_active_wave.size(),instance.palette))
+			fatalerror("Exotica active palette bytes changed: scene%llu base%08x\n",(unsigned long long)m_scene_fence_scene,instance.palette);
+	lease_us+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-check_started).count();
 	const auto assembled=std::chrono::steady_clock::now();
-	const auto *wave=reinterpret_cast<const uint8_t *>(z.m_waveram.get());
 	cruisn::zeus_host::PaletteSet palettes;
 	if(!cruisn::zeus_host::palettes(scene.instances,wave,0x1000000,palettes))fatalerror("Exotica active palette ownership rejected\n");
 	cruisn::zeus_margin::Packet packet;auto &material=packet.materials;
@@ -887,6 +909,10 @@ void crusnexo_state::scene_active_ready()
 		dump(prefix+"-context.bin",parameters.data(),parameters.size()*4);dump(prefix+"-ram.bin",m_active_ram.data(),m_active_ram.size()*4);
 		dump(prefix+"-ready-ram.bin",m_ram_base.target(),m_ram_base.bytes());
 		dump(prefix+"-end-internal.bin",m_active_internal.data(),m_active_internal.size()*4);
+		dump(prefix+"-end-wave.bin",m_active_wave.data(),m_active_wave.size());
+		std::array<uint8_t,4096> covered{};
+		for(size_t i=0;i<covered.size();++i)covered[i]=coverage.pages()[i]?1:0;
+		dump(prefix+"-texture-pages.bin",covered.data(),covered.size());
 		dump(prefix+"-wave.bin",wave,0x1000000);dump(prefix+"-packet.bin",wire.data(),wire.size());
 		dump(prefix+"-materials.bin",material_wire.data(),material_wire.size());
 		dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));
@@ -895,10 +921,11 @@ void crusnexo_state::scene_active_ready()
 	}
 	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active completion changed CPU cycles\n");
-	if(fprintf(m_active_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0,%.3f,%.3f,%u,%u,%u,%u,%.3f\n",
+	if(fprintf(m_active_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0,%.3f,%.3f,%u,%u,%u,%u,%.3f,%u,%u,%llu,%u,%u,%.3f\n",
 		(unsigned long long)m_scene_fence_scene,m_scene_fence_scene_frame,p.frame,unsigned(m_screen->frame_number()),
 		unsigned(selected.objects),unsigned(selected.candidates),unsigned(selected.already_submitted),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(excluded),
-		(unsigned long long)hash,us(started,assembled),us(assembled,committed),m_scene_fence_end_frame,unsigned(camera_advanced),changed_objects,binding_checks,m_active_seal_us)<0)fatalerror("Exotica active scene log write\n");
+		(unsigned long long)hash,us(started,assembled),us(assembled,committed),m_scene_fence_end_frame,unsigned(camera_advanced),changed_objects,binding_checks,m_active_seal_us,
+		bindings_advanced,unsigned(model_checks),(unsigned long long)model_bytes,unsigned(scene.instances.size()),unsigned(coverage.count()),lease_us)<0)fatalerror("Exotica active scene log write\n");
 	++m_active_scenes;m_active_quads+=scene.quads.size();
 }
 
