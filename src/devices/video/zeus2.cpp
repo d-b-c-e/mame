@@ -96,6 +96,24 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+	const char *stall_frame_text = std::getenv("MIDZ_GL_STALL_FRAME");
+	const char *stall_ms_text = std::getenv("MIDZ_GL_STALL_MS");
+	if (stall_frame_text || stall_ms_text)
+	{
+		auto number = [](const char *text, unsigned limit) -> unsigned
+		{
+			if (!text || *text < '0' || *text > '9') return 0;
+			char *end = nullptr;
+			const unsigned long value = strtoul(text, &end, 10);
+			return !*end && value >= 1 && value <= limit ? unsigned(value) : 0;
+		};
+		const unsigned frame = number(stall_frame_text, 1000000), ms = number(stall_ms_text, 5000);
+		const char *force = std::getenv("MIDV_FFB"), *live = std::getenv("MIDZ_GL");
+		if (!frame || !ms || !force || strcmp(force,"0") || !live || strcmp(live,"1") ||
+			strcmp(machine().system().name,"crusnexo"))
+			fatalerror("Zeus consumer stall requires Exotica/liveGL/FFB0, frame1..1000000 and milliseconds1..5000");
+		fprintf(stderr,"MIDZ_GL_STALL frame=%u milliseconds=%u\n",frame,ms);
+	}
 	if (const char *mode = std::getenv("MIDZ_SKY_REPEAT"))
 	{
 		const char *force=std::getenv("MIDV_FFB"), *live=std::getenv("MIDZ_GL");
@@ -459,10 +477,10 @@ static std::atomic<uint32_t> s_presented_frame{0};
 // when the emulation thread observes backpressure from the GL consumer.
 static bool s_phase_trace = false;
 static std::atomic<uint64_t> s_phase_stamp{0};
-enum { PHASE_OTHER, PHASE_READBACK, PHASE_FILE, PHASE_SWAP, PHASE_COUNT };
+enum { PHASE_OTHER, PHASE_READBACK, PHASE_FILE, PHASE_SWAP, PHASE_STALL, PHASE_COUNT };
 static const char *phase_name(unsigned phase)
 {
-	static const char *names[] = { "other", "readback", "file", "swap" };
+	static const char *names[] = { "other", "readback", "file", "swap", "stall" };
 	return phase < PHASE_COUNT ? names[phase] : "unknown";
 }
 static uint64_t begin_phase(unsigned phase)
@@ -1039,6 +1057,9 @@ void thread_main()
     };
     // Explicit diagnostic fault injection. Physical outputs stay off in replay.
     int const stop_frame = envi("MIDZ_GL_STOP_FRAME",nullptr,-1);
+    int const stall_frame = envi("MIDZ_GL_STALL_FRAME",nullptr,-1);
+    int const stall_ms = envi("MIDZ_GL_STALL_MS",nullptr,0);
+    bool stall_applied = false;
     FILE *snap_index = nullptr;
     if (snapdir) {
         char path[512]; snprintf(path,sizeof(path),"%s/captures.csv",snapdir);
@@ -1270,6 +1291,17 @@ void thread_main()
 		flush();
 
 		if (!frame_ready && !menu_open && !ui_changed) { Sleep(1); continue; }
+        if (frame_ready && !stall_applied && stall_frame > 0 && completed_frame >= uint32_t(stall_frame))
+        {
+            stall_applied = true;
+            const uint64_t began = GetTickCount64();
+            begin_phase(PHASE_STALL);
+            Sleep(stall_ms);
+            const uint64_t elapsed = GetTickCount64()-began;
+            finish_phase(PHASE_STALL, began);
+            fprintf(stderr,"MIDZ_GL_STALL_APPLIED frame=%u milliseconds=%d elapsed_ms=%llu\n",
+                completed_frame, stall_ms, (unsigned long long)elapsed);
+        }
         if (frame_ready && stop_frame >= 0 && completed_frame >= uint32_t(stop_frame)) {
             zlogf("diagnostic consumer stop at completed frame %u",completed_frame);
             break;
