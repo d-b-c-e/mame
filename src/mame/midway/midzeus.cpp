@@ -217,6 +217,8 @@ private:
 	uint32_t m_scene_source_mode=0; //0 rebuild,1 checked cache,2 exact rebuild comparison
 	uint64_t m_scene_source_verified=0;
 	std::unique_ptr<cruisn::exotica_future::CachedSources> m_scene_source_cache;
+	uint32_t m_scene_depth_mode=0;
+	uint64_t m_scene_depth_tests=0,m_scene_depth_verified=0,m_scene_depth_skipped=0;
 
 	void visibility_start();
 	void visibility_guard();
@@ -335,6 +337,8 @@ void crusnexo_state::scene_observer_start()
 	m_scene_last=number("MIDZ_HOST_LAST",1800,16000,0);
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
+	m_scene_depth_mode=number("MIDZ_HOST_EARLY_DEPTH",0,2,0);
+	if(m_scene_depth_mode)fprintf(stderr,"MIDZ_HOST_EARLY_DEPTH=%u\n",m_scene_depth_mode);
 	m_scene_source_mode=number("MIDZ_HOST_SOURCE_CACHE",0,2,0);
 	if(m_scene_source_mode) {
 		m_scene_source_cache=std::make_unique<cruisn::exotica_future::CachedSources>();
@@ -375,7 +379,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
 	setvbuf(m_scene_log,nullptr,_IOFBF,65536);
-	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds,materials_us\n");
+	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds,materials_us,source_cache,depth_mode,depth_tests,depth_verified,depth_skipped\n");
 	auto &space=m_maincpu->space(AS_PROGRAM);
 	// Native refreshes can split one game's scene. Latch its actual scene/list
 	// boundary, then join only the first supported original scenery submission.
@@ -537,8 +541,13 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);return true;
 	};
 	cruisn::exotica_scene::Result scene;
+	p.early_depth=m_scene_depth_mode;
 	if(!cruisn::exotica_scene::build(sources.sources,p,read,model_read,[](const cruisn::exotica_future::Source &s){return s.future;},scene))
 		fatalerror("Exotica host live scene rejected\n");
+	if(m_scene_depth_mode && (scene.depth_tests!=scene.selected-scene.unsupported_transform ||
+		(m_scene_depth_mode==2 && scene.depth_verified!=scene.depth_tests)))
+		fatalerror("Exotica host incomplete depth comparison\n");
+	m_scene_depth_tests+=scene.depth_tests;m_scene_depth_verified+=scene.depth_verified;m_scene_depth_skipped+=scene.depth_skipped;
 	const auto built=std::chrono::steady_clock::now();
 	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
 	const auto hashed=std::chrono::steady_clock::now();
@@ -607,11 +616,12 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica host assembly changed CPU cycles\n");
 	const auto finished=std::chrono::steady_clock::now();
 	auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
-	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f,%u,%u,%.3f\n",
+	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f,%u,%u,%.3f,%u,%u,%u,%u,%u\n",
 		p.frame,cpu_frame,pending.time,now,base,count,pending.bank,c.render[4],p.multiplier,unsigned(m_scene_loading!=0),
 		unsigned(sources.sources.size()),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(scene.viewport_polygons),
 		(unsigned long long)hash,us(started,ready),us(ready,built),us(built,hashed),us(materials_done,finished),
-		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time,unsigned(p.frustum_bounds),unsigned(scene.culled_bounds),us(hashed,materials_done))<0)
+		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time,unsigned(p.frustum_bounds),unsigned(scene.culled_bounds),us(hashed,materials_done),
+		m_scene_source_mode,m_scene_depth_mode,unsigned(scene.depth_tests),unsigned(scene.depth_verified),unsigned(scene.depth_skipped))<0)
 		fatalerror("Exotica host scene log write\n");
 	++m_scene_matched;m_scene_quads+=scene.quads.size();
 }
@@ -619,6 +629,8 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_scene_depth_mode)fprintf(stderr,"MIDZ_HOST_EARLY_DEPTH_RESULT mode=%u tested=%llu verified=%llu skipped=%llu\n",
+		m_scene_depth_mode,(unsigned long long)m_scene_depth_tests,(unsigned long long)m_scene_depth_verified,(unsigned long long)m_scene_depth_skipped);
 	if(m_scene_source_cache)fprintf(stderr,"MIDZ_HOST_SOURCE_CACHE_RESULT mode=%u verified=%llu hits=%llu misses=%llu\n",
 		m_scene_source_mode,(unsigned long long)m_scene_source_verified,
 		(unsigned long long)m_scene_source_cache->hits,(unsigned long long)m_scene_source_cache->misses);
