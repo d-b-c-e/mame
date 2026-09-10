@@ -39,7 +39,7 @@ static std::atomic<bool> s_capture_pacing{false};
 namespace mzgl {
 void start(); void stop();
 struct DepthMirrorSettings {
-	bool enabled=false;
+	bool enabled=false,wide=false;
 	uint32_t first=0,last=0;
 	std::set<uint32_t> snapshots;
 };
@@ -48,7 +48,8 @@ DepthMirrorSettings depth_mirror_settings()
 	DepthMirrorSettings settings;
 	const char *mode=std::getenv("MIDZ_DEPTH_MIRROR");
 	if(!mode)return settings;
-	if(strcmp(mode,"1"))fatalerror("Invalid Zeus depth mirror mode\n");
+	if(strcmp(mode,"1") && strcmp(mode,"2"))fatalerror("Invalid Zeus depth mirror mode\n");
+	settings.wide=!strcmp(mode,"2");
 	auto number=[](const char *name) {
 		const char *text=std::getenv(name);char *end=nullptr;
 		if(!text || *text<'0' || *text>'9')fatalerror("Missing Zeus depth mirror bound: %s\n",name);
@@ -143,7 +144,7 @@ void zeus2_device::device_start()
 		if(!force || strcmp(force,"0") || !live || strcmp(live,"1") ||
 			(active && strcmp(active,"0")) || strcmp(machine().system().name,"crusnexo"))
 			fatalerror("Zeus depth mirror requires Exotica/live GL/FFB0 and no late host drawing\n");
-		fprintf(stderr,"MIDZ_DEPTH_MIRROR=1 first=%u last=%u snapshots=%u\n",mirror.first,mirror.last,unsigned(mirror.snapshots.size()));
+		fprintf(stderr,"MIDZ_DEPTH_MIRROR=%u first=%u last=%u snapshots=%u\n",mirror.wide?2u:1u,mirror.first,mirror.last,unsigned(mirror.snapshots.size()));
 	}
 #endif
 	const char *stall_frame_text = std::getenv("MIDZ_GL_STALL_FRAME");
@@ -848,7 +849,7 @@ void thread_main()
 	bool mirror_failed=false;
 	double mirror_total_us=0;
 	if(depth_mirror.enabled) {
-		mirror_prog=zlink(gl,MZGL_VS,MZGL_DEPTH_COMPAT_FS);
+		mirror_prog=zlink(gl,MZGL_VS,depth_mirror.wide?MZGL_DEPTH_WIDE_FS:MZGL_DEPTH_COMPAT_FS);
 		if(!mirror_prog) { zlogf("depth mirror shader failed");return; }
 		for(const char *name : {"in_pos","in_rowbase","in_p","in_meta0","in_meta1","in_meta2"})
 			if(gl.GetAttribLocation(prog,name)!=gl.GetAttribLocation(mirror_prog,name)) {
@@ -1215,14 +1216,16 @@ void thread_main()
 		}
 		sky_tiles.clear(); sky_quads.clear();
 	};
+	// Source-tag only fast clears as range initialization. Direct depth writes
+	// retain actual-depth meaning; the original/compatibility shaders ignore1024.
 	// raw fills (fast clears / frame writes) go through the same pipeline
 	// as FLAG_RAW rectangles so ordering with quads is exact
 	int32_t const fullclip[4] = { 0, 0, CW - 1, CH - 1 };
 	auto add_rect = [&](int x0, int y0, int x1, int y1, uint32_t rgb24,
-			int32_t depth, bool dwrite, bool cmask)
+			int32_t depth, bool dwrite, bool cmask, bool range_clear)
 	{
 		want_batch(false, false, dwrite, cmask, 0, fullclip);
-		uint32_t const meta[10] = { 256u | (dwrite ? 16u : 0u), 0, 0, 0, 0,
+		uint32_t const meta[10] = { 256u | (dwrite ? 16u : 0u) | (range_clear ? 1024u : 0u), 0, 0, 0, 0,
 			rgb24, 0, 0, 0, 0 };
 		float const p[4] = { float(depth), 0.0f, 0.0f, 1.0f };
 		float const fx0 = float(x0), fy0 = float(y0);
@@ -1233,7 +1236,7 @@ void thread_main()
 			vert(c[0], c[1], 0.0f, p, meta);
 	};
 	auto add_span = [&](uint32_t addr, uint32_t n, uint32_t rgb24,
-			int32_t depth, bool dwrite, bool cmask)
+			int32_t depth, bool dwrite, bool cmask, bool range_clear)
 	{
 		if (cmask)
 			had_writes_iter = true;   // 2D screen signal (frame writes)
@@ -1242,7 +1245,7 @@ void thread_main()
 			uint32_t const row = addr / CW, x = addr % CW;
 			uint32_t const take = std::min(n, CW - x);
 			add_rect(int(x), int(row), int(x + take), int(row + 1),
-				rgb24, depth, dwrite, cmask);
+				rgb24, depth, dwrite, cmask, range_clear);
 			addr = (addr + take) & (CW * CH - 1);
 			n -= take;
 		}
@@ -1392,6 +1395,7 @@ void thread_main()
 				if(memcmp(original_color.data()+i*4,copied_color.data()+i*4,4))++colors;
 				uint32_t stored=0;float actual=0;
 				memcpy(&stored,original_depth.data()+i*4,4);memcpy(&actual,copied_depth.data()+i*4,4);
+				if(!std::isfinite(actual) || actual<0.0f || actual>1.0f)return false;
 				const uint32_t code=stored>>8;
 				const float expected=code==0xffffff?1.0f:float(code)*(1.0f/67108864.0f);
 				if(actual!=expected)++depths;
@@ -1411,7 +1415,9 @@ void thread_main()
 		if(fprintf(mirror_log,"%u,%d,%d,%llu,%llu,%llu,%u,%llu,%llu,%.3f,%.3f\n",frame,fw,fh,
 			(unsigned long long)mirror_batches,(unsigned long long)mirror_vertices,(unsigned long long)mirror_clears,unsigned(snapshot),
 			(unsigned long long)colors,(unsigned long long)depths,mirror_total_us,snapshot_us)<0)return false;
-		return !colors && !depths;
+		// Wide mode reports differences from compatibility, not a pixel-depth
+		// correctness verdict. The host must independently inspect that policy.
+		return depth_mirror.wide || (!colors && !depths);
 	};
     uint64_t phase_calls[PHASE_COUNT]{}, phase_total[PHASE_COUNT]{}, phase_max[PHASE_COUNT]{};
     auto finish_phase = [&](unsigned phase, uint64_t started)
@@ -1604,7 +1610,7 @@ void thread_main()
 					gl.BindFramebuffer(FRAMEBUFFER, 0);
 				}
 				add_span(p[0] & (CW * CH - 1), std::min(p[1], uint32_t(CW * CH)),
-					p[2] & 0xffffff, int32_t(p[3]), true, true);
+					p[2] & 0xffffff, int32_t(p[3]), true, true, true);
 				break;
 			}
 			case 4:
@@ -1614,18 +1620,18 @@ void thread_main()
 				uint32_t const r57 = p[1], r58 = p[2], r59 = p[3],
 					r5a = p[4], r5e = p[5];
 				if (r57 & 0x1)
-					add_span(addr, 1, r58 & 0xffffff, 0, false, true);
+					add_span(addr, 1, r58 & 0xffffff, 0, false, true, false);
 				if (r5e & 0x20)
 				{
 					if (r57 & 0x4)
-						add_span(addr + 1, 1, r5a & 0xffffff, 0, false, true);
+						add_span(addr + 1, 1, r5a & 0xffffff, 0, false, true, false);
 				}
 				else
 				{
 					if (r57 & 0x4)
-						add_span(addr + 1, 1, r59 & 0xffffff, 0, false, true);
+						add_span(addr + 1, 1, r59 & 0xffffff, 0, false, true, false);
 					if (r57 & 0x10)
-						add_span(addr, 1, 0, int32_t(r5a), true, false);
+						add_span(addr, 1, 0, int32_t(r5a), true, false, false);
 				}
 				break;
 			}
