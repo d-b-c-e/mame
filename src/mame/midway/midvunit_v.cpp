@@ -33,6 +33,7 @@
 // Purpose: prove process_dma_queue() is the complete render surface by
 // re-rasterizing the captured stream offline and diffing against videoram.
 #include <atomic>
+static std::atomic<bool> s_capture_pacing{false};
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
@@ -177,8 +178,11 @@ struct midv_live
 		uint64_t const started = blocked ? GetTickCount64() : 0;
 		// Every message mutates persistent state, including quads and CPU writes.
 		// Backpressure is lossless; a dead consumer fails the entire stream.
-		for (int wait = 0; need <= capacity && w - r + need > capacity && wait < 500; ++wait)
+		for (int wait = 0; need <= capacity && w - r + need > capacity && wait < 500 && GetTickCount64()-started < 10000;)
 		{
+			// Exclude only an acknowledged, bounded offline capture-capacity
+			// wait. Unannounced GL stalls retain the original500-iteration limit.
+			if (!s_capture_pacing.load()) ++wait;
 			Sleep(1);
 			r = ring_load(rpos);
 		}
@@ -1008,6 +1012,8 @@ void thread_main()
 	int const S = std::getenv("MIDV_GL_SCALE") ? atoi(std::getenv("MIDV_GL_SCALE")) : 3;
 	const char *snapdir = std::getenv("MIDV_GL_SNAP");
 	if (snapdir) std::fprintf(stderr, "MIDV_CAPTURE_WRITER_BEGIN\n");
+	const bool capture_paced = std::getenv("MIDV_CAPTURE_PACE") && !strcmp(std::getenv("MIDV_CAPTURE_PACE"), "1")
+		&& std::getenv("MIDV_FFB") && !strcmp(std::getenv("MIDV_FFB"), "0");
 	int const snap_every = std::getenv("MIDV_GL_SNAP_EVERY")
 		? std::max(1, atoi(std::getenv("MIDV_GL_SNAP_EVERY"))) : 150;
 	int const snap_first = std::getenv("MIDV_GL_SNAP_FIRST")
@@ -1751,7 +1757,7 @@ void thread_main()
 				request.row = row; request.index = snapshot_index;
 			}
 			const bool queued = cruisn::encode_capture_bitmap(cw, ch, px.data(), px.size(), request.bitmap)
-				&& snapshot_writer.submit(std::move(request));
+				&& snapshot_writer.submit(std::move(request), capture_paced ? 10000 : 0, &s_capture_pacing);
 			if (!queued) std::fprintf(stderr, "MIDV screenshot writer rejected: %s\n", path);
 			if (queued && menu_test_capture) {
 				// Avoid resubmitting a menu image while its file is still being written.
@@ -1767,11 +1773,12 @@ void thread_main()
 	}
 	const auto capture_stats = snapshot_writer.finish();
 	if (snapdir) {
-		std::fprintf(stderr, "MIDV_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu\n",
+		std::fprintf(stderr, "MIDV_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu paced=%u waits=%llu wait_us=%llu\n",
 			(unsigned long long)capture_stats.submitted, (unsigned long long)capture_stats.written,
 			(unsigned long long)capture_stats.failed, (unsigned long long)capture_stats.rejected,
 			(unsigned long long)capture_stats.peak_bytes, (unsigned long long)capture_stats.write_total_us,
-			(unsigned long long)capture_stats.write_max_us, (unsigned long long)capture_stats.drain_us);
+			(unsigned long long)capture_stats.write_max_us, (unsigned long long)capture_stats.drain_us, unsigned(capture_paced),
+			(unsigned long long)capture_stats.waits, (unsigned long long)capture_stats.wait_us);
 		if (capture_stats.failed || capture_stats.rejected)
 			std::fprintf(stderr, "MIDV screenshot writer failed: captures incomplete\n");
 	}

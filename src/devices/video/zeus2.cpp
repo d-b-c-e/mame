@@ -27,6 +27,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <atomic>
+static std::atomic<bool> s_capture_pacing{false};
 #include <thread>
 #include <vector>
 #include "zeus2_gl_shaders.h"
@@ -514,8 +515,11 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 		const uint64_t initial_r = r, started = GetTickCount64();
 		// Quads, clears and direct writes all mutate persistent framebuffer/depth
 		// state. Losing any one of them cannot be repaired by a texture refresh.
-		for (int i = 0; i < 500 && w - r + need > RING; ++i)
+		for (int i = 0; i < 500 && w - r + need > RING && GetTickCount64()-started < 10000;)
 		{
+			// Explicit offline capture pacing is bounded separately; a real
+			// consumer stall still gets the original500 ordinary wait iterations.
+			if (!s_capture_pacing.load()) ++i;
 			Sleep(1);
 			r = s_rr.load(std::memory_order_acquire);
 		}
@@ -658,6 +662,8 @@ void thread_main()
 	bool crt = envi("MIDZ_GL_CRT", "MIDV_GL_CRT", 0) != 0;
 	const char *snapdir = std::getenv("MIDZ_GL_SNAP");
 	if (snapdir) std::fprintf(stderr, "MIDZ_CAPTURE_WRITER_BEGIN\n");
+	const bool capture_paced = std::getenv("MIDZ_CAPTURE_PACE") && !strcmp(std::getenv("MIDZ_CAPTURE_PACE"), "1")
+		&& std::getenv("MIDV_FFB") && !strcmp(std::getenv("MIDV_FFB"), "0");
 	// crusnexo touches FB rows 0..800 (pages at 0 and 400); 1024 rows
 	// halve texture memory/traffic vs the full 2048-row address space, and
 	// the masks below wrap the (never-observed) high addresses harmlessly
@@ -1469,7 +1475,7 @@ void thread_main()
 				request.row = row; request.index = snap_index;
 			}
 			const bool queued = cruisn::encode_capture_bitmap(cw, ch, px.data(), px.size(), request.bitmap)
-				&& snapshot_writer.submit(std::move(request));
+				&& snapshot_writer.submit(std::move(request), capture_paced ? 10000 : 0, &s_capture_pacing);
 			if (!queued) std::fprintf(stderr, "MIDZ screenshot writer rejected: %s\n", path);
 			if (queued && menu_test_capture) {
 				// Avoid resubmitting a menu image while its file is still being written.
@@ -1492,11 +1498,12 @@ void thread_main()
 
 	const auto capture_stats = snapshot_writer.finish();
 	if (snapdir) {
-		std::fprintf(stderr, "MIDZ_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu\n",
+		std::fprintf(stderr, "MIDZ_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu paced=%u waits=%llu wait_us=%llu\n",
 			(unsigned long long)capture_stats.submitted, (unsigned long long)capture_stats.written,
 			(unsigned long long)capture_stats.failed, (unsigned long long)capture_stats.rejected,
 			(unsigned long long)capture_stats.peak_bytes, (unsigned long long)capture_stats.write_total_us,
-			(unsigned long long)capture_stats.write_max_us, (unsigned long long)capture_stats.drain_us);
+			(unsigned long long)capture_stats.write_max_us, (unsigned long long)capture_stats.drain_us, unsigned(capture_paced),
+			(unsigned long long)capture_stats.waits, (unsigned long long)capture_stats.wait_us);
 		if (capture_stats.failed || capture_stats.rejected)
 			std::fprintf(stderr, "MIDZ screenshot writer failed: captures incomplete\n");
 	}
