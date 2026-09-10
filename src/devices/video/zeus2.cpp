@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <cstdlib>
 #include <vector>
 #include "../../mame/midway/cruisn/capture_bitmap.h"
@@ -35,7 +36,42 @@ static std::atomic<bool> s_capture_pacing{false};
 #include "zeus2_gl_shaders.h"
 #include "../../mame/midway/midvunit_menu_assets.h"
 #include "../../mame/midway/cruisn/pause_cheats_win.h"
-namespace mzgl { void start(); void stop(); }
+namespace mzgl {
+void start(); void stop();
+struct DepthMirrorSettings {
+	bool enabled=false;
+	uint32_t first=0,last=0;
+	std::set<uint32_t> snapshots;
+};
+DepthMirrorSettings depth_mirror_settings()
+{
+	DepthMirrorSettings settings;
+	const char *mode=std::getenv("MIDZ_DEPTH_MIRROR");
+	if(!mode)return settings;
+	if(strcmp(mode,"1"))fatalerror("Invalid Zeus depth mirror mode\n");
+	auto number=[](const char *name) {
+		const char *text=std::getenv(name);char *end=nullptr;
+		if(!text || *text<'0' || *text>'9')fatalerror("Missing Zeus depth mirror bound: %s\n",name);
+		const unsigned long value=strtoul(text,&end,10);
+		if(*end || value<1 || value>16000)fatalerror("Invalid Zeus depth mirror bound: %s\n",name);
+		return uint32_t(value);
+	};
+	settings.first=number("MIDZ_DEPTH_FIRST");settings.last=number("MIDZ_DEPTH_LAST");
+	if(settings.last<settings.first || settings.last-settings.first>10000)
+		fatalerror("Zeus depth mirror interval exceeds bound\n");
+	if(const char *text=std::getenv("MIDZ_DEPTH_SNAPSHOTS")) {
+		while(*text) {
+			if(*text<'0' || *text>'9')fatalerror("Invalid Zeus depth mirror snapshot token\n");
+			char *end=nullptr;const unsigned long frame=strtoul(text,&end,10);
+			if(end==text || (*end && *end!=',') || frame<settings.first || frame>settings.last ||
+				!settings.snapshots.insert(uint32_t(frame)).second || settings.snapshots.size()>16)
+				fatalerror("Invalid Zeus depth mirror snapshot\n");
+			text=*end?end+1:end;if(*end && !*text)fatalerror("Empty Zeus depth mirror snapshot\n");
+		}
+	}
+	settings.enabled=true;return settings;
+}
+}
 void midv_trace_wheelpos(running_machine &machine, const char *tag);   // midvunit_v.cpp (POC)
 #endif
 
@@ -101,6 +137,15 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+#ifdef _WIN32
+	if(const auto mirror=mzgl::depth_mirror_settings();mirror.enabled) {
+		const char *force=std::getenv("MIDV_FFB"),*live=std::getenv("MIDZ_GL"),*active=std::getenv("MIDZ_HOST_ACTIVE");
+		if(!force || strcmp(force,"0") || !live || strcmp(live,"1") ||
+			(active && strcmp(active,"0")) || strcmp(machine().system().name,"crusnexo"))
+			fatalerror("Zeus depth mirror requires Exotica/live GL/FFB0 and no late host drawing\n");
+		fprintf(stderr,"MIDZ_DEPTH_MIRROR=1 first=%u last=%u snapshots=%u\n",mirror.first,mirror.last,unsigned(mirror.snapshots.size()));
+	}
+#endif
 	const char *stall_frame_text = std::getenv("MIDZ_GL_STALL_FRAME");
 	const char *stall_ms_text = std::getenv("MIDZ_GL_STALL_MS");
 	if (stall_frame_text || stall_ms_text)
@@ -379,6 +424,7 @@ struct GL
 	void (WINAPI *TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
 	void (WINAPI *TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
 	void (WINAPI *GetTexImage)(unsigned, int, unsigned, unsigned, void *);
+	void (WINAPI *GetTexLevelParameteriv)(unsigned,int,unsigned,int *);
 	void (WINAPI *DeleteTextures)(int, const uint *);
 	void (WINAPI *PixelStorei)(unsigned, int);
 	void (WINAPI *DrawArrays)(unsigned, int, int);
@@ -450,6 +496,7 @@ struct GL
 		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
 		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
 		L(GetTexImage, "glGetTexImage") L(DeleteTextures, "glDeleteTextures")
+		L(GetTexLevelParameteriv,"glGetTexLevelParameteriv")
 		L(DrawArrays, "glDrawArrays") L(Enable, "glEnable")
 		L(Disable, "glDisable") L(Scissor, "glScissor")
 		L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
@@ -686,6 +733,7 @@ void thread_main()
 	MARGIN = std::max(0, std::min(120, MARGIN));
 	int const CWW = CW + 2 * MARGIN;
 	int const fw = CWW * S, fh = CH * S;
+	auto depth_mirror=depth_mirror_settings();
 
 	HWND parent = nullptr;
 	for (int i = 0; i < 100 && !parent; i++) { Sleep(100); parent = find_mame_window(); }
@@ -792,6 +840,40 @@ void thread_main()
 	gl.ClearDepth(1.0);
 	gl.Clear(0x4100);   // COLOR | DEPTH
 	gl.BindFramebuffer(FRAMEBUFFER, 0);
+
+	uint mirror_prog=0,mirror_color=0,mirror_depth=0,mirror_fbo=0;
+	FILE *mirror_log=nullptr;
+	cruisn::CaptureWriter mirror_writer;
+	uint64_t mirror_batches=0,mirror_vertices=0,mirror_clears=0,mirror_frames=0,mirror_samples=0;
+	bool mirror_failed=false;
+	double mirror_total_us=0;
+	if(depth_mirror.enabled) {
+		mirror_prog=zlink(gl,MZGL_VS,MZGL_DEPTH_COMPAT_FS);
+		if(!mirror_prog) { zlogf("depth mirror shader failed");return; }
+		for(const char *name : {"in_pos","in_rowbase","in_p","in_meta0","in_meta1","in_meta2"})
+			if(gl.GetAttribLocation(prog,name)!=gl.GetAttribLocation(mirror_prog,name)) {
+				zlogf("depth mirror vertex layout differs: %s",name);return;
+			}
+		mirror_color=make_tex(fw,fh,RGBA8,RGBA,0x1401);
+		mirror_depth=make_tex(fw,fh,0x8cac /*DEPTH_COMPONENT32F*/,DEPTH_COMPONENT,0x1406);
+		int depth_bits=0,depth_type=0;
+		gl.GetTexLevelParameteriv(0x0de1,0,0x884a,&depth_bits);
+		gl.GetTexLevelParameteriv(0x0de1,0,0x8c16,&depth_type);
+		if(depth_bits!=32 || depth_type!=0x1406) {zlogf("depth mirror format differs");return;}
+		gl.GenFramebuffers(1,&mirror_fbo);gl.BindFramebuffer(FRAMEBUFFER,mirror_fbo);
+		gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0,0x0de1,mirror_color,0);
+		gl.FramebufferTexture2D(FRAMEBUFFER,DEPTH_ATTACHMENT,0x0de1,mirror_depth,0);
+		if(gl.CheckFramebufferStatus(FRAMEBUFFER)!=FRAMEBUFFER_COMPLETE) {zlogf("depth mirror framebuffer incomplete");return;}
+		gl.Clear(0x4100);gl.BindFramebuffer(FRAMEBUFFER,0);++mirror_clears;
+		gl.UseProgram(mirror_prog);
+		gl.Uniform2f(gl.GetUniformLocation(mirror_prog,"uCanvas"),float(CWW),float(CH));
+		gl.Uniform1f(gl.GetUniformLocation(mirror_prog,"uMargin"),float(MARGIN));
+		gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"waveram"),0);
+		gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"palTex"),1);
+		mirror_log=fopen("zeus-depth-mirror.csv","w");if(!mirror_log) {zlogf("depth mirror log failed");return;}
+		setvbuf(mirror_log,nullptr,_IOFBF,65536);
+		fprintf(mirror_log,"frame,width,height,batches,vertices,clears,snapshot,color_differences,depth_differences,mirror_us,snapshot_us\n");
+	}
 
 	uint vao, vbo_f, vbo_u, vao_empty;
 	gl.GenVertexArrays(1, &vao);
@@ -1068,6 +1150,14 @@ void thread_main()
 			gl.Scissor(0, (b.rowbase + b.clip[1]) * S, fw,
 				(b.clip[3] - b.clip[1] + 1) * S);
 			gl.DrawArrays(0x0004, b.first, b.count);
+			if(mirror_fbo) {
+				const auto began=std::chrono::steady_clock::now();
+				gl.UseProgram(mirror_prog);gl.BindFramebuffer(FRAMEBUFFER,mirror_fbo);
+				gl.DrawArrays(0x0004,b.first,b.count);
+				gl.BindFramebuffer(FRAMEBUFFER,fbo);gl.UseProgram(prog);
+				++mirror_batches;mirror_vertices+=b.count;
+				mirror_total_us+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-began).count();
+			}
 		}
 		gl.Disable(GLBLEND);
 		gl.Disable(GLSCISSOR_TEST);
@@ -1277,6 +1367,52 @@ void thread_main()
 	std::vector<uint8_t> rec;
     uint32_t completed_frame = 0;
     double completed_seconds = 0;
+	uint32_t mirror_previous=0;
+	auto mirror_frame=[&](uint32_t frame) {
+		if(!mirror_fbo || frame<depth_mirror.first || frame>depth_mirror.last)return true;
+		if(mirror_frames && frame<=mirror_previous)return false;
+		mirror_previous=frame;++mirror_frames;
+		uint64_t colors=0,depths=0;double snapshot_us=0;
+		const bool snapshot=depth_mirror.snapshots.erase(frame)!=0;
+		if(snapshot) {
+			const auto began=std::chrono::steady_clock::now();
+			const size_t pixels=size_t(fw)*fh,bytes=pixels*4;
+			if(bytes>64*1024*1024)return false;
+			auto read_texture=[&](uint texture,unsigned format,unsigned type) {
+				std::vector<uint8_t> data(bytes);
+				gl.ActiveTexture(TEXTURE0+6);gl.BindTexture(0x0de1,texture);
+				gl.PixelStorei(0x0d05,1);gl.GetTexImage(0x0de1,0,format,type,data.data());return data;
+			};
+			auto original_color=read_texture(fbTex,RGBA,0x1401);
+			auto copied_color=read_texture(mirror_color,RGBA,0x1401);
+			auto original_depth=read_texture(depthTex,DEPTH_COMPONENT,0x1405);
+			auto copied_depth=read_texture(mirror_depth,DEPTH_COMPONENT,0x1406);
+			if(gl.GetError()!=0)return false;
+			for(size_t i=0;i<pixels;++i) {
+				if(memcmp(original_color.data()+i*4,copied_color.data()+i*4,4))++colors;
+				uint32_t stored=0;float actual=0;
+				memcpy(&stored,original_depth.data()+i*4,4);memcpy(&actual,copied_depth.data()+i*4,4);
+				const uint32_t code=stored>>8;
+				const float expected=code==0xffffff?1.0f:float(code)*(1.0f/67108864.0f);
+				if(actual!=expected)++depths;
+			}
+			const std::string prefix="zeus-depth-"+std::to_string(frame);
+			auto save=[&](const std::string &suffix,std::vector<uint8_t> data) {
+				cruisn::CaptureWriter::Request request;request.path=prefix+suffix;request.bitmap=std::move(data);
+				return mirror_writer.submit(std::move(request),capture_paced?10000:0,&s_capture_pacing);
+			};
+			if(!save("-original-color.bin",std::move(original_color)) || !save("-mirror-color.bin",std::move(copied_color)) ||
+				!save("-original-depth.bin",std::move(original_depth)) || !save("-mirror-depth.bin",std::move(copied_depth)))return false;
+			gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0de1,waveTex);
+			gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0de1,palTex);gl.ActiveTexture(TEXTURE0);
+			snapshot_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-began).count();
+			++mirror_samples;
+		}
+		if(fprintf(mirror_log,"%u,%d,%d,%llu,%llu,%llu,%u,%llu,%llu,%.3f,%.3f\n",frame,fw,fh,
+			(unsigned long long)mirror_batches,(unsigned long long)mirror_vertices,(unsigned long long)mirror_clears,unsigned(snapshot),
+			(unsigned long long)colors,(unsigned long long)depths,mirror_total_us,snapshot_us)<0)return false;
+		return !colors && !depths;
+	};
     uint64_t phase_calls[PHASE_COUNT]{}, phase_total[PHASE_COUNT]{}, phase_max[PHASE_COUNT]{};
     auto finish_phase = [&](unsigned phase, uint64_t started)
     {
@@ -1458,6 +1594,12 @@ void thread_main()
 					gl.Clear(0x4100);
 					gl.Scissor(fw - MARGIN * S, int(row0 * S), MARGIN * S, int(nrows * S));
 					gl.Clear(0x4100);
+					if(mirror_fbo) {
+						gl.BindFramebuffer(FRAMEBUFFER,mirror_fbo);
+						gl.Clear(0x4100);
+						gl.Scissor(0,int(row0*S),MARGIN*S,int(nrows*S));gl.Clear(0x4100);
+						gl.BindFramebuffer(FRAMEBUFFER,fbo);mirror_clears+=2;
+					}
 					gl.Disable(GLSCISSOR_TEST);
 					gl.BindFramebuffer(FRAMEBUFFER, 0);
 				}
@@ -1537,6 +1679,9 @@ void thread_main()
 		s_rr.store(r, std::memory_order_release);
 		flush();
 
+		if(frame_ready && !mirror_frame(completed_frame)) {
+			mirror_failed=true;s_stopz.store(true);zlogf("depth mirror comparison failed at frame%u",completed_frame);break;
+		}
 		if (!frame_ready && !menu_open && !ui_changed) { Sleep(1); continue; }
         if (frame_ready && !stall_applied && stall_frame > 0 && completed_frame >= uint32_t(stall_frame))
         {
@@ -1733,6 +1878,22 @@ void thread_main()
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
 
+	if(mirror_log) {
+		const auto stats=mirror_writer.finish();
+		const int closed=fclose(mirror_log);
+		if(stats.failed || stats.rejected || stats.submitted!=stats.written || stats.written!=4*mirror_samples ||
+			!depth_mirror.snapshots.empty() || mirror_previous!=depth_mirror.last || closed)mirror_failed=true;
+		fprintf(stderr,"MIDZ_DEPTH_MIRROR_RESULT complete=%u frames=%llu batches=%llu vertices=%llu clears=%llu snapshots=%llu remaining=%u\n",
+			unsigned(!mirror_failed),(unsigned long long)mirror_frames,(unsigned long long)mirror_batches,
+			(unsigned long long)mirror_vertices,(unsigned long long)mirror_clears,(unsigned long long)mirror_samples,unsigned(depth_mirror.snapshots.size()));
+		fprintf(stderr,"MIDZ_DEPTH_MIRROR_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu waits=%llu wait_us=%llu\n",
+			(unsigned long long)stats.submitted,(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected,
+			(unsigned long long)stats.peak_bytes,(unsigned long long)stats.write_total_us,(unsigned long long)stats.write_max_us,(unsigned long long)stats.drain_us,
+			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
+	}
+	if(mirror_fbo)gl.DeleteFramebuffers(1,&mirror_fbo);
+	if(mirror_color)gl.DeleteTextures(1,&mirror_color);
+	if(mirror_depth)gl.DeleteTextures(1,&mirror_depth);
 	if(margin_log) {
 		const auto stats=margin_writer.finish();
 		if(stats.failed || stats.rejected || stats.submitted!=stats.written)private_failed=true;
