@@ -10,6 +10,7 @@
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
 #include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
 #include "../../mame/midway/cruisn/zeus_margin_clear.h"
+#include "../../mame/midway/cruisn/zeus_sky_repeat.h"
 
 #include "screen.h"
 
@@ -95,6 +96,16 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+	if (const char *mode = std::getenv("MIDZ_SKY_REPEAT"))
+	{
+		const char *force=std::getenv("MIDV_FFB"), *live=std::getenv("MIDZ_GL");
+		const char *page=std::getenv("MIDZ_GL_MARGIN_PAGE_CLEAR"), *palette=std::getenv("MIDZ_PALETTE_GUARD");
+		if ((mode[0]!='0' && mode[0]!='1') || mode[1] || strcmp(machine().system().name,"crusnexo") ||
+			!force || strcmp(force,"0") || !live || strcmp(live,"1") ||
+			(mode[0]=='1' && (!page || strcmp(page,"1") || !palette || strcmp(palette,"1"))))
+			fatalerror("Zeus sky diagnostic requires Exotica/liveGL/FFB0; repeat needs page clearing and palette guard");
+		fprintf(stderr,"MIDZ_SKY_REPEAT=%c\n",mode[0]);
+	}
 	if (const char *mode = std::getenv("MIDZ_GL_MARGIN_PAGE_CLEAR"))
 	{
 		const char *force = std::getenv("MIDV_FFB");
@@ -823,6 +834,13 @@ void thread_main()
 	bool const margin_trace = std::getenv("MIDZ_GL_MARGIN_PAGE_CLEAR") != nullptr;
 	bool const margin_page_clear = envi("MIDZ_GL_MARGIN_PAGE_CLEAR", nullptr, 0) != 0;
 	uint64_t margin_clears = 0, margin_expansions = 0;
+	bool const sky_trace=std::getenv("MIDZ_SKY_REPEAT")!=nullptr;
+	bool const sky_enabled=envi("MIDZ_SKY_REPEAT",nullptr,0)!=0;
+	bool sky_open=false;
+	std::vector<midz_quad_rec> sky_quads;
+	std::vector<cruisn::zeus_sky_tile> sky_tiles;
+	if (sky_enabled) { sky_quads.reserve(64); sky_tiles.reserve(64); }
+	uint64_t sky_groups=0,sky_accepted=0,sky_copied=0,sky_budget_rejected=0;
 	uint32_t zb38 = 0x1900000;
 	uint64_t presents = 0, n_quads = 0;
 	int snap_n = 0;
@@ -915,6 +933,31 @@ void thread_main()
 				float const p[4] = { v[2], v[3], v[4], v[5] };
 				vert(v[0], v[1], rb, p, meta);
 			}
+	};
+	auto sky_tile = [](const midz_quad_rec &r)
+	{
+		cruisn::zeus_sky_tile t;
+		t.state={{r.texdata,r.tex_src,r.texwidth,r.solidcolor,r.transcolor,r.srcAlpha,r.dstAlpha,
+			r.flags,uint32_t(r.zbuf_min),r.rr04,r.yscale,uint32_t(r.clip[0]),uint32_t(r.clip[1]),
+			uint32_t(r.clip[2]),uint32_t(r.clip[3])}};
+		for (unsigned i=0;i<4;++i) for (unsigned j=0;j<6;++j) t.v[i][j]=r.verts[i][j];
+		return t;
+	};
+	auto finish_sky = [&]()
+	{
+		sky_open=false;
+		if (sky_tiles.empty()) return;
+		++sky_groups;
+		auto const plan=cruisn::zeus_sky_repeat(sky_tiles,unsigned(MARGIN));
+		if (plan.accepted) {
+			++sky_accepted;
+			for (auto const &copy:plan.copies) {
+				auto q=sky_quads[copy.index];
+				for (unsigned i=0;i<4;++i) q.verts[i][0]+=copy.shift;
+				add_quad(q); ++sky_copied;
+			}
+		}
+		sky_tiles.clear(); sky_quads.clear();
 	};
 	// raw fills (fast clears / frame writes) go through the same pipeline
 	// as FLAG_RAW rectangles so ordering with quads is exact
@@ -1056,11 +1099,23 @@ void thread_main()
 			rec.resize(hdr[1]);
 			if (hdr[1]) ring_get(rec.data(), hdr[1]);
 			r = (r + 7) & ~7ull;
+			// Finish before changing palettes/uploads/pages or presenting. Stored
+			// tiles retain the current material only within this uninterrupted span.
+			if (sky_enabled && hdr[0]!=1 && !sky_quads.empty()) finish_sky();
 			switch (hdr[0])
 			{
 			case 1:
-				if (rec.size() >= sizeof(midz_quad_rec))
-					add_quad(*(const midz_quad_rec *)rec.data());
+				if (rec.size() >= sizeof(midz_quad_rec)) {
+					auto const &q=*(const midz_quad_rec *)rec.data();
+					if (sky_enabled && sky_open) {
+						auto const t=sky_tile(q);
+						if (q.numverts==4 && cruisn::zeus_sky_candidate(t)) {
+							if (sky_tiles.size()<64) { sky_tiles.push_back(t); sky_quads.push_back(q); }
+							else { sky_tiles.clear(); sky_quads.clear(); sky_open=false; ++sky_budget_rejected; }
+						} else finish_sky();
+					}
+					add_quad(q);
+				}
 				break;
 			case 2:
 			{
@@ -1095,6 +1150,7 @@ void thread_main()
 					uint32_t const row0 = span.row, nrows = span.count;
 					++margin_clears;
 					if (span.expanded) ++margin_expansions;
+					if (sky_enabled) sky_open=true;
 					flush();
 					gl.BindFramebuffer(FRAMEBUFFER, fbo);
 					gl.Viewport(0, 0, fw, fh);
@@ -1377,6 +1433,10 @@ void thread_main()
 	if (margin_trace)
 		fprintf(stderr,"MIDZ_MARGIN_RESULT page=%d clears=%llu expanded=%llu\n",
 			int(margin_page_clear),(unsigned long long)margin_clears,(unsigned long long)margin_expansions);
+	if (sky_trace)
+		fprintf(stderr,"MIDZ_SKY_REPEAT_RESULT enabled=%d groups=%llu accepted=%llu copied=%llu budget_rejected=%llu\n",
+			int(sky_enabled),(unsigned long long)sky_groups,(unsigned long long)sky_accepted,
+			(unsigned long long)sky_copied,(unsigned long long)sky_budget_rejected);
 	s_zpause.store(0);
 	zlogf("ring drops: quads %u, state(spans/pal/tick) %u", s_drops_quad.load(), s_drops_state.load());
 	zlogf("exit after %llu presents, %llu quads",
