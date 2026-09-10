@@ -201,7 +201,7 @@ private:
 	uint32_t m_scene_first=0,m_scene_last=0,m_scene_multiplier=1,m_scene_cpu_frame=0;
 	uint64_t m_scene_serial=0;
 	double m_scene_cpu_time=0;
-	bool m_scene_open=false,m_scene_armed=false;
+	bool m_scene_open=false,m_scene_armed=false,m_scene_bounds=false;
 	std::array<uint32_t,3> m_scene_camera{};
 	uint32_t m_scene_loading=0;
 	float m_scene_margin=88;
@@ -325,6 +325,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_first=number("MIDZ_HOST_FIRST",1800,16000,0);
 	m_scene_last=number("MIDZ_HOST_LAST",1800,16000,0);
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
+	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
 		memregion("maindata")->bytes()!=0x800000 || memregion("bankeddata")->bytes()!=0x3000000 ||
@@ -344,7 +345,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
 	setvbuf(m_scene_log,nullptr,_IOFBF,65536);
-	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time\n");
+	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds\n");
 	auto &space=m_maincpu->space(AS_PROGRAM);
 	// Native refreshes can split one game's scene. Latch its actual scene/list
 	// boundary, then join only the first supported original scenery submission.
@@ -392,6 +393,7 @@ void crusnexo_state::scene_observer_start()
 	m_zeus->set_midz_model_observer([this](uint32_t base,uint32_t count,uint32_t yscale){scene_observer_model(base,count,yscale);});
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::scene_observer_exit,this));
 	fprintf(stderr,"MIDZ_HOST_SCENE=1 first=%u last=%u multiplier=%u snapshots=%u\n",m_scene_first,m_scene_last,m_scene_multiplier,unsigned(m_scene_snapshots.size()));
+	if(m_scene_bounds)fprintf(stderr,"MIDZ_HOST_BOUNDS=1\n");
 }
 
 void crusnexo_state::scene_observer_prepare()
@@ -401,7 +403,7 @@ void crusnexo_state::scene_observer_prepare()
 	const uint32_t flags=uint32_t(m_maincpu->state_int(TMS320C3X_R6));
 	if(flags&0x80 || ((flags&3)!=0 && (flags&3)!=3))return;
 	const auto cycles=m_maincpu->total_cycles();m_scene_busy=true;
-	ScenePending pending;auto &p=pending.parameters;p.frame=frame;p.multiplier=m_scene_multiplier;p.margin=m_scene_margin;
+	ScenePending pending;auto &p=pending.parameters;p.frame=frame;p.multiplier=m_scene_multiplier;p.margin=m_scene_margin;p.frustum_bounds=m_scene_bounds;
 	pending.scene=m_scene_serial;pending.scene_frame=m_scene_cpu_frame;pending.scene_time=m_scene_cpu_time;
 	if(frame<m_scene_cpu_frame || frame>m_scene_cpu_frame+1)fatalerror("Exotica host scenery preparation frame\n");
 	pending.object=uint32_t(m_maincpu->state_int(TMS320C3X_AR7));
@@ -516,11 +518,11 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica host assembly changed CPU cycles\n");
 	const auto finished=std::chrono::steady_clock::now();
 	auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
-	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f\n",
+	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f,%u,%u\n",
 		p.frame,cpu_frame,pending.time,now,base,count,pending.bank,c.render[4],p.multiplier,unsigned(m_scene_loading!=0),
 		unsigned(sources.sources.size()),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(scene.viewport_polygons),
 		(unsigned long long)hash,us(started,ready),us(ready,built),us(built,hashed),us(hashed,finished),
-		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time)<0)
+		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time,unsigned(p.frustum_bounds),unsigned(scene.culled_bounds))<0)
 		fatalerror("Exotica host scene log write\n");
 	++m_scene_matched;m_scene_quads+=scene.quads.size();
 }
