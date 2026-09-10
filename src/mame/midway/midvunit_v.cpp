@@ -40,6 +40,7 @@
 #include <thread>
 #include <set>
 #include <vector>
+#include "cruisn/capture_bitmap.h"
 #include <string>
 #ifdef _WIN32
 #include <winsock2.h>
@@ -1282,6 +1283,7 @@ void thread_main()
 	std::vector<uint32_t> udata;
 	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
 	int snap_n = 0;
+	std::vector<uint8_t> snapshot_bitmap;
 	uint32_t last_received_frame = 0;
 	int const stall_frame = std::getenv("MIDV_GL_STALL_FRAME") ? atoi(std::getenv("MIDV_GL_STALL_FRAME")) : -1;
 	int const stall_ms = std::getenv("MIDV_GL_STALL_MS") ? std::clamp(atoi(std::getenv("MIDV_GL_STALL_MS")), 0, 5000) : 0;
@@ -1731,29 +1733,10 @@ void thread_main()
 				snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
 			else
 				snprintf(path, sizeof(path), "%s\\mvgl_%03d.bmp", snapdir, snap_n++);
-			FILE *f = fopen(path, "wb");
-			logf("snap %s -> %s", path, f ? "ok" : "FOPEN FAILED");
-			if (f)
+			const bool snapshot_written = cruisn::write_capture_bitmap(path, cw, ch, px.data(), px.size(), snapshot_bitmap);
+			if (!snapshot_written) std::fprintf(stderr, "MIDV screenshot write failed: %s\n", path);
+			if (snapshot_written)
 			{
-				int const rowsz = (cw * 3 + 3) & ~3;
-				uint32_t const img = rowsz * ch;
-				uint8_t bh[54] = { 'B', 'M' };
-				*(uint32_t *)(bh + 2) = 54 + img;
-				*(uint32_t *)(bh + 10) = 54;
-				*(uint32_t *)(bh + 14) = 40;
-				*(int32_t *)(bh + 18) = cw;
-				*(int32_t *)(bh + 22) = ch;
-				*(uint16_t *)(bh + 26) = 1;
-				*(uint16_t *)(bh + 28) = 24;
-				*(uint32_t *)(bh + 34) = img;
-				fwrite(bh, 1, 54, f);
-				std::vector<uint8_t> row(rowsz, 0);
-				for (int y = 0; y < ch; y++)
-				{
-					memcpy(row.data(), &px[size_t(y) * cw * 3], cw * 3);
-					fwrite(row.data(), 1, rowsz, f);
-				}
-				fclose(f);
 				if (menu_test_capture)
 				{
 					menu_test_saved = menu_test_step;

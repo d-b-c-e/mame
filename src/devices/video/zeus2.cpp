@@ -18,6 +18,7 @@
 #include <map>
 #include <cstdlib>
 #include <vector>
+#include "../../mame/midway/cruisn/capture_bitmap.h"
 
 // MIDZ_GL in-process renderer (Windows-only, env-gated; see mzgl below)
 #ifdef _WIN32
@@ -892,6 +893,7 @@ void thread_main()
 	uint32_t zb38 = 0x1900000;
 	uint64_t presents = 0, n_quads = 0;
 	int snap_n = 0;
+	std::vector<uint8_t> snapshot_bitmap;
 
 	auto vert = [&](float x, float y, float rowbase, const float *p,
 			const uint32_t *meta)
@@ -1455,28 +1457,10 @@ void thread_main()
 			char path[512];
 			if (menu_test_capture) snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
 			else snprintf(path, sizeof(path), "%s\\mzgl_%03d.bmp", snapdir, snap_n++);
-			FILE *f = fopen(path, "wb");
-			if (f)
+			const bool snapshot_written = cruisn::write_capture_bitmap(path, cw, ch, px.data(), px.size(), snapshot_bitmap);
+			if (!snapshot_written) std::fprintf(stderr, "MIDZ screenshot write failed: %s\n", path);
+			if (snapshot_written)
 			{
-				int const rowsz = (cw * 3 + 3) & ~3;
-				uint32_t const img = rowsz * ch;
-				uint8_t bh[54] = { 'B', 'M' };
-				*(uint32_t *)(bh + 2) = 54 + img;
-				*(uint32_t *)(bh + 10) = 54;
-				*(uint32_t *)(bh + 14) = 40;
-				*(int32_t *)(bh + 18) = cw;
-				*(int32_t *)(bh + 22) = ch;
-				*(uint16_t *)(bh + 26) = 1;
-				*(uint16_t *)(bh + 28) = 24;
-				*(uint32_t *)(bh + 34) = img;
-				fwrite(bh, 1, 54, f);
-				std::vector<uint8_t> rowbuf(rowsz, 0);
-				for (int y = 0; y < ch; y++)
-				{
-					memcpy(rowbuf.data(), &px[size_t(y) * cw * 3], cw * 3);
-					fwrite(rowbuf.data(), 1, rowsz, f);
-				}
-                fclose(f);
                 if (menu_test_capture) {
                     menu_test_saved = menu_test_step;
                     zlogf("menu snapshot step=%d open=%d selected=%d crt=%d completed_frame=%u new_frame=%d",
