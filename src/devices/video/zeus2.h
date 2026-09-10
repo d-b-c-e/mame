@@ -54,6 +54,7 @@ struct zeus2_poly_extra_data
 	bool            blend_enable;
 	int32_t         zbuf_min;
 	bool            depth_min_enable;
+	bool            depth_floor_enable;
 	bool            depth_test_enable;
 	bool            depth_write_enable;
 	bool            depth_clear_enable;
@@ -156,6 +157,7 @@ public:
 	uint32_t zeus_texbase;
 	int zeus_quad_size;
 	bool m_useZOffset;
+	uint32_t m_upstream_render = 0; // Diagnostic #16094 policy, independent of saved device state.
 
 	std::unique_ptr<uint32_t[]> m_waveram;
 	static uint8_t *s_waveram_base;     // m_waveram start, for WAVERAM_WRAP

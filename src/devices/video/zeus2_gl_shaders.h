@@ -105,7 +105,7 @@ static const char *MZGL_FS =
 	"    int curz = int(p.x);\n"
 	"    int dv;\n"
 	"    if ((flags & 32u) != 0u)      dv = 0xffffff;          // depth_clear\n"
-	"    else if ((flags & 4u) != 0u)  dv = curz + zmin;       // depth_min\n"
+	"    else if ((flags & 4u) != 0u)  dv = (flags & 512u) != 0u ? max(curz,zmin) : curz + zmin;\n"
 	"    else                          dv = curz;\n"
 	"    dv = clamp(dv, 0, 0xffffff);\n"
 	"    gl_FragDepth = float(dv) / 16777215.0;\n"
@@ -270,4 +270,3 @@ static const char *MZGL_MENU_FS =
 	"    color = vec4(uColor.rgb, uColor.a * a);\n"
 	"}\n"
 	"\n";
-

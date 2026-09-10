@@ -7,6 +7,7 @@
 **************************************************************************/
 #include "emu.h"
 #include "zeus2.h"
+#include "../../mame/midway/cruisn/zeus_render_policy.h"
 
 #include "screen.h"
 
@@ -92,6 +93,16 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+	if (const char *mode = std::getenv("MIDZ_UPSTREAM_RENDER"))
+	{
+		if (mode[0] < '0' || mode[0] > '7' || mode[1] || strcmp(machine().system().name,"crusnexo"))
+			fatalerror("MIDZ_UPSTREAM_RENDER requires Exotica 2.4 and a single mask0..7");
+		m_upstream_render = mode[0] - '0';
+		const char *force = std::getenv("MIDV_FFB");
+		if (m_upstream_render && (!force || strcmp(force,"0")))
+			fatalerror("Zeus upstream rendering diagnostic requires MIDV_FFB=0");
+		fprintf(stderr,"MIDZ_UPSTREAM_RENDER=%u PR=16094\n",m_upstream_render);
+	}
 #ifdef _WIN32
 	// MIDZ_GL=1: spawn the in-process GL renderer thread (see mzgl below)
 	if (std::getenv("MIDZ_GL") && atoi(std::getenv("MIDZ_GL")) != 0)
@@ -1518,7 +1529,8 @@ void zeus2_device::midz_cap_quad(int numverts, const void *verts,
 	r.flags = (extra.solid_enable ? 1 : 0) | (extra.blend_enable ? 2 : 0)
 		| (extra.depth_min_enable ? 4 : 0) | (extra.depth_test_enable ? 8 : 0)
 		| (extra.depth_write_enable ? 16 : 0) | (extra.depth_clear_enable ? 32 : 0)
-		| (extra.texture_alpha ? 64 : 0) | (extra.texture_rgb555 ? 128 : 0);
+		| (extra.texture_alpha ? 64 : 0) | (extra.texture_rgb555 ? 128 : 0)
+		| (extra.depth_floor_enable ? cruisn::zeus_policy::QuadDepthFloor : 0);
 	r.zbuf_min = extra.zbuf_min;
 	r.rr04 = m_renderRegs[0x4];
 	r.yscale = uint32_t(m_yScale);
@@ -2886,7 +2898,9 @@ void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit
 		if (++s_cap_model_count > 4096 || count > 0xc800)
 			fatalerror("Zeus model journal exceeds bounded record count");
 		captured = {};
-		captured.version = 1; captured.frame = uint32_t(screen().frame_number());
+		captured.version = m_upstream_render ? 2 : 1;
+		captured.reserved = m_upstream_render;
+		captured.frame = uint32_t(screen().frame_number());
 		captured.id = s_cap_model_count; captured.baseaddr = baseaddr; captured.count = count;
 		captured.quad_size = zeus_quad_size; captured.system = m_system;
 		captured.first_quad = s_cap_recq; captured.ucode = m_curUCodeSrc;
@@ -3293,15 +3307,18 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	extra.transcolor = (texmode & 0x180) ? 0 : 0x100;
 	extra.texbase = WAVERAM_BLOCK0_EXT(m_state->zeus_texbase);
 	extra.depth_min_enable = true;// (m_state->m_renderRegs[0x14] & 0x008000);
+	extra.depth_floor_enable = (m_state->m_upstream_render & cruisn::zeus_policy::DepthFloor) != 0;
 	extra.zbuf_min = util::sext(m_state->m_renderRegs[0x15], 24);
-	extra.depth_test_enable = !(m_state->m_renderRegs[0x14] & 0x000020);
+	const auto policy = cruisn::zeus_policy::material(m_state->m_upstream_render,texmode,
+		m_state->m_renderRegs[0x14],m_state->m_renderRegs[0x40],m_state->m_renderRegs[0x0c]);
+	extra.depth_test_enable = policy.depth_test;
 	//extra.depth_test_enable &= !(m_state->m_renderRegs[0x14] & 0x008000);
-	extra.depth_write_enable = !(m_state->m_renderRegs[0x14] & 0x001000);
+	extra.depth_write_enable = policy.depth_write;
 	extra.depth_clear_enable = (m_state->m_renderRegs[0x14] & 0x000c00);
 	// 021e0e = blend with texture alpha for type 2, 020202 blend src / dst alpha
-	extra.blend_enable = ((m_state->m_renderRegs[0x40] == 0x020202) || (m_state->m_renderRegs[0x40] == 0x021e0e && (texmode & 0x3) == 2));
+	extra.blend_enable = policy.blend;
 	// Clamp translucency (1.8 fixed, 0x100=1.0) to 0x100: scale8() takes a uint8_t, so >=0x100 would truncate to near-black.
-	extra.srcAlpha = std::min<uint32_t>(m_state->m_renderRegs[0x0c], 0x100);
+	extra.srcAlpha = policy.source_alpha;
 	extra.dstAlpha = std::min<uint32_t>(m_state->m_renderRegs[0x0d], 0x100);
 	extra.texture_alpha = false;
 	extra.texture_rgb555 = false;
@@ -3320,8 +3337,6 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 			extra.get_texel = m_state->get_texel_8bit_2x2_alpha;
 			extra.texture_alpha = true;
 			extra.get_alpha = m_state->get_alpha_8bit_2x2_alpha;
-			extra.depth_test_enable = false;
-			extra.depth_write_enable = false;
 		}
 		else {
 			extra.texture_rgb555 = true;
@@ -3399,7 +3414,8 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 			//curDepthVal = object.zbuf_min;
 			curDepthVal = 0xffffff;
 		} else if (object.depth_min_enable) {
-			curDepthVal = curz + object.zbuf_min;
+			curDepthVal = cruisn::zeus_policy::depth(object.depth_floor_enable ? cruisn::zeus_policy::DepthFloor : 0,
+				curz,object.zbuf_min);
 		}
 		else {
 			curDepthVal = curz;
