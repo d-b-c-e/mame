@@ -432,6 +432,7 @@ constexpr size_t RING = 64u << 20;
 static uint8_t *s_ringbuf = nullptr;
 static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
+static std::atomic<uint32_t> s_presented_frame{0};
 static std::atomic<int> s_zpause{0};
 static std::atomic<double> s_secs{0.0};   // machine time, published by screen_update for the GL thread
 static std::thread s_thread;
@@ -1339,6 +1340,7 @@ void thread_main()
 			}
 		}
 		SwapBuffers(dc);
+		if (frame_ready) s_presented_frame.store(completed_frame);
 		if (!vsync)
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
@@ -1375,6 +1377,7 @@ void start()
 		return;
 	s_stopz.store(false);
 	s_donez.store(false);
+	s_presented_frame.store(0);
 	s_on.store(true);
 	s_thread = std::thread(thread_main);
 }
@@ -1383,6 +1386,18 @@ void stop()
 {
 	if (!s_on.load())
 		return;
+	// Diagnostic-only: finish already queued captures before tearing resources
+	// down. No extra emulated frame, guest write or physical output is generated.
+	if (const char *drain = std::getenv("MIDZ_GL_DRAIN_FRAME"))
+		if (std::getenv("MIDV_FFB") && !strcmp(std::getenv("MIDV_FFB"),"0")) {
+			char *end = nullptr; const auto target = strtoul(drain,&end,10);
+			if (*drain >= '0' && *drain <= '9' && !*end && target <= 1000000) {
+				const auto began = GetTickCount64();
+				while (!s_donez.load() && s_presented_frame.load() < target && GetTickCount64()-began < 10000) Sleep(5);
+				fprintf(stderr,"MIDZ capture drain: target=%lu presented=%u wait_ms=%llu complete=%u\n",
+					target,s_presented_frame.load(),(unsigned long long)(GetTickCount64()-began),unsigned(s_presented_frame.load()>=target));
+			}
+		}
 	s_stopz.store(true);
 	if (s_thread.joinable())
 		s_thread.join();
