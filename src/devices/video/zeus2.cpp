@@ -8,6 +8,7 @@
 #include "emu.h"
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
+#include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
 
 #include "screen.h"
 
@@ -93,6 +94,14 @@ TIMER_CALLBACK_MEMBER(zeus2_device::int_timer_callback)
 
 void zeus2_device::device_start()
 {
+	if (const char *mode = std::getenv("MIDZ_PALETTE_GUARD"))
+	{
+		const char *force = std::getenv("MIDV_FFB");
+		if ((mode[0] != '0' && mode[0] != '1') || mode[1] ||
+			strcmp(machine().system().name,"crusnexo") || !force || strcmp(force,"0"))
+			fatalerror("Zeus palette diagnostic requires Exotica, mask0/1 and MIDV_FFB=0");
+		fprintf(stderr,"MIDZ_PALETTE_GUARD=%c\n",mode[0]);
+	}
 	if (const char *mode = std::getenv("MIDZ_UPSTREAM_RENDER"))
 	{
 		if (mode[0] < '0' || mode[0] > '7' || mode[1] || strcmp(machine().system().name,"crusnexo"))
@@ -794,6 +803,11 @@ void thread_main()
 	std::vector<Batch> batches;
 	static uint8_t *wave_mirror = (uint8_t *)calloc(1, 16u << 20);
 	uint32_t pal_slot = 0;
+	bool const palette_trace = std::getenv("MIDZ_PALETTE_GUARD") != nullptr;
+	bool const palette_guard = envi("MIDZ_PALETTE_GUARD", nullptr, 0) != 0;
+	cruisn::zeus_palette_lifetime palette_life;
+	uint64_t palette_conflicts = 0, palette_flushes = 0, palette_frame_conflicts = 0;
+	unsigned palette_log_frames = 0;
 	uint32_t zb38 = 0x1900000;
 	uint64_t presents = 0, n_quads = 0;
 	int snap_n = 0;
@@ -823,6 +837,7 @@ void thread_main()
 	};
 	auto flush = [&]()
 	{
+		if (palette_trace) palette_life.clear();
 		if (fdata.empty()) { batches.clear(); return; }
 		if (!batches.empty())
 			batches.back().count = int(fdata.size() / 7) - batches.back().first;
@@ -867,6 +882,7 @@ void thread_main()
 	bool had_quads_iter = false, had_writes_iter = false, wide_mode = false;
 	auto add_quad = [&](const midz_quad_rec &r)
 	{
+		if (palette_trace) palette_life.use(pal_slot);
 		++n_quads;
 		had_quads_iter = true;
 		bool const blend = (r.flags & 2) != 0;
@@ -1033,7 +1049,13 @@ void thread_main()
 				break;
 			case 2:
 			{
-				pal_slot = (pal_slot + 1) & 255;
+				uint32_t const next_slot = (pal_slot + 1) & 255;
+				if (palette_trace && palette_life.conflicts(next_slot))
+				{
+					++palette_conflicts; ++palette_frame_conflicts;
+					if (palette_guard) { flush(); ++palette_flushes; }
+				}
+				pal_slot = next_slot;
 				gl.ActiveTexture(TEXTURE0 + 1);
 				gl.BindTexture(0x0DE1, palTex);
 				gl.TexSubImage2D(0x0DE1, 0, 0, int(pal_slot), 256, 1,
@@ -1118,6 +1140,12 @@ void thread_main()
                     FrameTick tick; memcpy(&tick,rec.data(),sizeof(tick));
                     zb38=tick.base; completed_frame=tick.frame;
                     completed_seconds=tick.seconds; frame_ready=true;
+                    if (palette_frame_conflicts) {
+                        if (palette_log_frames++ < 64)
+                            zlogf("palette lifetime completed_frame=%u conflicts=%llu guard=%d",
+                                tick.frame, (unsigned long long)palette_frame_conflicts, int(palette_guard));
+                        palette_frame_conflicts = 0;
+                    }
                 }
 				break;
 			}
@@ -1325,6 +1353,9 @@ void thread_main()
 		}
 	}
 	if (snap_index) fclose(snap_index);
+	if (palette_trace)
+		fprintf(stderr,"MIDZ_PALETTE_RESULT guard=%d conflicts=%llu flushes=%llu\n",
+			int(palette_guard),(unsigned long long)palette_conflicts,(unsigned long long)palette_flushes);
 	s_zpause.store(0);
 	zlogf("ring drops: quads %u, state(spans/pal/tick) %u", s_drops_quad.load(), s_drops_state.load());
 	zlogf("exit after %llu presents, %llu quads",
