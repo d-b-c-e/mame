@@ -13,6 +13,7 @@
 #include "../../mame/midway/cruisn/zeus_sky_repeat.h"
 #include "../../mame/midway/cruisn/zeus_host_materials.h"
 #include "../../mame/midway/cruisn/zeus_margin_packet.h"
+#include "../../mame/midway/cruisn/zeus_wide_packet.h"
 
 #include "screen.h"
 
@@ -1373,6 +1374,91 @@ void thread_main()
 		++margin_packets;margin_quads+=packet.quads.size();return true;
 	};
 
+	cruisn::CaptureWriter future_writer;
+	FILE *future_log=nullptr;
+	uint64_t future_packets=0,future_quads=0,future_snapshots=0;
+	auto private_future=[&](const std::vector<uint8_t> &wire)->bool {
+		const auto started=std::chrono::steady_clock::now();const int mode=envi("MIDZ_HOST_FUTURE",nullptr,0);
+		cruisn::zeus_wide::Packet packet;
+		if(!mirror_fbo || !depth_mirror.wide || (mode!=1 && mode!=2) ||
+			!cruisn::zeus_wide::decode(wire.data(),wire.size(),packet) || packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
+		// The ring dispatcher has finished buffered sky copies. Commit them to
+		// both original/private targets before any future geometry is inserted.
+		flush();std::vector<uint8_t> material;
+		if(!cruisn::zeus_host::encode(packet.materials,material) || !private_materials(material))return false;
+		auto read_texture=[&](uint texture,unsigned format,unsigned type) {
+			std::vector<uint8_t> bytes(size_t(fw)*fh*4);
+			gl.ActiveTexture(TEXTURE0+7);gl.BindTexture(0x0de1,texture);gl.PixelStorei(0x0d05,1);
+			gl.GetTexImage(0x0de1,0,format,type,bytes.data());return bytes;
+		};
+		std::vector<uint8_t> before_color,before_depth,original_color,original_depth;
+		if(packet.materials.snapshot) {
+			before_color=read_texture(mirror_color,RGBA,0x1401);before_depth=read_texture(mirror_depth,DEPTH_COMPONENT,0x1406);
+			original_color=read_texture(fbTex,RGBA,0x1401);original_depth=read_texture(depthTex,DEPTH_COMPONENT,0x1405);
+		}
+		uint64_t hash=14695981039346656037ull;size_t vertices=0;
+		for(const auto &q:packet.quads) {
+			const auto *bytes=reinterpret_cast<const uint8_t *>(&q.polygon);
+			for(size_t i=0;i<sizeof(q.polygon);++i){hash^=bytes[i];hash*=1099511628211ull;}
+		}
+		if(packet.draw && !packet.quads.empty()) {
+			std::vector<float> floats;std::vector<uint32_t> integers;std::vector<Batch> own_batches;
+			floats.reserve(packet.quads.size()*42);integers.reserve(packet.quads.size()*60);
+			for(const auto &q:packet.quads) {
+				const auto &s=q.polygon.state;const auto flags=s[9];
+				const bool blend=(flags&2)!=0,dtest=(flags&8)!=0,dwrite=(flags&16)!=0 && !(flags&128);
+				const bool same=!own_batches.empty() && own_batches.back().blend==blend && own_batches.back().dtest==dtest &&
+					own_batches.back().dwrite==dwrite && own_batches.back().rowbase==int(s[11]) && std::equal(own_batches.back().clip,own_batches.back().clip+4,s.begin()+13);
+				if(!same) {
+					if(!own_batches.empty())own_batches.back().count=int(floats.size()/7)-own_batches.back().first;
+					own_batches.push_back({int(floats.size()/7),0,blend,dtest,dwrite,true,int(s[11]),{int(s[13]),int(s[14]),int(s[15]),int(s[16])}});
+				}
+				const uint32_t meta[10]={flags,(s[3]*8)&0xffffff,s[4],s[2]&0xffff,s[6],s[5],q.palette,s[7],s[8],s[10]};
+				for(unsigned i=2;i<s[1];++i)for(unsigned index:{0u,i-1,i}) {
+					const auto &v=q.polygon.vertices[index];floats.insert(floats.end(),{v[0],v[1],float(s[11]),v[2],v[3],v[4],v[5]});
+					integers.insert(integers.end(),meta,meta+10);
+				}
+			}
+			vertices=floats.size()/7;if(!own_batches.empty())own_batches.back().count=int(vertices)-own_batches.back().first;
+			gl.UseProgram(mirror_prog);gl.BindVertexArray(vao);
+			gl.BindBuffer(ARRAY_BUFFER,vbo_f);gl.BufferData(ARRAY_BUFFER,floats.size()*4,floats.data(),STREAM_DRAW);
+			gl.BindBuffer(ARRAY_BUFFER,vbo_u);gl.BufferData(ARRAY_BUFFER,integers.size()*4,integers.data(),STREAM_DRAW);
+			gl.BindFramebuffer(FRAMEBUFFER,mirror_fbo);gl.Viewport(0,0,fw,fh);
+			gl.Enable(GLDEPTH_TEST);gl.Enable(GLSCISSOR_TEST);gl.BlendFunc(GLONE,GLSRC_ALPHA);
+			gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"waveram"),4);gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"palTex"),5);
+			gl.ActiveTexture(TEXTURE0+4);gl.BindTexture(0x0de1,private_wave_tex);gl.ActiveTexture(TEXTURE0+5);gl.BindTexture(0x0de1,private_palette_tex);
+			for(const auto &b:own_batches) {
+				if(b.blend)gl.Enable(GLBLEND);else gl.Disable(GLBLEND);
+				gl.DepthFunc(b.dtest?GLLEQUAL:GLALWAYS);gl.DepthMask(b.dwrite);gl.ColorMask(1,1,1,1);
+				gl.Scissor(0,(b.rowbase+b.clip[1])*S,fw,(b.clip[3]-b.clip[1]+1)*S);gl.DrawArrays(0x0004,b.first,b.count);
+			}
+			gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"waveram"),0);gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"palTex"),1);
+		}
+		gl.Disable(GLBLEND);gl.Disable(GLSCISSOR_TEST);gl.DepthMask(1);gl.ColorMask(1,1,1,1);gl.BindFramebuffer(FRAMEBUFFER,0);gl.UseProgram(prog);
+		if(packet.materials.snapshot) {
+			auto after_color=read_texture(mirror_color,RGBA,0x1401),after_depth=read_texture(mirror_depth,DEPTH_COMPONENT,0x1406);
+			if(original_color!=read_texture(fbTex,RGBA,0x1401) || original_depth!=read_texture(depthTex,DEPTH_COMPONENT,0x1405))return false;
+			auto save=[&](const char *suffix,std::vector<uint8_t> bytes) {
+				cruisn::CaptureWriter::Request request;request.path="exotica-future-"+std::to_string(packet.materials.frame)+suffix;request.bitmap=std::move(bytes);
+				return future_writer.submit(std::move(request),capture_paced?10000:0,&s_capture_pacing);
+			};
+			if(!save("-before-color.bin",std::move(before_color)) || !save("-before-depth.bin",std::move(before_depth)) ||
+				!save("-after-color.bin",std::move(after_color)) || !save("-after-depth.bin",std::move(after_depth)))return false;
+			++future_snapshots;
+		}
+		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0de1,waveTex);gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0de1,palTex);gl.ActiveTexture(TEXTURE0);
+		if(gl.GetError())return false;
+		if(!future_log) {
+			future_log=fopen("exotica-future-gpu.csv","w");if(!future_log)return false;setvbuf(future_log,nullptr,_IOFBF,65536);
+			fprintf(future_log,"scene,frame,mode,multiplier,page,quads,vertices,bytes,hash,snapshot,host_us\n");
+		}
+		const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
+		if(fprintf(future_log,"%llu,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%u,%.3f\n",(unsigned long long)packet.materials.scene,
+			packet.materials.frame,unsigned(mode),packet.multiplier,packet.page,unsigned(packet.quads.size()),(unsigned long long)vertices,
+			(unsigned long long)wire.size(),(unsigned long long)hash,unsigned(packet.materials.snapshot),elapsed)<0)return false;
+		++future_packets;future_quads+=packet.quads.size();return true;
+	};
+
 	std::vector<uint8_t> rec;
     uint32_t completed_frame = 0;
     double completed_seconds = 0;
@@ -1721,6 +1807,9 @@ void thread_main()
 					zlogf("private material validation/upload failed after %llu packets",(unsigned long long)private_packets);
 				}
 				break;
+			case 9:
+				if(!private_future(rec)) {private_failed=true;s_stopz.store(true);zlogf("private future validation/draw failed after %llu packets",(unsigned long long)future_packets);}
+				break;
 			case 8:
 				if(!private_margin(rec)) {
 					private_failed=true;s_stopz.store(true);
@@ -1949,6 +2038,14 @@ void thread_main()
 			(unsigned long long)stats.peak_bytes,(unsigned long long)stats.write_total_us,(unsigned long long)stats.write_max_us,(unsigned long long)stats.drain_us,
 			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
 	}
+	if(envi("MIDZ_HOST_FUTURE",nullptr,0)) {
+		const auto stats=future_writer.finish();const int closed=future_log?fclose(future_log):-1;
+		const bool complete=!private_failed && future_packets && future_packets==private_packets && !closed &&
+			stats.submitted==4*future_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
+		fprintf(stderr,"MIDZ_HOST_FUTURE_GPU_RESULT complete=%u scenes=%llu quads=%llu snapshots=%llu written=%llu failed=%llu rejected=%llu\n",
+			unsigned(complete),(unsigned long long)future_packets,(unsigned long long)future_quads,(unsigned long long)future_snapshots,
+			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
+	}
 	if(depth_mirror.stream_frame) {
 		const auto stats=stream_writer.finish();
 		const bool complete=stream_complete && !stream_failed && !stream_active && stats.submitted==3 && stats.written==3 && !stats.failed && !stats.rejected;
@@ -2068,6 +2165,17 @@ void stop()
 
 }   // namespace mzgl
 #endif   // _WIN32
+
+bool zeus2_device::midz_host_future(const uint8_t *data, size_t size)
+{
+#ifdef OSD_WINDOWS
+	const char *mode=std::getenv("MIDZ_HOST_FUTURE"),*ffb=std::getenv("MIDV_FFB"),*mirror=std::getenv("MIDZ_DEPTH_MIRROR");
+	if(midz_live && mode && (!strcmp(mode,"1") || !strcmp(mode,"2")) && ffb && !strcmp(ffb,"0") && mirror && !strcmp(mirror,"2") &&
+		!std::getenv("MIDZ_DEPTH_STREAM_FRAME") && data && size>=cruisn::zeus_wide::header_bytes && size<=cruisn::zeus_wide::maximum_bytes)
+		return mzgl::ring_push2(9,data,uint32_t(size),nullptr,0);
+#endif
+	return false;
+}
 
 bool zeus2_device::midz_host_materials(const uint8_t *data, size_t size)
 {

@@ -36,6 +36,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/zeus_host_materials.h"
 #include "cruisn/exotica_active_capture.h"
 #include "cruisn/zeus_margin_packet.h"
+#include "cruisn/zeus_wide_packet.h"
 #include "cruisn/zeus_resource_lease.h"
 
 #include <algorithm>
@@ -213,6 +214,7 @@ private:
 	FILE *m_scene_log=nullptr;
 	uint32_t m_scene_first=0,m_scene_last=0,m_scene_multiplier=1,m_scene_cpu_frame=0;
 	uint64_t m_scene_serial=0;
+	uint32_t m_scene_future_mode=0;
 	double m_scene_cpu_time=0;
 	bool m_scene_open=false,m_scene_armed=false,m_scene_bounds=false;
 	std::array<uint32_t,3> m_scene_camera{};
@@ -402,6 +404,13 @@ void crusnexo_state::scene_observer_start()
 			m_zeus->midz_host_wave_enable();
 			fprintf(stderr,"MIDZ_HOST_MATERIAL_PAGES=%u\n",m_scene_material_pages);
 		}
+	}
+	m_scene_future_mode=number("MIDZ_HOST_FUTURE",0,2,0);
+	if(m_scene_future_mode) {
+		const char *mirror=std::getenv("MIDZ_DEPTH_MIRROR");
+		if(!m_scene_material_image || m_active_mode || !m_zeus->midz_live || !mirror || strcmp(mirror,"2") || std::getenv("MIDZ_DEPTH_STREAM_FRAME"))
+			fatalerror("Exotica future drawing requires private materials/wide mirror and no late margins/command journal\n");
+		fprintf(stderr,"MIDZ_HOST_FUTURE=%u\n",m_scene_future_mode);
 	}
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
@@ -656,7 +665,28 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		auto &wire=material_wire;
 		if(!cruisn::zeus_host::encode(packet,wire))fatalerror("Exotica private material packet rejected\n");
 		const auto material_encoded=std::chrono::steady_clock::now();
-		if(!m_zeus->midz_host_materials(wire.data(),wire.size()))fatalerror("Exotica private material queue rejected\n");
+		if(m_scene_future_mode) {
+			cruisn::zeus_wide::Packet future;
+			future.materials=packet;future.margin=uint32_t(m_scene_margin);future.page=p.context.render[4];
+			future.multiplier=m_scene_multiplier;future.draw=m_scene_future_mode==2;
+			for(size_t i=0;i<scene.instances.size();++i) {
+				const auto &instance=scene.instances[i];
+				for(size_t j=0;j<instance.quad_count;++j) {
+					cruisn::zeus_wide::Quad q;q.polygon=scene.quads[instance.first_quad+j];q.palette=palettes.instance_rows[i];
+					if(!cruisn::zeus_wide::depth_range(q.polygon,p.frame,future.page))fatalerror("Exotica future range/state rejected frame%u instance%u quad%u\n",p.frame,unsigned(i),unsigned(j));
+					future.quads.push_back(q);
+				}
+			}
+			std::vector<uint8_t> encoded;
+			if(!cruisn::zeus_wide::encode(future,encoded) || !m_zeus->midz_host_future(encoded.data(),encoded.size()))
+				fatalerror("Exotica future owned queue rejected\n");
+			if(packet.snapshot) {
+				const auto name="exotica-future-"+std::to_string(p.frame)+".xwd";
+				FILE *file=fopen(name.c_str(),"wb");if(!file)fatalerror("Exotica future packet snapshot open\n");
+				const bool saved=fwrite(encoded.data(),1,encoded.size(),file)==encoded.size();const int closed=fclose(file);
+				if(!saved || closed)fatalerror("Exotica future packet snapshot write\n");
+			}
+		} else if(!m_zeus->midz_host_materials(wire.data(),wire.size()))fatalerror("Exotica private material queue rejected\n");
 		const auto material_queued=std::chrono::steady_clock::now();
 		if(!m_scene_material_image->apply(packet.wave))fatalerror("Exotica private material producer commit rejected\n");
 		// No emulated writes can occur between staging and this emulation-thread commit.
