@@ -189,14 +189,20 @@ private:
 	uint32_t scene_read(uint32_t address);
 	struct ScenePending {
 		cruisn::exotica_scene::Parameters parameters;
-		uint32_t base=0,count=0,bank=0,object=0;
+		uint32_t base=0,count=0,bank=0,object=0,scene_frame=0;
+		uint64_t scene=0;
+		double scene_time=0;
 		double time=0;
 		std::array<float,3> translation{};
 	};
 	std::deque<ScenePending> m_scene_pending;
-	memory_passthrough_handler m_scene_ready_tap,m_scene_begin_tap,m_scene_end_tap;
+	memory_passthrough_handler m_scene_ready_tap,m_scene_begin_tap,m_scene_end_tap,m_scene_marker_tap,m_scene_lists_tap;
 	FILE *m_scene_log=nullptr;
-	uint32_t m_scene_first=0,m_scene_last=0,m_scene_multiplier=1,m_scene_prepared_frame=UINT32_MAX;
+	uint32_t m_scene_first=0,m_scene_last=0,m_scene_multiplier=1,m_scene_cpu_frame=0;
+	uint64_t m_scene_serial=0;
+	double m_scene_cpu_time=0;
+	bool m_scene_open=false,m_scene_armed=false;
+	std::array<uint32_t,3> m_scene_camera{};
 	uint32_t m_scene_loading=0;
 	float m_scene_margin=88;
 	std::set<uint32_t> m_scene_snapshots;
@@ -338,8 +344,32 @@ void crusnexo_state::scene_observer_start()
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
 	setvbuf(m_scene_log,nullptr,_IOFBF,65536);
-	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles\n");
+	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time\n");
 	auto &space=m_maincpu->space(AS_PROGRAM);
+	// Native refreshes can split one game's scene. Latch its actual scene/list
+	// boundary, then join only the first supported original scenery submission.
+	m_scene_marker_tap=space.install_write_tap(0xff2,0xff2,"exotica_host_scene_begin",
+		[this](offs_t offset,uint32_t &data,uint32_t mask) {
+			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x67f6)return;
+			if(m_scene_open || data!=UINT32_MAX)fatalerror("Exotica host scene begin order\n");
+			m_scene_cpu_frame=uint32_t(m_screen->frame_number());m_scene_cpu_time=machine().time().as_double();
+			m_scene_open=true;m_scene_armed=false;++m_scene_serial;
+			for(unsigned i=0;i<3;++i)m_scene_camera[i]=m_ram_base[0xfeb+i];
+		});
+	m_scene_lists_tap=space.install_read_tap(0xbbb5,0xbbb9,"exotica_host_scene_lists",
+		[this](offs_t offset,uint32_t &data,uint32_t mask) {
+			if(machine().side_effects_disabled())return;
+			const auto pc=m_maincpu->state_int(TMS320C3X_PC);
+			if(offset==0xbbb5 && pc==0x6820) {
+				if(!m_scene_open || m_scene_armed || m_ram_base[0x67f5]!=0x15200ff2 ||
+					m_ram_base[0x681f]!=0x082fbbb5 || m_ram_base[0x6835]!=0x082fbbb9)
+					fatalerror("Exotica host scene list signature/order\n");
+				m_scene_armed=m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last;
+			} else if(offset==0xbbb9 && pc==0x6836) {
+				if(!m_scene_open)fatalerror("Exotica host scene end order\n");
+				m_scene_open=false;m_scene_armed=false;
+			}
+		});
 	m_scene_ready_tap=space.install_read_tap(0xb47d,0xb47d,"exotica_host_ready",
 		[this](offs_t offset,uint32_t &data,uint32_t mask) {
 			if(!machine().side_effects_disabled() && !m_scene_busy && m_maincpu->state_int(TMS320C3X_PC)==0x6964)
@@ -367,11 +397,13 @@ void crusnexo_state::scene_observer_start()
 void crusnexo_state::scene_observer_prepare()
 {
 	const uint32_t frame=uint32_t(m_screen->frame_number());
-	if(frame<m_scene_first || frame>m_scene_last || frame==m_scene_prepared_frame)return;
+	if(!m_scene_armed)return;
 	const uint32_t flags=uint32_t(m_maincpu->state_int(TMS320C3X_R6));
 	if(flags&0x80 || ((flags&3)!=0 && (flags&3)!=3))return;
 	const auto cycles=m_maincpu->total_cycles();m_scene_busy=true;
 	ScenePending pending;auto &p=pending.parameters;p.frame=frame;p.multiplier=m_scene_multiplier;p.margin=m_scene_margin;
+	pending.scene=m_scene_serial;pending.scene_frame=m_scene_cpu_frame;pending.scene_time=m_scene_cpu_time;
+	if(frame<m_scene_cpu_frame || frame>m_scene_cpu_frame+1)fatalerror("Exotica host scenery preparation frame\n");
 	pending.object=uint32_t(m_maincpu->state_int(TMS320C3X_AR7));
 	if(pending.object<0x1000 || uint64_t(pending.object)+0x94>0x40000 || m_scene_pending.size()>=16)
 		fatalerror("Exotica host object/queue bounds\n");
@@ -380,7 +412,10 @@ void crusnexo_state::scene_observer_prepare()
 		read(0x67c0)!=0x87ff3e || !cruisn::exotica_future::code_matches(read))
 		fatalerror("Exotica host code/camera signature\n");
 	for(unsigned i=0;i<32;++i)p.setup.object[i]=read(pending.object+i);
-	for(unsigned i=0;i<3;++i)p.camera[i]=read(0xfeb+i);
+	for(unsigned i=0;i<3;++i) {
+		p.camera[i]=read(0xfeb+i);
+		if(p.camera[i]!=m_scene_camera[i])fatalerror("Exotica host scene preparation camera changed\n");
+	}
 	for(unsigned i=0;i<9;++i){p.view[i]=read(read(0x67bf)+i);p.alternate[i]=read(read(0x67c0)+i);}
 	p.scale=read(0x67db);p.setup.palette_setup=read(0x15f2);
 	for(unsigned i=0;i<12;++i)p.setup.constants[i]=read(0x67d0+i);
@@ -407,7 +442,7 @@ void crusnexo_state::scene_observer_prepare()
 	pending.base=read(selected+3);pending.count=read(selected+4);pending.bank=m_disk_asic_jr[5]&3;
 	if(!pending.base || pending.count>0xc800 || pending.bank>2)fatalerror("Exotica host original model/bank\n");
 	pending.time=machine().time().as_double();m_scene_pending.push_back(std::move(pending));
-	m_scene_prepared_frame=frame;++m_scene_prepared;
+	m_scene_armed=false;++m_scene_prepared;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica host preparation changed CPU cycles\n");
 	m_scene_busy=false;
 }
@@ -432,7 +467,8 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	if(p.frame<cpu_frame || p.frame>cpu_frame+1 || pending.bank!=(m_disk_asic_jr[5]&3))
 		fatalerror("Exotica host source/device frame or bank changed\n");
 	auto read=[&](uint32_t address){return scene_read(address);};
-	for(unsigned i=0;i<3;++i)if(p.camera[i]!=read(0xfeb+i))fatalerror("Exotica host live camera changed\n");
+	for(unsigned i=0;i<3;++i)if(p.camera[i]!=read(0xfeb+i))fatalerror("Exotica host live camera changed: scene=%llu scene_frame=%u cpu_frame=%u frame=%u axis=%u before=%08x after=%08x cpu_time=%.12f device_time=%.12f\n",
+		(unsigned long long)pending.scene,pending.scene_frame,cpu_frame,p.frame,i,p.camera[i],read(0xfeb+i),pending.time,now);
 	for(unsigned i=0;i<9;++i)if(p.view[i]!=read(read(0x67bf)+i) || p.alternate[i]!=read(read(0x67c0)+i))
 		fatalerror("Exotica host live view changed\n");
 	for(unsigned i=0;i<12;++i)if(p.setup.constants[i]!=read(0x67d0+i))fatalerror("Exotica host setup constants changed\n");
@@ -480,10 +516,11 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica host assembly changed CPU cycles\n");
 	const auto finished=std::chrono::steady_clock::now();
 	auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
-	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0\n",
+	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f\n",
 		p.frame,cpu_frame,pending.time,now,base,count,pending.bank,c.render[4],p.multiplier,unsigned(m_scene_loading!=0),
 		unsigned(sources.sources.size()),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(scene.viewport_polygons),
-		(unsigned long long)hash,us(started,ready),us(ready,built),us(built,hashed),us(hashed,finished))<0)
+		(unsigned long long)hash,us(started,ready),us(ready,built),us(built,hashed),us(hashed,finished),
+		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time)<0)
 		fatalerror("Exotica host scene log write\n");
 	++m_scene_matched;m_scene_quads+=scene.quads.size();
 }
