@@ -147,6 +147,8 @@ public:
 	// No observer is installed in ordinary launches.
 	void set_midz_model_observer(std::function<void(uint32_t,uint32_t,uint32_t)> observer)
 	{ m_midz_model_observer=std::move(observer); }
+	// Owned, bounded private texture uploads only; no original GPU resource writes.
+	bool midz_host_materials(const uint8_t *data, size_t size);
 
 	uint32_t m_zeusbase[0x80];
 	uint32_t m_renderRegs[0x50];

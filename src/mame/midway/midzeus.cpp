@@ -31,6 +31,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/hud_drivetrain.h"
 #include "cruisn/exotica_visibility.h"
 #include "cruisn/exotica_scene_capture.h"
+#include "cruisn/zeus_host_materials.h"
 
 #include <algorithm>
 #include <chrono>
@@ -208,6 +209,8 @@ private:
 	std::set<uint32_t> m_scene_snapshots;
 	uint64_t m_scene_prepared=0,m_scene_matched=0,m_scene_quads=0,m_scene_saved=0;
 	bool m_scene_busy=false,m_scene_rom_saved=false;
+	std::unique_ptr<cruisn::zeus_host::WaveImage> m_scene_material_image;
+	FILE *m_scene_material_log=nullptr;
 
 	void visibility_start();
 	void visibility_guard();
@@ -326,6 +329,14 @@ void crusnexo_state::scene_observer_start()
 	m_scene_last=number("MIDZ_HOST_LAST",1800,16000,0);
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
+	if(number("MIDZ_HOST_MATERIALS",0,1,0)) {
+		m_scene_material_image=std::make_unique<cruisn::zeus_host::WaveImage>();
+		m_scene_material_log=fopen("exotica-host-materials.csv","w");
+		if(!m_scene_material_log)fatalerror("Cannot create Exotica material log\n");
+		setvbuf(m_scene_material_log,nullptr,_IOFBF,65536);
+		fprintf(m_scene_material_log,"scene,frame,generation,pages,palettes,bytes,hash,stage_us,encode_us,queue_us,commit_us\n");
+		fprintf(stderr,"MIDZ_HOST_MATERIALS=1\n");
+	}
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
 		memregion("maindata")->bytes()!=0x800000 || memregion("bankeddata")->bytes()!=0x3000000 ||
@@ -345,7 +356,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
 	setvbuf(m_scene_log,nullptr,_IOFBF,65536);
-	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds\n");
+	fprintf(m_scene_log,"frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds,materials_us\n");
 	auto &space=m_maincpu->space(AS_PROGRAM);
 	// Native refreshes can split one game's scene. Latch its actual scene/list
 	// boundary, then join only the first supported original scenery submission.
@@ -496,6 +507,34 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	const auto built=std::chrono::steady_clock::now();
 	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
 	const auto hashed=std::chrono::steady_clock::now();
+	std::vector<uint8_t> material_wire;
+	if(m_scene_material_image) {
+		const auto material_start=std::chrono::steady_clock::now();
+		cruisn::zeus_host::Packet packet;
+		packet.frame=p.frame;packet.scene=pending.scene;packet.snapshot=m_scene_snapshots.count(p.frame)!=0;
+		const auto *wave=reinterpret_cast<const uint8_t *>(z.m_waveram.get());
+		cruisn::zeus_host::PaletteSet palettes;
+		if(!cruisn::zeus_host::palettes(scene.instances,wave,0x1000000,palettes) ||
+			!m_scene_material_image->stage(wave,0x1000000,packet.wave))
+			fatalerror("Exotica private material ownership rejected\n");
+		packet.rows=std::move(palettes.rows);
+		const auto material_staged=std::chrono::steady_clock::now();
+		auto &wire=material_wire;
+		if(!cruisn::zeus_host::encode(packet,wire))fatalerror("Exotica private material packet rejected\n");
+		const auto material_encoded=std::chrono::steady_clock::now();
+		if(!m_zeus->midz_host_materials(wire.data(),wire.size()))fatalerror("Exotica private material queue rejected\n");
+		const auto material_queued=std::chrono::steady_clock::now();
+		if(!m_scene_material_image->apply(packet.wave))fatalerror("Exotica private material producer commit rejected\n");
+		const auto material_committed=std::chrono::steady_clock::now();
+		auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+		if(fprintf(m_scene_material_log,"%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f\n",
+			(unsigned long long)pending.scene,p.frame,(unsigned long long)packet.wave.generation,
+			unsigned(packet.wave.pages.size()),unsigned(packet.rows.size()),unsigned(wire.size()),
+			(unsigned long long)packet.wave.result_hash,us(material_start,material_staged),us(material_staged,material_encoded),
+			us(material_encoded,material_queued),us(material_queued,material_committed))<0)
+			fatalerror("Exotica material log write\n");
+	}
+	const auto materials_done=std::chrono::steady_clock::now();
 	if(m_scene_snapshots.erase(p.frame)) {
 		auto dump=[](const std::string &name,const void *data,size_t bytes) {
 			FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open Exotica host snapshot\n");
@@ -512,17 +551,18 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		dump(prefix+"-context.bin",parameters.data(),parameters.size()*4);
 		dump(prefix+"-ram.bin",m_ram_base.target(),m_ram_base.bytes());
 		dump(prefix+"-wave.bin",z.m_waveram.get(),0x1000000);
+		if(!material_wire.empty())dump(prefix+"-materials.bin",material_wire.data(),material_wire.size());
 		dump(prefix+"-quads.bin",scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
 		dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));++m_scene_saved;
 	}
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica host assembly changed CPU cycles\n");
 	const auto finished=std::chrono::steady_clock::now();
 	auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
-	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f,%u,%u\n",
+	if(fprintf(m_scene_log,"%u,%u,%.12f,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,0,%llu,%u,%.12f,%u,%u,%.3f\n",
 		p.frame,cpu_frame,pending.time,now,base,count,pending.bank,c.render[4],p.multiplier,unsigned(m_scene_loading!=0),
 		unsigned(sources.sources.size()),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(scene.viewport_polygons),
-		(unsigned long long)hash,us(started,ready),us(ready,built),us(built,hashed),us(hashed,finished),
-		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time,unsigned(p.frustum_bounds),unsigned(scene.culled_bounds))<0)
+		(unsigned long long)hash,us(started,ready),us(ready,built),us(built,hashed),us(materials_done,finished),
+		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time,unsigned(p.frustum_bounds),unsigned(scene.culled_bounds),us(hashed,materials_done))<0)
 		fatalerror("Exotica host scene log write\n");
 	++m_scene_matched;m_scene_quads+=scene.quads.size();
 }
@@ -530,6 +570,12 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_scene_material_log) {
+		if(fclose(m_scene_material_log))fatalerror("Exotica material log close\n");
+		m_scene_material_log=nullptr;
+		fprintf(stderr,"MIDZ_HOST_MATERIALS_RESULT queued=%llu hash=%016llx\n",
+			(unsigned long long)m_scene_material_image->generation(),(unsigned long long)m_scene_material_image->image_hash());
+	}
 	m_zeus->set_midz_model_observer({});
 	const int closed=fclose(m_scene_log);m_scene_log=nullptr;
 	const bool complete=!closed && m_scene_prepared && m_scene_prepared==m_scene_matched &&

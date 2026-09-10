@@ -11,6 +11,7 @@
 #include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
 #include "../../mame/midway/cruisn/zeus_margin_clear.h"
 #include "../../mame/midway/cruisn/zeus_sky_repeat.h"
+#include "../../mame/midway/cruisn/zeus_host_materials.h"
 
 #include "screen.h"
 
@@ -374,6 +375,8 @@ struct GL
 	void (WINAPI *TexParameteri)(unsigned, unsigned, int);
 	void (WINAPI *TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
 	void (WINAPI *TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+	void (WINAPI *GetTexImage)(unsigned, int, unsigned, unsigned, void *);
+	void (WINAPI *DeleteTextures)(int, const uint *);
 	void (WINAPI *PixelStorei)(unsigned, int);
 	void (WINAPI *DrawArrays)(unsigned, int, int);
 	void (WINAPI *Enable)(unsigned);
@@ -440,6 +443,7 @@ struct GL
 		L(GenTextures, "glGenTextures") L(BindTexture, "glBindTexture")
 		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
 		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
+		L(GetTexImage, "glGetTexImage") L(DeleteTextures, "glDeleteTextures")
 		L(DrawArrays, "glDrawArrays") L(Enable, "glEnable")
 		L(Disable, "glDisable") L(Scissor, "glScissor")
 		L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
@@ -501,11 +505,11 @@ struct FrameTick { uint32_t base, frame; double seconds; };
 static std::atomic<uint32_t> s_drops_quad{0}, s_drops_state{0};   // ring overflow accounting (midz_gl.log)
 static std::atomic<bool> s_wave_resync{false};   // a waveram span was lost: re-emit the FULL waveram at the next flush
 
-static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
+static bool ring_push2(uint32_t type, const void *p1, uint32_t n1,
 		const void *p2, uint32_t n2)
 {
 	if (!s_on.load(std::memory_order_relaxed) || s_stopz.load(std::memory_order_relaxed))
-		return;
+		return false;
 	uint32_t const bytes = n1 + n2;
 	uint64_t w = s_rw.load(std::memory_order_relaxed);
 	uint64_t r = s_rr.load(std::memory_order_acquire);
@@ -540,7 +544,7 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 				s_presented_frame.load(), type, (unsigned long long)need, (unsigned long long)(w-r),
 				(unsigned long long)RING, (unsigned long long)(r-initial_r),
 				(unsigned long long)(now-started), phase, (unsigned long long)phase_ms);
-			return;
+			return false;
 		}
 	}
 	auto put = [&](const void *src, uint32_t n)
@@ -558,6 +562,7 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 	if (n2) put(p2, n2);
 	w = (w + 7) & ~7ull;
 	s_rw.store(w, std::memory_order_release);
+	return true;
 }
 
 static FILE *s_zlog;
@@ -882,6 +887,92 @@ void thread_main()
 	};
 	std::vector<Batch> batches;
 	static uint8_t *wave_mirror = (uint8_t *)calloc(1, 16u << 20);
+	std::unique_ptr<cruisn::zeus_host::WaveImage> private_image;
+	uint private_wave_tex=0,private_palette_tex=0;
+	uint64_t private_scene=0,private_packets=0,private_snapshots=0;
+	uint32_t private_frame=0;
+	FILE *private_log=nullptr;
+	bool private_failed=false;
+	auto private_materials=[&](const std::vector<uint8_t> &wire)->bool {
+		using namespace cruisn::zeus_host;
+		const auto start=std::chrono::steady_clock::now();
+		const char *enabled=std::getenv("MIDZ_HOST_MATERIALS");
+		const char *ffb=std::getenv("MIDV_FFB");
+		if(!enabled || strcmp(enabled,"1") || !ffb || strcmp(ffb,"0"))return false;
+		Packet packet;
+		if(!decode(wire.data(),wire.size(),packet) || packet.scene<=private_scene || packet.frame<private_frame)return false;
+		if(!private_image)private_image=std::make_unique<WaveImage>();
+		if(!accept(packet,*private_image))return false;
+		const auto decoded=std::chrono::steady_clock::now();
+		if(!private_log) {
+			private_log=fopen("exotica-host-materials-gpu.csv","w");
+			if(!private_log)return false;
+			setvbuf(private_log,nullptr,_IOFBF,65536);
+			fprintf(private_log,"scene,frame,generation,pages,palettes,bytes,hash,decode_us,upload_us,snapshot_us\n");
+		}
+		if(gl.GetError()) {zlogf("private materials: preexisting OpenGL error");return false;}
+		std::vector<uint8_t> original_wave_before,original_palette_before;
+		auto texture_bytes=[&](uint texture,std::size_t bytes,unsigned type) {
+			std::vector<uint8_t> data(bytes);
+			gl.ActiveTexture(TEXTURE0+4);gl.BindTexture(0x0DE1,texture);
+			gl.PixelStorei(0x0D05 /*PACK_ALIGNMENT*/,1);
+			gl.GetTexImage(0x0DE1,0,RED_INTEGER,type,data.data());
+			return data;
+		};
+		if(packet.snapshot) {
+			original_wave_before=texture_bytes(waveTex,16777216,0x1401);
+			original_palette_before=texture_bytes(palTex,256*256*4,0x1405);
+			if(gl.GetError())return false;
+		}
+		gl.ActiveTexture(TEXTURE0+4);
+		if(!private_wave_tex)private_wave_tex=make_tex(4096,4096,R8UI,RED_INTEGER,0x1401);
+		gl.BindTexture(0x0DE1,private_wave_tex);
+		// A 4KB page is one texture row. Merge consecutive changed rows;
+		// upload from the checked owned image, never from live game memory.
+		for(std::size_t i=0;i<packet.wave.pages.size();) {
+			const auto first=packet.wave.pages[i].index;std::size_t end=i+1;
+			while(end<packet.wave.pages.size() && packet.wave.pages[end].index==packet.wave.pages[end-1].index+1)++end;
+			gl.TexSubImage2D(0x0DE1,0,0,int(first),4096,int(end-i),RED_INTEGER,0x1401,
+				private_image->bytes().data()+std::size_t(first)*4096);
+			i=end;
+		}
+		std::vector<uint32_t> colors;
+		colors.reserve(packet.rows.size()*256);
+		for(const auto &row:packet.rows)colors.insert(colors.end(),row.colors.begin(),row.colors.end());
+		gl.ActiveTexture(TEXTURE0+5);
+		if(!private_palette_tex)private_palette_tex=make_tex(256,int(max_palettes),R32UI,RED_INTEGER,0x1405);
+		gl.BindTexture(0x0DE1,private_palette_tex);
+		if(!colors.empty())gl.TexSubImage2D(0x0DE1,0,0,0,256,int(packet.rows.size()),RED_INTEGER,0x1405,colors.data());
+		if(gl.GetError()) {zlogf("private materials: OpenGL upload failed");return false;}
+		const auto uploaded=std::chrono::steady_clock::now();
+		if(packet.snapshot) {
+			const auto wave=texture_bytes(private_wave_tex,16777216,0x1401);
+			const auto palettes=texture_bytes(private_palette_tex,256*max_palettes*4,0x1405);
+			const auto original_wave_after=texture_bytes(waveTex,16777216,0x1401);
+			const auto original_palette_after=texture_bytes(palTex,256*256*4,0x1405);
+			if(gl.GetError() || wave!=private_image->bytes() ||
+				(!colors.empty() && memcmp(palettes.data(),colors.data(),colors.size()*4)) ||
+				original_wave_before!=original_wave_after || original_palette_before!=original_palette_after)return false;
+			auto save=[](const std::string &name,const void *data,size_t bytes) {
+				FILE *file=fopen(name.c_str(),"wb");if(!file)return false;
+				const bool written=fwrite(data,1,bytes,file)==bytes;const int closed=fclose(file);
+				return written && !closed;
+			};
+			const auto prefix="exotica-host-"+std::to_string(packet.frame);
+			if(!save(prefix+"-gpu-wave.bin",wave.data(),wave.size()) ||
+				!save(prefix+"-gpu-palettes.bin",palettes.data(),colors.size()*4))return false;
+			++private_snapshots;
+		}
+		gl.ActiveTexture(TEXTURE0);
+		const auto finished=std::chrono::steady_clock::now();
+		auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+		if(fprintf(private_log,"%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f\n",
+			(unsigned long long)packet.scene,packet.frame,(unsigned long long)packet.wave.generation,
+			unsigned(packet.wave.pages.size()),unsigned(packet.rows.size()),unsigned(wire.size()),
+			(unsigned long long)packet.wave.result_hash,us(start,decoded),us(decoded,uploaded),us(uploaded,finished))<0)return false;
+		private_scene=packet.scene;private_frame=packet.frame;++private_packets;
+		return true;
+	};
 	uint32_t pal_slot = 0;
 	bool const palette_trace = std::getenv("MIDZ_PALETTE_GUARD") != nullptr;
 	bool const palette_guard = envi("MIDZ_PALETTE_GUARD", nullptr, 0) != 0;
@@ -1174,7 +1265,7 @@ void thread_main()
 			r = (r + 7) & ~7ull;
 			// Finish before changing palettes/uploads/pages or presenting. Stored
 			// tiles retain the current material only within this uninterrupted span.
-			if (sky_enabled && hdr[0]!=1 && !sky_quads.empty()) finish_sky();
+			if (sky_enabled && hdr[0]!=1 && hdr[0]!=7 && !sky_quads.empty()) finish_sky();
 			switch (hdr[0])
 			{
 			case 1:
@@ -1294,7 +1385,14 @@ void thread_main()
                     }
                 }
 				break;
+			case 7:
+				if(!private_materials(rec)) {
+					private_failed=true;s_stopz.store(true);
+					zlogf("private material validation/upload failed after %llu packets",(unsigned long long)private_packets);
+				}
+				break;
 			}
+            if(private_failed)break;
             if (frame_ready) break; // never consume the next frame before presenting this one
 		}
 		s_rr.store(r, std::memory_order_release);
@@ -1496,6 +1594,14 @@ void thread_main()
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
 
+	if(private_log) {
+		if(fclose(private_log))private_failed=true;
+		fprintf(stderr,"MIDZ_HOST_MATERIALS_GPU_RESULT complete=%u received=%llu snapshots=%llu hash=%016llx\n",
+			unsigned(!private_failed),(unsigned long long)private_packets,(unsigned long long)private_snapshots,
+			(unsigned long long)private_image->image_hash());
+	}
+	if(private_wave_tex)gl.DeleteTextures(1,&private_wave_tex);
+	if(private_palette_tex)gl.DeleteTextures(1,&private_palette_tex);
 	const auto capture_stats = snapshot_writer.finish();
 	if (snapdir) {
 		std::fprintf(stderr, "MIDZ_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu paced=%u waits=%llu wait_us=%llu\n",
@@ -1584,6 +1690,18 @@ void stop()
 
 }   // namespace mzgl
 #endif   // _WIN32
+
+bool zeus2_device::midz_host_materials(const uint8_t *data, size_t size)
+{
+#ifdef _WIN32
+	const char *enabled=std::getenv("MIDZ_HOST_MATERIALS");
+	const char *ffb=std::getenv("MIDV_FFB");
+	if(midz_live && enabled && !strcmp(enabled,"1") && ffb && !strcmp(ffb,"0") &&
+		data && size>=cruisn::zeus_host::packet_header_bytes && size<=cruisn::zeus_host::maximum_material_bytes)
+		return mzgl::ring_push2(7,data,uint32_t(size),nullptr,0);
+#endif
+	return false;
+}
 
 void zeus2_device::midz_screen_hook(bool completed)
 {
