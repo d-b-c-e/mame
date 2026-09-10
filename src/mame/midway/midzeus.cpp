@@ -430,7 +430,7 @@ void crusnexo_state::scene_observer_start()
 		m_active_log=fopen("exotica-active-scenes.csv","w");
 		if(!m_active_log)fatalerror("Cannot create Exotica active-scene log\n");
 		setvbuf(m_active_log,nullptr,_IOFBF,65536);
-		fprintf(m_active_log,"scene,scene_frame,frame,ready_frame,objects,candidates,already_submitted,instances,quads,excluded_raster,hash,guest_cycles,assembly_us,materials_us,sealed_frame,camera_advanced,changed_objects,binding_checks,seal_us,bindings_advanced,model_checks,model_bytes,palette_checks,texture_pages,lease_us\n");
+		fprintf(m_active_log,"scene,scene_frame,frame,ready_frame,objects,candidates,already_submitted,instances,quads,excluded_raster,hash,guest_cycles,assembly_us,materials_us,sealed_frame,camera_advanced,changed_objects,binding_checks,seal_us,bindings_advanced,model_checks,model_bytes,palette_checks,texture_pages,lease_us,ram_models\n");
 		m_active_ram.resize(m_ram_base.bytes()/4);
 		m_active_wave.resize(cruisn::zeus_lease::wave_bytes);
 		m_active_submission_tap=space.install_write_tap(0x46e,0x46e,"exotica_active_original_submission",
@@ -445,6 +445,7 @@ void crusnexo_state::scene_observer_start()
 		fprintf(stderr,"MIDZ_HOST_ACTIVE=%u\n",m_active_mode);
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_SEALED=1\n");
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_RESOURCE_LEASE=1\n");
+		fprintf(stderr,"MIDZ_HOST_ACTIVE_RAM_MODELS=1\n");
 	}
 	// Native refreshes can split one game's scene. Latch its actual scene/list
 	// boundary, then join only the first supported original scenery submission.
@@ -939,11 +940,12 @@ void crusnexo_state::scene_active_ready()
 	}
 	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active completion changed CPU cycles\n");
-	if(fprintf(m_active_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0,%.3f,%.3f,%u,%u,%u,%u,%.3f,%u,%u,%llu,%u,%u,%.3f\n",
+	const auto ram_models=std::count_if(scene.instances.begin(),scene.instances.end(),[](const auto &s){return s.descriptor<0x40000;});
+	if(fprintf(m_active_log,"%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0,%.3f,%.3f,%u,%u,%u,%u,%.3f,%u,%u,%llu,%u,%u,%.3f,%u\n",
 		(unsigned long long)m_scene_fence_scene,m_scene_fence_scene_frame,p.frame,unsigned(m_screen->frame_number()),
 		unsigned(selected.objects),unsigned(selected.candidates),unsigned(selected.already_submitted),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(excluded),
 		(unsigned long long)hash,us(started,assembled),us(assembled,committed),m_scene_fence_end_frame,unsigned(camera_advanced),changed_objects,binding_checks,m_active_seal_us,
-		bindings_advanced,unsigned(model_checks),(unsigned long long)model_bytes,unsigned(scene.instances.size()),unsigned(coverage.count()),lease_us)<0)fatalerror("Exotica active scene log write\n");
+		bindings_advanced,unsigned(model_checks),(unsigned long long)model_bytes,unsigned(scene.instances.size()),unsigned(coverage.count()),lease_us,unsigned(ram_models))<0)fatalerror("Exotica active scene log write\n");
 	++m_active_scenes;m_active_quads+=scene.quads.size();
 }
 
