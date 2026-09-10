@@ -455,6 +455,23 @@ static uint8_t *s_ringbuf = nullptr;
 static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
 static std::atomic<uint32_t> s_presented_frame{0};
+// Host-only diagnostics. A single atomic preserves the phase/start-time pair
+// when the emulation thread observes backpressure from the GL consumer.
+static bool s_phase_trace = false;
+static std::atomic<uint64_t> s_phase_stamp{0};
+enum { PHASE_OTHER, PHASE_READBACK, PHASE_FILE, PHASE_SWAP, PHASE_COUNT };
+static const char *phase_name(unsigned phase)
+{
+	static const char *names[] = { "other", "readback", "file", "swap" };
+	return phase < PHASE_COUNT ? names[phase] : "unknown";
+}
+static uint64_t begin_phase(unsigned phase)
+{
+	if (!s_phase_trace) return 0;
+	const uint64_t now = GetTickCount64();
+	s_phase_stamp.store((now << 8) | phase, std::memory_order_relaxed);
+	return now;
+}
 static std::atomic<int> s_zpause{0};
 static std::atomic<double> s_secs{0.0};   // machine time, published by screen_update for the GL thread
 static std::thread s_thread;
@@ -474,6 +491,7 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 	uint64_t const need = 8 + ((uint64_t(bytes) + 7) & ~7ull);
 	if (w - r + need > RING)
 	{
+		const uint64_t initial_r = r, started = GetTickCount64();
 		// Quads, clears and direct writes all mutate persistent framebuffer/depth
 		// state. Losing any one of them cannot be repaired by a texture refresh.
 		for (int i = 0; i < 500 && w - r + need > RING; ++i)
@@ -481,11 +499,23 @@ static void ring_push2(uint32_t type, const void *p1, uint32_t n1,
 			Sleep(1);
 			r = s_rr.load(std::memory_order_acquire);
 		}
+		const uint64_t stamp = s_phase_stamp.load(std::memory_order_relaxed);
+		const uint64_t now = GetTickCount64();
+		const char *phase = stamp ? phase_name(unsigned(stamp & 255)) : "unmeasured";
+		const uint64_t phase_ms = stamp ? now - (stamp >> 8) : 0;
+		if (s_phase_trace && now - started >= 50)
+			osd_printf_info("MIDZ stream wait: presented=%u type=%u need=%llu queued=%llu consumer_bytes=%llu wait_ms=%llu phase=%s phase_ms=%llu\n",
+				s_presented_frame.load(), type, (unsigned long long)need, (unsigned long long)(w-r),
+				(unsigned long long)(r-initial_r), (unsigned long long)(now-started), phase, (unsigned long long)phase_ms);
 		if (w - r + need > RING)
 		{
 			s_drops_state.fetch_add(1);
 			s_stopz.store(true);
-			osd_printf_error("MIDZ render stream failed: consumer timeout; native presentation fallback\n");
+			osd_printf_error("MIDZ render stream failed: consumer timeout; native presentation fallback; "
+				"presented=%u type=%u need=%llu queued=%llu capacity=%llu consumer_bytes=%llu wait_ms=%llu phase=%s phase_ms=%llu\n",
+				s_presented_frame.load(), type, (unsigned long long)need, (unsigned long long)(w-r),
+				(unsigned long long)RING, (unsigned long long)(r-initial_r),
+				(unsigned long long)(now-started), phase, (unsigned long long)phase_ms);
 			return;
 		}
 	}
@@ -995,6 +1025,18 @@ void thread_main()
 	std::vector<uint8_t> rec;
     uint32_t completed_frame = 0;
     double completed_seconds = 0;
+    uint64_t phase_calls[PHASE_COUNT]{}, phase_total[PHASE_COUNT]{}, phase_max[PHASE_COUNT]{};
+    auto finish_phase = [&](unsigned phase, uint64_t started)
+    {
+        if (!s_phase_trace) return;
+        const uint64_t elapsed = GetTickCount64() - started;
+        ++phase_calls[phase]; phase_total[phase] += elapsed;
+        phase_max[phase] = std::max(phase_max[phase], elapsed);
+        begin_phase(PHASE_OTHER);
+        if (elapsed >= 50)
+            zlogf("slow phase: completed_frame=%u phase=%s elapsed_ms=%llu",
+                completed_frame, phase_name(phase), (unsigned long long)elapsed);
+    };
     // Explicit diagnostic fault injection. Physical outputs stay off in replay.
     int const stop_frame = envi("MIDZ_GL_STOP_FRAME",nullptr,-1);
     FILE *snap_index = nullptr;
@@ -1374,7 +1416,10 @@ void thread_main()
 			// This destination has tight RGB rows. The default four-byte pack
 			// alignment pads odd-width rows and can write beyond the allocation.
 			gl.PixelStorei(0x0D05 /*GL_PACK_ALIGNMENT*/, 1);
+			const uint64_t read_began = begin_phase(PHASE_READBACK);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0, 0x1401, px.data());
+			finish_phase(PHASE_READBACK, read_began);
+			const uint64_t file_began = begin_phase(PHASE_FILE);
 			char path[512];
 			if (menu_test_capture) snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
 			else snprintf(path, sizeof(path), "%s\\mzgl_%03d.bmp", snapdir, snap_n++);
@@ -1413,8 +1458,11 @@ void thread_main()
                 fflush(snap_index);
                 }
 			}
+			finish_phase(PHASE_FILE, file_began);
 		}
+		const uint64_t swap_began = begin_phase(PHASE_SWAP);
 		SwapBuffers(dc);
+		finish_phase(PHASE_SWAP, swap_began);
 		if (frame_ready) s_presented_frame.store(completed_frame);
 		if (!vsync)
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
@@ -1430,6 +1478,11 @@ void thread_main()
 		}
 	}
 	if (snap_index) fclose(snap_index);
+	if (s_phase_trace)
+		for (unsigned phase = PHASE_READBACK; phase < PHASE_COUNT; ++phase)
+			fprintf(stderr,"MIDZ_GL_TIMING phase=%s calls=%llu total_ms=%llu max_ms=%llu\n",
+				phase_name(phase), (unsigned long long)phase_calls[phase],
+				(unsigned long long)phase_total[phase], (unsigned long long)phase_max[phase]);
 	if (palette_trace)
 		fprintf(stderr,"MIDZ_PALETTE_RESULT guard=%d conflicts=%llu flushes=%llu\n",
 			int(palette_guard),(unsigned long long)palette_conflicts,(unsigned long long)palette_flushes);
@@ -1460,6 +1513,9 @@ void start()
 	s_stopz.store(false);
 	s_donez.store(false);
 	s_presented_frame.store(0);
+	s_phase_trace = std::getenv("MIDZ_GL_LOG") != nullptr;
+	s_phase_stamp.store(0);
+	begin_phase(PHASE_OTHER);
 	s_on.store(true);
 	s_thread = std::thread(thread_main);
 }
