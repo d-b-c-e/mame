@@ -740,7 +740,7 @@ void crusnexo_state::scene_active_list(uint32_t entry,uint32_t head)
 		if(p.camera[i]!=m_scene_camera[i])fatalerror("Exotica active list camera changed\n");
 	}
 	for(unsigned i=0;i<9;++i){p.view[i]=read(read(0x67bf)+i);p.alternate[i]=read(read(0x67c0)+i);}
-	for(unsigned i=0;i<14;++i)p.constants[i]=read(0x67ce+i);
+	for(unsigned i=0;i<14;++i)p.constants[i]=read(0x67ce + i);
 	if(!m_active_capture.capture(entry,head,p,read))
 		fatalerror("Exotica active list rejected at scene%llu frame%u entry%08x\n",(unsigned long long)m_scene_serial,m_scene_cpu_frame,entry);
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active list changed CPU cycles\n");
@@ -782,7 +782,7 @@ void crusnexo_state::scene_active_ready()
 		const auto &owned=list.parameters;
 		if(owned.camera!=p.camera || owned.view!=p.view || owned.alternate!=p.alternate ||
 			owned.mode!=read(0x75) || owned.projection_table!=read(0x67cc))fatalerror("Exotica active captured list dependencies changed\n");
-		for(unsigned i=0;i<14;++i)if(owned.constants[i]!=read(0x67ce+i))fatalerror("Exotica active captured projection constants changed\n");
+		for(unsigned i=0;i<14;++i)if(owned.constants[i]!=read(0x67ce + i))fatalerror("Exotica active captured projection constants changed\n");
 		cruisn::exotica_scene::Result part;
 		if(!cruisn::exotica_scene::build_active(list.sources,p,read,model_read,part))
 			fatalerror("Exotica active current geometry rejected at frame%u scene%llu\n",p.frame,(unsigned long long)m_scene_fence_scene);
