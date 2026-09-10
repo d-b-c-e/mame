@@ -2168,7 +2168,7 @@ void stop()
 
 bool zeus2_device::midz_host_future(const uint8_t *data, size_t size)
 {
-#ifdef OSD_WINDOWS
+#ifdef _WIN32
 	const char *mode=std::getenv("MIDZ_HOST_FUTURE"),*ffb=std::getenv("MIDV_FFB"),*mirror=std::getenv("MIDZ_DEPTH_MIRROR");
 	if(midz_live && mode && (!strcmp(mode,"1") || !strcmp(mode,"2")) && ffb && !strcmp(ffb,"0") && mirror && !strcmp(mirror,"2") &&
 		!std::getenv("MIDZ_DEPTH_STREAM_FRAME") && data && size>=cruisn::zeus_wide::header_bytes && size<=cruisn::zeus_wide::maximum_bytes)
