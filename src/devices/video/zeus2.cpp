@@ -1371,6 +1371,9 @@ void thread_main()
             (completed_frame % s_snap_every) == 0 && snap_n < s_snap_max)))
 		{
 			std::vector<uint8_t> px(size_t(cw) * ch * 3);
+			// This destination has tight RGB rows. The default four-byte pack
+			// alignment pads odd-width rows and can write beyond the allocation.
+			gl.PixelStorei(0x0D05 /*GL_PACK_ALIGNMENT*/, 1);
 			gl.ReadPixels(0, 0, cw, ch, 0x80E0, 0x1401, px.data());
 			char path[512];
 			if (menu_test_capture) snprintf(path, sizeof(path), "%s\\menu_%02d.bmp", snapdir, menu_test_step);
