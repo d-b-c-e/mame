@@ -790,6 +790,24 @@ void crusnexo_state::scene_active_ready()
 		return scene_read(address);
 	};
 	auto p=m_active_seed;p.multiplier=1;p.complete_fade=false;p.early_depth=1;
+	auto reject=[&](const char *kind,uint32_t detail0=0,uint32_t detail1=0) {
+		// First failure only (fatal below), bounded raw diagnostic files. The
+		// same owned operands let the offline oracle locate the rejected source.
+		auto dump=[](const std::string &name,const void *data,size_t bytes) {
+			FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open active failure snapshot\n");
+			const bool ok=fwrite(data,1,bytes,f)==bytes;const int closed=fclose(f);
+			if(!ok || closed)fatalerror("Cannot complete active failure snapshot\n");
+		};
+		const auto prefix="exotica-active-failure-"+std::to_string(p.frame);
+		const auto parameters=cruisn::exotica_scene::parameter_words(p,m_active_seed_bank,m_active_sealed_loading);
+		dump(prefix+"-context.bin",parameters.data(),parameters.size()*4);
+		dump(prefix+"-ram.bin",m_active_ram.data(),m_active_ram.size()*4);
+		dump(prefix+"-ready-ram.bin",m_ram_base.target(),m_ram_base.bytes());
+		dump(prefix+"-end-internal.bin",m_active_internal.data(),m_active_internal.size()*4);
+		dump(prefix+"-end-wave.bin",m_active_wave.data(),m_active_wave.size());
+		dump(prefix+"-wave.bin",m_zeus->m_waveram.get(),m_active_wave.size());
+		fatalerror("Exotica active %s rejected: frame%u scene%llu detail%08x/%08x\n",kind,p.frame,(unsigned long long)m_scene_fence_scene,detail0,detail1);
+	};
 	for(unsigned i=0;i<3;++i)if(p.camera[i]!=read(0xfeb+i))fatalerror("Exotica active completion camera changed\n");
 	for(unsigned i=0;i<9;++i)if(p.view[i]!=read(read(0x67bf)+i) || p.alternate[i]!=read(read(0x67c0)+i))
 		fatalerror("Exotica active completion view changed\n");
@@ -826,7 +844,7 @@ void crusnexo_state::scene_active_ready()
 		if(offset>4*1024*1024 || n>4*1024*1024-offset)return false;
 		const auto check_started=std::chrono::steady_clock::now();
 		if(!cruisn::zeus_lease::model_equal(m_active_wave.data(),wave,m_active_wave.size(),address,size))
-			fatalerror("Exotica active model bytes changed: scene%llu base%08x count%u\n",(unsigned long long)m_scene_fence_scene,address,size);
+			reject("model bytes",address,size);
 		lease_us+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-check_started).count();
 		++model_checks;model_bytes+=n*4;
 		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);return true;
@@ -839,7 +857,7 @@ void crusnexo_state::scene_active_ready()
 		for(unsigned i=0;i<14;++i)if(owned.constants[i]!=read(0x67ce + i))fatalerror("Exotica active captured projection constants changed\n");
 		cruisn::exotica_scene::Result part;
 		if(!cruisn::exotica_scene::build_active(list.sources,p,read,model_read,part))
-			fatalerror("Exotica active current geometry rejected at frame%u scene%llu\n",p.frame,(unsigned long long)m_scene_fence_scene);
+			reject("current geometry",0xbbb5+unsigned(&list-selected.lists.data()));
 		for(auto instance:part.instances) {
 			bool valid=true;
 			for(size_t j=0;j<instance.quad_count;++j)
@@ -855,10 +873,10 @@ void crusnexo_state::scene_active_ready()
 	cruisn::zeus_lease::Coverage coverage;
 	for(const auto &quad:scene.quads)if(!coverage.add(quad))fatalerror("Exotica active texture footprint rejected\n");
 	if(!coverage.equal(m_active_wave.data(),wave,m_active_wave.size()))
-		fatalerror("Exotica active texture bytes changed: scene%llu\n",(unsigned long long)m_scene_fence_scene);
+		reject("texture bytes");
 	for(const auto &instance:scene.instances)
 		if(!cruisn::zeus_lease::palette_equal(m_active_wave.data(),wave,m_active_wave.size(),instance.palette))
-			fatalerror("Exotica active palette bytes changed: scene%llu base%08x\n",(unsigned long long)m_scene_fence_scene,instance.palette);
+			reject("palette bytes",instance.palette);
 	lease_us+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-check_started).count();
 	const auto assembled=std::chrono::steady_clock::now();
 	cruisn::zeus_host::PaletteSet palettes;
