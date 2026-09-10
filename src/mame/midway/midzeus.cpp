@@ -32,6 +32,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/exotica_visibility.h"
 #include "cruisn/exotica_scene_capture.h"
 #include "cruisn/exotica_source_cache.h"
+#include "cruisn/command_ring_fence.h"
 #include "cruisn/zeus_host_materials.h"
 
 #include <algorithm>
@@ -179,6 +180,7 @@ protected:
 
 	virtual void machine_reset() override
 	{
+		if(m_scene_fence_requests)fatalerror("Exotica command-fence diagnostic cannot cross machine reset\n");
 		midzeus2_state::machine_reset();
 		visibility_reset();
 	}
@@ -188,6 +190,9 @@ private:
 	void scene_observer_prepare();
 	void scene_observer_model(uint32_t base,uint32_t count,uint32_t yscale);
 	void scene_observer_exit();
+	void scene_fence_end();
+	void scene_fence_word(bool empty);
+	void scene_fence_ready(bool immediate);
 	uint32_t scene_read(uint32_t address);
 	struct ScenePending {
 		cruisn::exotica_scene::Parameters parameters;
@@ -219,6 +224,13 @@ private:
 	std::unique_ptr<cruisn::exotica_future::CachedSources> m_scene_source_cache;
 	uint32_t m_scene_depth_mode=0;
 	uint64_t m_scene_depth_tests=0,m_scene_depth_verified=0,m_scene_depth_skipped=0;
+	using SceneFence=cruisn::CommandRingFence<0x30000,0x2000>;
+	SceneFence m_scene_fence;
+	FILE *m_scene_fence_log=nullptr;
+	bool m_scene_fence_selected=false;
+	uint64_t m_scene_fence_requests=0,m_scene_fence_completed=0,m_scene_fence_immediate=0,m_scene_fence_scene=0;
+	uint32_t m_scene_fence_scene_frame=0,m_scene_fence_end_frame=0,m_scene_fence_consumer=0,m_scene_fence_words=0;
+	double m_scene_fence_end_time=0;
 
 	void visibility_start();
 	void visibility_guard();
@@ -338,6 +350,14 @@ void crusnexo_state::scene_observer_start()
 	m_scene_multiplier=number("MIDZ_HOST_MULTIPLIER",1,3,1);
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
 	m_scene_depth_mode=number("MIDZ_HOST_EARLY_DEPTH",0,2,0);
+	if(number("MIDZ_HOST_FENCE",0,1,0)) {
+		m_scene_fence_log=fopen("exotica-host-fences.csv","w");
+		if(!m_scene_fence_log)fatalerror("Cannot create Exotica command-fence log\n");
+		setvbuf(m_scene_fence_log,nullptr,_IOFBF,65536);
+		fprintf(m_scene_fence_log,"scene,scene_frame,end_frame,end_time,ready_frame,ready_time,consumer,target,words,immediate,guest_cycles,page\n");
+		m_zeus->set_midz_fifo_observer([this](bool empty){scene_fence_word(empty);});
+		fprintf(stderr,"MIDZ_HOST_FENCE=1\n");
+	}
 	if(m_scene_depth_mode)fprintf(stderr,"MIDZ_HOST_EARLY_DEPTH=%u\n",m_scene_depth_mode);
 	m_scene_source_mode=number("MIDZ_HOST_SOURCE_CACHE",0,2,0);
 	if(m_scene_source_mode) {
@@ -388,7 +408,7 @@ void crusnexo_state::scene_observer_start()
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x67f6)return;
 			if(m_scene_open || data!=UINT32_MAX)fatalerror("Exotica host scene begin order\n");
 			m_scene_cpu_frame=uint32_t(m_screen->frame_number());m_scene_cpu_time=machine().time().as_double();
-			m_scene_open=true;m_scene_armed=false;++m_scene_serial;
+			m_scene_open=true;m_scene_armed=false;m_scene_fence_selected=false;++m_scene_serial;
 			for(unsigned i=0;i<3;++i)m_scene_camera[i]=m_ram_base[0xfeb+i];
 		});
 	m_scene_lists_tap=space.install_read_tap(0xbbb5,0xbbb9,"exotica_host_scene_lists",
@@ -402,6 +422,7 @@ void crusnexo_state::scene_observer_start()
 				m_scene_armed=m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last;
 			} else if(offset==0xbbb9 && pc==0x6836) {
 				if(!m_scene_open)fatalerror("Exotica host scene end order\n");
+				if(m_scene_fence_log && m_scene_fence_selected)scene_fence_end();
 				m_scene_open=false;m_scene_armed=false;
 			}
 		});
@@ -478,7 +499,7 @@ void crusnexo_state::scene_observer_prepare()
 	pending.base=read(selected+3);pending.count=read(selected+4);pending.bank=m_disk_asic_jr[5]&3;
 	if(!pending.base || pending.count>0xc800 || pending.bank>2)fatalerror("Exotica host original model/bank\n");
 	pending.time=machine().time().as_double();m_scene_pending.push_back(std::move(pending));
-	m_scene_armed=false;++m_scene_prepared;
+	m_scene_armed=false;m_scene_fence_selected=true;++m_scene_prepared;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica host preparation changed CPU cycles\n");
 	m_scene_busy=false;
 }
@@ -626,9 +647,56 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	++m_scene_matched;m_scene_quads+=scene.quads.size();
 }
 
+void crusnexo_state::scene_fence_end()
+{
+	const auto cycles=m_maincpu->total_cycles();
+	const uint32_t code[][2]={{0xb472,0x880000},{0xb681,0x0828046d},{0xb684,0x08403001},{0xb685,0x15400608},{0xb686,0x1528046d}};
+	for(const auto &word:code)if(m_ram_base[word[0]]!=word[1])fatalerror("Exotica command-ring signature\n");
+	m_scene_fence_scene=m_scene_serial;m_scene_fence_scene_frame=m_scene_cpu_frame;
+	m_scene_fence_end_frame=uint32_t(m_screen->frame_number());m_scene_fence_end_time=machine().time().as_double();
+	m_scene_fence_consumer=m_ram_base[0x46d];
+	const auto status=m_scene_fence.begin(m_scene_fence_consumer,m_ram_base[0x46e],m_zeus->midz_fifo_empty());
+	if(status==SceneFence::Status::invalid)fatalerror("Exotica command-fence request/partial boundary\n");
+	m_scene_fence_words=m_scene_fence.remaining();++m_scene_fence_requests;
+	if(status==SceneFence::Status::ready)scene_fence_ready(true);
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica command-fence request changed CPU cycles\n");
+}
+
+void crusnexo_state::scene_fence_word(bool empty)
+{
+	if(!m_scene_fence_log || !m_scene_fence.pending() || machine().side_effects_disabled())return;
+	if(m_maincpu->state_int(TMS320C3X_PC)!=0xb686)return;
+	const auto cycles=m_maincpu->total_cycles();
+	const auto status=m_scene_fence.consumed(uint32_t(m_maincpu->state_int(TMS320C3X_AR0)),empty);
+	if(status==SceneFence::Status::invalid)fatalerror("Exotica command-fence consumer order/partial boundary\n");
+	if(status==SceneFence::Status::ready)scene_fence_ready(false);
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica command-fence completion changed CPU cycles\n");
+}
+
+void crusnexo_state::scene_fence_ready(bool immediate)
+{
+	const auto frame=uint32_t(m_screen->frame_number());const double now=machine().time().as_double();
+	if(m_scene_fence.pending() || !m_zeus->midz_fifo_empty() || frame<m_scene_fence_end_frame ||
+		frame>m_scene_fence_end_frame+1 || now<m_scene_fence_end_time || now-m_scene_fence_end_time>=.0176)
+		fatalerror("Exotica command-fence completion clock\n");
+	if(fprintf(m_scene_fence_log,"%llu,%u,%u,%.12f,%u,%.12f,%u,%u,%u,%u,0,%u\n",
+		(unsigned long long)m_scene_fence_scene,m_scene_fence_scene_frame,m_scene_fence_end_frame,m_scene_fence_end_time,
+		frame,now,m_scene_fence_consumer,m_scene_fence.target(),m_scene_fence_words,unsigned(immediate),m_zeus->m_renderRegs[4])<0)
+		fatalerror("Exotica command-fence log write\n");
+	++m_scene_fence_completed;m_scene_fence_immediate+=immediate;
+}
+
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_scene_fence_log) {
+		m_zeus->set_midz_fifo_observer({});
+		const int closed=fclose(m_scene_fence_log);m_scene_fence_log=nullptr;
+		const bool complete=!closed && !m_scene_fence.pending() && m_scene_fence_requests==m_scene_matched &&
+			m_scene_fence_completed==m_scene_fence_requests && m_scene_fence_requests;
+		fprintf(stderr,"MIDZ_HOST_FENCE_RESULT complete=%u requested=%llu completed=%llu immediate=%llu\n",unsigned(complete),
+			(unsigned long long)m_scene_fence_requests,(unsigned long long)m_scene_fence_completed,(unsigned long long)m_scene_fence_immediate);
+	}
 	if(m_scene_depth_mode)fprintf(stderr,"MIDZ_HOST_EARLY_DEPTH_RESULT mode=%u tested=%llu verified=%llu skipped=%llu\n",
 		m_scene_depth_mode,(unsigned long long)m_scene_depth_tests,(unsigned long long)m_scene_depth_verified,(unsigned long long)m_scene_depth_skipped);
 	if(m_scene_source_cache)fprintf(stderr,"MIDZ_HOST_SOURCE_CACHE_RESULT mode=%u verified=%llu hits=%llu misses=%llu\n",

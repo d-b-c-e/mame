@@ -2218,6 +2218,7 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 		/* set the interrupt signal to indicate we can handle more */
 		// Not sure how much to time to put here
 		int_timer->adjust(attotime::from_usec(20));
+		if(m_midz_fifo_observer)m_midz_fifo_observer(zeus_fifo_words==0);
 		break;
 
 	case 0x10:

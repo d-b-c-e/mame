@@ -148,6 +148,11 @@ public:
 	// No observer is installed in ordinary launches.
 	void set_midz_model_observer(std::function<void(uint32_t,uint32_t,uint32_t)> observer)
 	{ m_midz_model_observer=std::move(observer); }
+	// Runs after the original FIFO word has been processed and any original
+	// polygon records queued. No callback is installed in ordinary launches.
+	void set_midz_fifo_observer(std::function<void(bool)> observer)
+	{ m_midz_fifo_observer=std::move(observer); }
+	bool midz_fifo_empty() const { return zeus_fifo_words==0; }
 	// Owned, bounded private texture uploads only; no original GPU resource writes.
 	bool midz_host_materials(const uint8_t *data, size_t size);
 	// Emulation-thread-only notifications, independent of original upload spans.
@@ -204,6 +209,7 @@ protected:
 
 private:
 	std::function<void(uint32_t,uint32_t,uint32_t)> m_midz_model_observer;
+	std::function<void(bool)> m_midz_fifo_observer;
 	std::unique_ptr<cruisn::WrittenPages<0x1000000,4096>> m_host_wave_pages;
 	TIMER_CALLBACK_MEMBER(int_timer_callback);
 	void zeus2_register32_w(offs_t offset, uint32_t data, int logit);
