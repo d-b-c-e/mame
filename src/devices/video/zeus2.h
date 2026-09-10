@@ -160,7 +160,15 @@ public:
 	void midz_host_wave_enable() { m_host_wave_pages=std::make_unique<cruisn::WrittenPages<0x1000000,4096>>(); }
 	std::vector<uint32_t> midz_host_wave_pages() const { return m_host_wave_pages ? m_host_wave_pages->pages() : std::vector<uint32_t>(); }
 	void midz_host_wave_commit() { if(m_host_wave_pages)m_host_wave_pages->clear(); }
-	void midz_host_wave_postload() { if(m_host_wave_pages)m_host_wave_pages->mark_all(); }
+	void midz_active_wave_enable() {
+		m_active_wave_pages=std::make_unique<cruisn::WrittenPages<0x1000000,4096>>();m_active_wave_pages->mark_all();
+	}
+	std::vector<uint32_t> midz_active_wave_pages() const { return m_active_wave_pages ? m_active_wave_pages->pages() : std::vector<uint32_t>(); }
+	void midz_active_wave_commit() { if(m_active_wave_pages)m_active_wave_pages->clear(); }
+	void midz_host_wave_postload() {
+		if(m_host_wave_pages)m_host_wave_pages->mark_all();
+		if(m_active_wave_pages)m_active_wave_pages->mark_all();
+	}
 
 	uint32_t m_zeusbase[0x80];
 	uint32_t m_renderRegs[0x50];
@@ -212,6 +220,7 @@ private:
 	std::function<void(uint32_t,uint32_t,uint32_t)> m_midz_model_observer;
 	std::function<void(bool)> m_midz_fifo_observer;
 	std::unique_ptr<cruisn::WrittenPages<0x1000000,4096>> m_host_wave_pages;
+	std::unique_ptr<cruisn::WrittenPages<0x1000000,4096>> m_active_wave_pages;
 	TIMER_CALLBACK_MEMBER(int_timer_callback);
 	void zeus2_register32_w(offs_t offset, uint32_t data, int logit);
 	void zeus2_register_update(offs_t offset, uint32_t oldval, int logit);

@@ -2077,6 +2077,7 @@ void zeus2_device::midz_wave_dirty(uint32_t addr41)
 		+ ((addr41 >> 16) % WAVERAM0_HEIGHT) * WAVERAM0_WIDTH;
 	uint32_t const off = block * 8;
 	if(m_host_wave_pages && !m_host_wave_pages->mark(off,8))fatalerror("Exotica private WaveRAM write outside image\n");
+	if(m_active_wave_pages && !m_active_wave_pages->mark(off,8))fatalerror("Exotica sealed WaveRAM write outside image\n");
 	if (off < s_wave_lo) s_wave_lo = off;
 	if (off + 8 > s_wave_hi) s_wave_hi = off + 8;
 }
