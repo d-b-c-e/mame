@@ -38,6 +38,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/zeus_margin_packet.h"
 #include "cruisn/zeus_wide_packet.h"
 #include "cruisn/zeus_resource_lease.h"
+#include "cruisn/scenery_lifetimes.h"
 
 #include <algorithm>
 #include <chrono>
@@ -180,16 +181,44 @@ protected:
 		save_item(NAME(m_crusnexo_leds_select));
 		visibility_start();
 		scene_observer_start();
+		lifetime_start();
 	}
 
 	virtual void machine_reset() override
 	{
+		if(m_lifetime_started)fatalerror("Exotica lifetime diagnostic cannot cross machine reset\n");
 		if(m_scene_fence_requests)fatalerror("Exotica command-fence diagnostic cannot cross machine reset\n");
 		midzeus2_state::machine_reset();
 		visibility_reset();
 	}
 
 private:
+
+	void lifetime_start();
+	bool lifetime_scope();
+	void lifetime_exit();
+	void lifetime_emit(char event,uint32_t slot,uint64_t generation,uint64_t owner,
+		const cruisn::scenery_lifetimes::Key &key,uint32_t reason,uint32_t flags);
+	bool lifetime_slot(uint32_t slot)const;
+	cruisn::scenery_lifetimes::Registry m_lifetimes;
+	struct LifetimePending {
+		unsigned kind=0;uint32_t slot=0,old_head=0,new_head=0,count=0,base=0;
+		double time=0,head_time=0;
+	} m_lifetime_pending;
+	struct LifetimeOwner {
+		cruisn::scenery_lifetimes::Handle handle;uint64_t serial=0;
+		bool faded=false,opaque=false;
+	};
+	std::map<uint32_t,LifetimeOwner> m_lifetime_owners;
+	uint32_t m_lifetime_first=0,m_lifetime_last=0,m_lifetime_owner_slot=0,m_lifetime_owner_source=0,m_lifetime_owner_entry=0;
+	uint32_t m_lifetime_initial_head=0,m_lifetime_initial_count=0;
+	bool m_lifetime_started=false;
+	uint64_t m_lifetime_records=0,m_lifetime_bindings=0,m_lifetime_emissions=0,m_lifetime_owned=0;
+	uint64_t m_lifetime_first_draws=0,m_lifetime_fading_draws=0,m_lifetime_opaque=0,m_lifetime_draw_records=0;
+	FILE *m_lifetime_log=nullptr;
+	memory_passthrough_handler m_lifetime_head_tap,m_lifetime_count_tap,m_lifetime_reset_tap;
+	memory_passthrough_handler m_lifetime_owner_tap,m_lifetime_ready_tap,m_lifetime_submit_tap;
+
 	void scene_observer_start();
 	void scene_observer_prepare();
 	void scene_observer_model(uint32_t base,uint32_t count,uint32_t yscale);
@@ -354,6 +383,193 @@ uint32_t crusnexo_state::scene_read(uint32_t address)
 		return m_maincpu->space(AS_PROGRAM).read_dword(address);
 	}
 	fatalerror("Exotica host read outside captured RAM/ROM contract: %08x\n",address);
+}
+
+// Explicit read-only original allocation/submission observation. The reusable
+// registry carries identities only; this driver adapter checks real guest code,
+// free-list/count transactions, reset rebuilding and original model commits.
+bool crusnexo_state::lifetime_slot(uint32_t slot)const
+{
+	return slot>=0x1000 && uint64_t(slot)+31<=0x40000 && (slot+31<=0x30000 || slot>=0x32000);
+}
+
+void crusnexo_state::lifetime_emit(char event,uint32_t slot,uint64_t generation,uint64_t owner,
+	const cruisn::scenery_lifetimes::Key &key,uint32_t reason,uint32_t flags)
+{
+	if(!m_lifetime_log || ++m_lifetime_records>200000)fatalerror("Exotica lifetime record budget\n");
+	if(fprintf(m_lifetime_log,"%c,%u,%.17g,%llu,%llu,%llu,%u,%llu,%llu,%u,%u,%u,%u\n",
+		event,unsigned(m_screen->frame_number()),machine().time().as_double(),
+		(unsigned long long)m_lifetimes.sequence(),(unsigned long long)m_lifetimes.epoch(),
+		(unsigned long long)generation,slot,(unsigned long long)owner,(unsigned long long)key.realm,
+		key.section,key.source,reason,flags)<0)fatalerror("Exotica lifetime write failed\n");
+}
+
+bool crusnexo_state::lifetime_scope()
+{
+	if(machine().side_effects_disabled())return false;
+	const auto frame=m_screen->frame_number();
+	if(frame<m_lifetime_first || frame>m_lifetime_last)return false;
+	if(!m_lifetime_started) {
+		const std::pair<uint32_t,uint32_t> signatures[]={
+			{0xbbf6,0x152010a8},{0xbbf9,0x152010a9},{0xbc64,0x152a10a8},{0xbc67,0x152010a9},
+			{0xbbc7,0x086004b0},{0xbbc8,0x152010a9},{0xbbcc,0x1549c000},{0xbbce,0x0269001f},
+			{0xbbd4,0x1540c000},{0xbbcb,0x087b04af},{0xbbcf,0x6400bbd2},{0xbbd0,0x1549c000},
+			{0xbbd1,0x08080009},{0xbbd2,0x0269001f},{0xb859,0x082267c4},{0xb8cb,0x0840041d},
+			{0x696f,0x152d046e},{0x6963,0x0820b47d}};
+		for(const auto &s:signatures)if(m_ram_base[s.first]!=s.second)fatalerror("Exotica lifetime code signature %x\n",s.first);
+		cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
+		if(!m_lifetimes.start(layout,true))fatalerror("Exotica lifetime initialization\n");
+		m_lifetime_initial_head=m_ram_base[0x10a8];m_lifetime_initial_count=m_ram_base[0x10a9];
+		if((m_lifetime_initial_head && !lifetime_slot(m_lifetime_initial_head)) || m_lifetime_initial_count>4096)
+			fatalerror("Exotica initial pool bounds\n");
+		m_lifetime_started=true;
+		lifetime_emit('L',m_lifetime_initial_head,0,0,{},m_lifetime_initial_count,0);
+	}
+	return true;
+}
+
+void crusnexo_state::lifetime_start()
+{
+	const char *mode=std::getenv("MIDZ_LIFETIME");
+	if(!mode || !strcmp(mode,"0"))return;
+	const char *ffb=std::getenv("MIDV_FFB");
+	if(strcmp(mode,"1") || !ffb || strcmp(ffb,"0") || strcmp(machine().system().name,"crusnexo"))
+		fatalerror("Exotica lifetime observation requires crusnexo, MIDZ_LIFETIME=1 and MIDV_FFB=0\n");
+	auto number=[](const char *name) {
+		const char *value=std::getenv(name);if(!value || !*value)fatalerror("Missing Exotica lifetime bound %s\n",name);
+		for(const char *p=value;*p;++p)if(*p<'0' || *p>'9')fatalerror("Invalid Exotica lifetime bound %s\n",name);
+		char *end=nullptr;const auto n=strtoul(value,&end,10);
+		if(*end || n<1799 || n>15999)fatalerror("Invalid Exotica lifetime range %s\n",name);
+		return uint32_t(n);
+	};
+	m_lifetime_first=number("MIDZ_LIFETIME_FIRST");m_lifetime_last=number("MIDZ_LIFETIME_LAST");
+	if(m_lifetime_last<m_lifetime_first || m_lifetime_last-m_lifetime_first>10000 || m_ram_base.bytes()!=0x100000)
+		fatalerror("Exotica lifetime interval/space bounds\n");
+	m_lifetime_log=fopen("exotica-lifetime-events.csv","w");
+	if(!m_lifetime_log)fatalerror("Cannot open Exotica lifetime journal\n");
+	setvbuf(m_lifetime_log,nullptr,_IOFBF,65536);
+	if(fprintf(m_lifetime_log,"event,frame,time,sequence,epoch,generation,slot,owner,realm,section,source,reason,flags\n")<0)
+		fatalerror("Cannot write Exotica lifetime header\n");
+	auto &space=m_maincpu->space(AS_PROGRAM);
+	m_lifetime_head_tap=space.install_write_tap(0x10a8,0x10a8,"exotica_lifetime_head",
+		[this](offs_t,uint32_t &data,uint32_t mask) {
+			if(!lifetime_scope())return;
+			if(mask!=UINT32_MAX)fatalerror("Exotica lifetime partial head write\n");
+			auto &p=m_lifetime_pending;const auto pc=m_maincpu->state_int(TMS320C3X_PC);
+			if(p.kind==3) {
+				if(pc!=0xbbcd || p.head_time || data!=p.base || m_ram_base[0x10a8]!=p.old_head || m_ram_base[0x10a9]!=1200)
+					fatalerror("Exotica lifetime reset head\n");
+				p.head_time=machine().time().as_double();return;
+			}
+			if(p.kind)fatalerror("Exotica lifetime overlapping transaction\n");
+			p.old_head=m_ram_base[0x10a8];p.count=m_ram_base[0x10a9];p.new_head=data;p.time=machine().time().as_double();
+			if((p.old_head && !lifetime_slot(p.old_head)) || (data && !lifetime_slot(data)) || p.count>4096)
+				fatalerror("Exotica lifetime head/count bounds\n");
+			if(pc==0xbbf7) {
+				p.kind=1;p.slot=uint32_t(m_maincpu->state_int(TMS320C3X_AR0));
+				if(!lifetime_slot(p.slot) || p.slot!=p.old_head || !p.count || m_ram_base[p.slot]!=data)
+					fatalerror("Exotica lifetime allocation link\n");
+			} else if(pc==0xbc65) {
+				p.kind=2;p.slot=uint32_t(m_maincpu->state_int(TMS320C3X_AR2));
+				if(!lifetime_slot(p.slot) || p.slot!=data || m_ram_base[p.slot]!=p.old_head)
+					fatalerror("Exotica lifetime removal link\n");
+			} else fatalerror("Exotica lifetime unmapped head PC%x\n",unsigned(pc));
+		});
+	m_lifetime_count_tap=space.install_write_tap(0x10a9,0x10a9,"exotica_lifetime_count",
+		[this](offs_t,uint32_t &data,uint32_t mask) {
+			if(!lifetime_scope())return;
+			if(mask!=UINT32_MAX)fatalerror("Exotica lifetime partial count write\n");
+			auto &p=m_lifetime_pending;const auto pc=m_maincpu->state_int(TMS320C3X_PC);
+			if(!p.kind && pc==0xbbc9) {
+				p.kind=3;p.base=m_ram_base[0xbbbc];p.old_head=m_ram_base[0x10a8];p.count=m_ram_base[0x10a9];p.time=machine().time().as_double();
+				if(data!=1200 || m_ram_base[0xbbba]!=0x10a8 || !lifetime_slot(p.base) || uint64_t(p.base)+1201*31>0x40000 || (p.base<0x32000 && uint64_t(p.base)+1201*31>0x30000))
+					fatalerror("Exotica lifetime reset operands\n");
+				m_lifetime_reset_tap=m_maincpu->space(AS_PROGRAM).install_write_tap(p.base,p.base+1201*31,"exotica_lifetime_reset_tail",
+					[this](offs_t address,uint32_t &value,uint32_t bits) {
+						if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0xbbd5)return;
+						auto &p=m_lifetime_pending;
+						if(bits!=UINT32_MAX || p.kind!=3 || !p.head_time || value || address!=p.base+1200*31 ||
+							address!=uint32_t(m_maincpu->state_int(TMS320C3X_AR0)) || m_ram_base[0x10a8]!=p.base || m_ram_base[0x10a9]!=1200)
+							fatalerror("Exotica lifetime reset tail\n");
+						for(unsigned i=0;i<1200;++i)if(m_ram_base[p.base+i*31]!=p.base+(i+1)*31)fatalerror("Exotica lifetime reset link\n");
+						const double now=machine().time().as_double();
+						if(now<p.head_time || p.head_time<p.time || now-p.time>=.001)fatalerror("Exotica lifetime reset duration\n");
+						cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
+						if(!m_lifetimes.reset(layout))fatalerror("Exotica lifetime reset registry\n");
+						m_lifetime_owners.clear();lifetime_emit('R',p.base,0,0,{},1201,1200);
+						p=LifetimePending();m_lifetime_reset_tap.remove();
+					});
+				return;
+			}
+			const auto expected=p.kind==1?0xbbfa:0xbc68;
+			if((p.kind!=1 && p.kind!=2) || pc!=expected || m_ram_base[0x10a8]!=p.new_head || m_ram_base[0x10a9]!=p.count ||
+				data!=(p.kind==1?p.count-1:p.count+1) || data>4096)
+				fatalerror("Exotica lifetime paired count\n");
+			const double now=machine().time().as_double();if(now<p.time || now-p.time>=.001)fatalerror("Exotica lifetime paired duration\n");
+			uint64_t generation=0;bool unknown=false;
+			if(p.kind==1 ? !m_lifetimes.allocate(p.slot,generation) : !m_lifetimes.release(p.slot,unknown))
+				fatalerror("Exotica lifetime registry transaction\n");
+			m_lifetime_owners.erase(p.slot);
+			lifetime_emit(p.kind==1?'A':'F',p.slot,generation,0,{},unsigned(unknown),data);
+			p=LifetimePending();
+		});
+	m_lifetime_owner_tap=space.install_read_tap(0x67c4,0x67c4,"exotica_lifetime_source",
+		[this](offs_t,uint32_t &,uint32_t) {
+			if(!lifetime_scope() || m_maincpu->state_int(TMS320C3X_PC)!=0xb85a)return;
+			if(m_lifetime_owner_slot)fatalerror("Exotica lifetime nested source constructor\n");
+			m_lifetime_owner_slot=uint32_t(m_maincpu->state_int(TMS320C3X_AR4));
+			m_lifetime_owner_source=uint32_t(m_maincpu->state_int(TMS320C3X_AR5))-4;m_lifetime_owner_entry=m_ram_base[0x597];
+			if(!lifetime_slot(m_lifetime_owner_slot) || !cruisn::exotica_future::span(m_lifetime_owner_source,6) ||
+				!cruisn::exotica_future::span(m_lifetime_owner_entry,4))fatalerror("Exotica lifetime source bounds\n");
+			m_lifetime_ready_tap=m_maincpu->space(AS_PROGRAM).install_read_tap(m_lifetime_owner_slot+29,m_lifetime_owner_slot+29,"exotica_lifetime_source_ready",
+				[this](offs_t,uint32_t &,uint32_t) {
+					if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0xb8cc)return;
+					if(!m_lifetime_owner_slot || m_lifetime_owner_slot!=uint32_t(m_maincpu->state_int(TMS320C3X_AR4)))
+						fatalerror("Exotica lifetime source completion\n");
+					const uint32_t bank=m_disk_asic_jr[5]&3,table=m_ram_base[0xe9]+m_ram_base[0x1fbc];
+					if(bank>2 || !cruisn::exotica_future::span(table,1))fatalerror("Exotica lifetime source realm\n");
+					cruisn::scenery_lifetimes::Key key;key.realm=(uint64_t(bank+1)<<32)|table;key.section=m_lifetime_owner_entry;key.source=m_lifetime_owner_source;
+					LifetimeOwner owner;
+					if(!m_lifetimes.bind(m_lifetime_owner_slot,key,owner.handle) || ++m_lifetime_bindings>10000)
+						fatalerror("Exotica lifetime source binding\n");
+					owner.serial=m_lifetime_bindings;
+					if(!m_lifetime_owners.emplace(m_lifetime_owner_slot,owner).second)fatalerror("Exotica lifetime duplicate owner map\n");
+					lifetime_emit('B',m_lifetime_owner_slot,owner.handle.generation,owner.serial,key,0,m_ram_base[m_lifetime_owner_slot+15]);
+					m_lifetime_owner_slot=0;m_lifetime_ready_tap.remove();
+				});
+		});
+	m_lifetime_submit_tap=space.install_write_tap(0x46e,0x46e,"exotica_lifetime_model_commit",
+		[this](offs_t,uint32_t &data,uint32_t mask) {
+			if(!lifetime_scope() || m_maincpu->state_int(TMS320C3X_PC)!=0x6970)return;
+			if(++m_lifetime_emissions>20000000)fatalerror("Exotica lifetime submission budget\n");
+			const uint32_t slot=uint32_t(m_maincpu->state_int(TMS320C3X_AR7));
+			auto found=m_lifetime_owners.find(slot);if(found==m_lifetime_owners.end())return;
+			if(mask!=UINT32_MAX || !lifetime_slot(slot) || data<0x30000 || data>=0x32000 || data!=uint32_t(m_maincpu->state_int(TMS320C3X_AR5)))
+				fatalerror("Exotica lifetime original commit bounds\n");
+			++m_lifetime_owned;auto &owner=found->second;bool first=false;
+			if(!m_lifetimes.submitted(owner.handle,uint64_t(m_screen->frame_number())+1,first))fatalerror("Exotica lifetime stale original commit\n");
+			const uint32_t flags=uint32_t(m_maincpu->state_int(TMS320C3X_R6));uint32_t reason=first?1:0;
+			m_lifetime_first_draws+=first;
+			if(flags&0x04000000){reason|=2;owner.faded=true;++m_lifetime_fading_draws;}
+			else if(owner.faded && !owner.opaque){reason|=4;owner.opaque=true;++m_lifetime_opaque;}
+			if(reason){++m_lifetime_draw_records;lifetime_emit('D',slot,owner.handle.generation,owner.serial,owner.handle.key,reason,flags);}
+		});
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::lifetime_exit,this));
+	fprintf(stderr,"MIDZ_LIFETIME=1 first=%u last=%u\n",m_lifetime_first,m_lifetime_last);
+}
+
+void crusnexo_state::lifetime_exit()
+{
+	if(!m_lifetime_log)return;
+	m_lifetime_head_tap.remove();m_lifetime_count_tap.remove();m_lifetime_reset_tap.remove();
+	m_lifetime_owner_tap.remove();m_lifetime_ready_tap.remove();m_lifetime_submit_tap.remove();
+	const bool complete=m_lifetime_started && m_screen->frame_number()>m_lifetime_last && !m_lifetime_pending.kind && !m_lifetime_owner_slot;
+	const bool good=!ferror(m_lifetime_log);const int closed=fclose(m_lifetime_log);m_lifetime_log=nullptr;
+	fprintf(stderr,"MIDZ_LIFETIME_RESULT complete=%u records=%llu transitions=%llu bindings=%llu emissions=%llu owned=%llu draws=%llu first_draws=%llu fading=%llu opaque=%llu epochs=%llu\n",
+		unsigned(complete && good && !closed),(unsigned long long)m_lifetime_records,(unsigned long long)m_lifetimes.sequence(),
+		(unsigned long long)m_lifetime_bindings,(unsigned long long)m_lifetime_emissions,(unsigned long long)m_lifetime_owned,
+		(unsigned long long)m_lifetime_draw_records,(unsigned long long)m_lifetime_first_draws,(unsigned long long)m_lifetime_fading_draws,
+		(unsigned long long)m_lifetime_opaque,(unsigned long long)m_lifetimes.epoch());
 }
 
 void crusnexo_state::scene_observer_start()
