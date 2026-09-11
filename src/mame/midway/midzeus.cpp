@@ -40,6 +40,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/zeus_resource_lease.h"
 #include "cruisn/scenery_lifetimes.h"
 #include "cruisn/exotica_waiting.h"
+#include "cruisn/exotica_waiting_handover.h"
 
 #include <algorithm>
 #include <chrono>
@@ -227,6 +228,7 @@ private:
 	void scene_fence_end();
 	void scene_fence_word(bool empty);
 	void scene_fence_ready(bool immediate);
+	void scene_waiting_ready();
 	void scene_active_list(uint32_t entry,uint32_t head);
 	void scene_active_seal();
 	void scene_active_ready();
@@ -250,6 +252,14 @@ private:
 	uint64_t m_waiting_scenes=0,m_waiting_candidates=0,m_waiting_quads=0;
 	uint32_t m_waiting_saved=0;
 	std::set<uint32_t> m_waiting_snapshots;
+	uint32_t m_handover_mode=0,m_handover_frame=0,m_handover_saved=0;
+	uint64_t m_handover_scene=0,m_handover_proposal_records=0,m_handover_end_records=0;
+	uint64_t m_handover_completed=0,m_handover_captured=0,m_handover_submitted=0,m_handover_retired=0,m_handover_bytes=0;
+	double m_handover_time=0;
+	FILE *m_handover_log=nullptr,*m_handover_cohorts=nullptr;
+	std::set<uint32_t> m_handover_snapshots;
+	cruisn::exotica_waiting::Pending m_handover_pending;
+	cruisn::exotica_scene::Result m_handover_geometry;
 	double m_scene_cpu_time=0;
 	bool m_scene_open=false,m_scene_armed=false,m_scene_bounds=false;
 	std::array<uint32_t,3> m_scene_camera{};
@@ -584,6 +594,8 @@ void crusnexo_state::scene_observer_start()
 	if(!mode || !strcmp(mode,"0")) {
 		const char *waiting=std::getenv("MIDZ_HOST_WAITING");
 		if(waiting && strcmp(waiting,"0"))fatalerror("Exotica waiting observation requires host scene mode\n");
+		const char *handover=std::getenv("MIDZ_HOST_HANDOVER");
+		if(handover && strcmp(handover,"0"))fatalerror("Exotica waiting completion requires host scene mode\n");
 		return;
 	}
 	const char *ffb=std::getenv("MIDV_FFB");
@@ -641,6 +653,9 @@ void crusnexo_state::scene_observer_start()
 	if(number("MIDZ_HOST_FUTURE_PRESENT",0,1,0) && m_scene_future_mode!=2)
 		fatalerror("Exotica future presentation requires explicit future draw mode\n");
 	m_waiting_mode=number("MIDZ_HOST_WAITING",0,1,0);
+	m_handover_mode=number("MIDZ_HOST_HANDOVER",0,1,0);
+	if(m_handover_mode && (!m_waiting_mode || !m_scene_fence_log || m_active_mode))
+		fatalerror("Exotica waiting completion requires waiting/fence observation and excludes active margins\n");
 	if(m_waiting_mode) {
 		const char *lifetime=std::getenv("MIDZ_LIFETIME");
 		if(!m_scene_future_mode || !lifetime || strcmp(lifetime,"1") ||
@@ -671,6 +686,15 @@ void crusnexo_state::scene_observer_start()
 		setvbuf(m_waiting_log,nullptr,_IOFBF,65536);
 		fprintf(m_waiting_log,"scene,frame,device_time,epoch,sequence,records,historical,unowned,submitted,future,bound_future,bound_future_submitted,candidates,instances,quads,hash,guest_cycles\n");
 		fprintf(stderr,"MIDZ_HOST_WAITING=1\n");
+	}
+	if(m_handover_mode) {
+		m_handover_snapshots=m_scene_snapshots;
+		m_handover_log=fopen("exotica-handover-scenes.csv","w");
+		m_handover_cohorts=fopen("exotica-handover-cohorts.bin","wb");
+		if(!m_handover_log || !m_handover_cohorts)fatalerror("Cannot create Exotica completion observation\n");
+		setvbuf(m_handover_log,nullptr,_IOFBF,65536);setvbuf(m_handover_cohorts,nullptr,_IOFBF,65536);
+		fprintf(m_handover_log,"scene,proposal_frame,proposal_time,proposal_records,end_records,ready_frame,ready_time,ready_records,epoch,captured,submitted,retired,retained,owners_hash,instances,quads,geometry_hash,guest_cycles\n");
+		fprintf(stderr,"MIDZ_HOST_HANDOVER=1\n");
 	}
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
@@ -879,7 +903,13 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		if(table>UINT32_MAX)fatalerror("Exotica waiting track table overflow\n");
 		const uint64_t realm=(uint64_t(pending.bank+1)<<32)|table;
 		cruisn::exotica_waiting::Result waiting;
-		if(!cruisn::exotica_waiting::select(sources.sources,realm,m_lifetimes,read,waiting))
+		if(m_handover_mode) {
+			if(!m_handover_pending.capture(sources.sources,realm,m_lifetimes,m_lifetime_records,read))
+				fatalerror("Exotica waiting completion capture/order rejected\n");
+			waiting=m_handover_pending.selection();
+			m_handover_scene=pending.scene;m_handover_frame=p.frame;m_handover_time=now;
+			m_handover_proposal_records=m_lifetime_records;m_handover_end_records=0;
+		} else if(!cruisn::exotica_waiting::select(sources.sources,realm,m_lifetimes,read,waiting))
 			fatalerror("Exotica waiting source/generation/operand rejection frame%u\n",p.frame);
 		std::vector<cruisn::exotica_future::Source> selected;
 		std::vector<std::array<uint64_t,6>> owners;
@@ -914,6 +944,17 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 			++m_waiting_saved;
 		}
 		++m_waiting_scenes;m_waiting_candidates+=selected.size();m_waiting_quads+=proposed.quads.size();
+		if(m_handover_mode) {
+			// Explicit LE uint64 fields on the supported Windows host; no padded
+			// native structs. WCH1, scene, actual event watermark, epoch, count.
+			const uint64_t header[]={0x31484357,pending.scene,m_lifetime_records,m_lifetimes.epoch(),owners.size()};
+			const size_t bytes=sizeof(header)+owners.size()*sizeof(owners[0]);
+			if(bytes>64*1024*1024-m_handover_bytes)fatalerror("Exotica waiting cohort byte budget\n");
+			if(fwrite(header,1,sizeof(header),m_handover_cohorts)!=sizeof(header) ||
+				fwrite(owners.data(),sizeof(owners[0]),owners.size(),m_handover_cohorts)!=owners.size())
+				fatalerror("Exotica waiting cohort write\n");
+			m_handover_bytes+=bytes;m_handover_geometry=std::move(proposed);
+		}
 	}
 	cruisn::exotica_scene::Result scene;
 	p.early_depth=m_scene_depth_mode;
@@ -1025,6 +1066,12 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 void crusnexo_state::scene_fence_end()
 {
 	const auto cycles=m_maincpu->total_cycles();
+	if(m_handover_mode) {
+		if(!m_handover_pending.pending() || m_handover_scene!=m_scene_serial ||
+			m_lifetime_pending.kind || m_lifetime_owner_slot)
+			fatalerror("Exotica waiting completion CPU boundary mismatch\n");
+		m_handover_end_records=m_lifetime_records;
+	}
 	const uint32_t code[][2]={{0xb472,0x880000},{0xb681,0x0828046d},{0xb684,0x08403001},{0xb685,0x15400608},{0xb686,0x1528046d}};
 	for(const auto &word:code)if(m_ram_base[word[0]]!=word[1])fatalerror("Exotica command-ring signature\n");
 	m_scene_fence_scene=m_scene_serial;m_scene_fence_scene_frame=m_scene_cpu_frame;
@@ -1060,7 +1107,68 @@ void crusnexo_state::scene_fence_ready(bool immediate)
 		frame,now,m_scene_fence_consumer,m_scene_fence.target(),m_scene_fence_words,unsigned(immediate),m_zeus->m_renderRegs[4])<0)
 		fatalerror("Exotica command-fence log write\n");
 	++m_scene_fence_completed;m_scene_fence_immediate+=immediate;
+	if(m_handover_mode)scene_waiting_ready();
 	if(m_active_mode)scene_active_ready();
+}
+
+void crusnexo_state::scene_waiting_ready()
+{
+	const auto cycles=m_maincpu->total_cycles();
+	const auto frame=uint32_t(m_screen->frame_number());const double now=machine().time().as_double();
+	if(m_handover_scene!=m_scene_fence_scene || !m_handover_end_records ||
+		m_handover_end_records<m_handover_proposal_records || m_handover_end_records>m_lifetime_records ||
+		m_lifetime_pending.kind || m_lifetime_owner_slot)
+		fatalerror("Exotica waiting completion device boundary mismatch\n");
+	cruisn::exotica_waiting::Completion completion;
+	if(!m_handover_pending.complete(m_lifetimes,m_lifetime_records,completion))
+		fatalerror("Exotica waiting completion generation/reset/order rejected\n");
+	std::set<std::pair<uint32_t,uint32_t>> retained;
+	std::vector<std::array<uint64_t,6>> owners;
+	for(const auto &item:completion.items) {
+		const auto &h=item.owner;
+		if(item.source.future || !retained.emplace(h.key.section,h.key.source).second)
+			fatalerror("Exotica waiting completion source identity\n");
+		owners.push_back({{h.key.realm,h.key.section,h.key.source,h.slot,h.epoch,h.generation}});
+	}
+	// Filter already-built proposal geometry. Rebuilding against device-ready
+	// WaveRAM/context would silently mix two resource boundaries. No drawing here.
+	cruisn::exotica_scene::Result filtered;
+	for(auto instance:m_handover_geometry.instances) {
+		if(!retained.count({instance.entry,instance.source}))continue;
+		if(instance.first_quad>m_handover_geometry.quads.size() ||
+			instance.quad_count>m_handover_geometry.quads.size()-instance.first_quad)
+			fatalerror("Exotica waiting completion geometry extent\n");
+		const auto begin=m_handover_geometry.quads.begin()+instance.first_quad;
+		instance.first_quad=filtered.quads.size();
+		filtered.quads.insert(filtered.quads.end(),begin,begin+instance.quad_count);
+		filtered.instances.push_back(instance);
+	}
+	const auto owner_hash=cruisn::exotica_scene::byte_hash(owners.data(),owners.size()*sizeof(owners[0]));
+	const auto geometry_hash=cruisn::exotica_scene::byte_hash(filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0]));
+	if(fprintf(m_handover_log,"%llu,%u,%.12f,%llu,%llu,%u,%.12f,%llu,%llu,%u,%u,%u,%u,%016llx,%u,%u,%016llx,0\n",
+		(unsigned long long)m_handover_scene,m_handover_frame,m_handover_time,
+		(unsigned long long)m_handover_proposal_records,(unsigned long long)m_handover_end_records,frame,now,
+		(unsigned long long)m_lifetime_records,(unsigned long long)m_lifetimes.epoch(),unsigned(completion.captured),
+		unsigned(completion.submitted),unsigned(completion.retired),unsigned(completion.items.size()),
+		(unsigned long long)owner_hash,unsigned(filtered.instances.size()),unsigned(filtered.quads.size()),(unsigned long long)geometry_hash)<0)
+		fatalerror("Exotica waiting completion log write\n");
+	if(m_handover_snapshots.erase(m_handover_frame)) {
+		auto dump=[](const std::string &name,const void *data,size_t bytes) {
+			FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open Exotica completion snapshot\n");
+			const bool ok=fwrite(data,1,bytes,f)==bytes;const int closed=fclose(f);
+			if(!ok || closed)fatalerror("Cannot complete Exotica completion snapshot\n");
+		};
+		const std::string prefix="exotica-handover-"+std::to_string(m_handover_frame);
+		const auto instances=cruisn::exotica_scene::instance_words(filtered);
+		dump(prefix+"-owners.bin",owners.data(),owners.size()*sizeof(owners[0]));
+		dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));
+		dump(prefix+"-quads.bin",filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0]));
+		++m_handover_saved;
+	}
+	++m_handover_completed;m_handover_captured+=completion.captured;
+	m_handover_submitted+=completion.submitted;m_handover_retired+=completion.retired;
+	m_handover_geometry=cruisn::exotica_scene::Result{};
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica waiting completion changed CPU cycles\n");
 }
 
 void crusnexo_state::scene_active_list(uint32_t entry,uint32_t head)
@@ -1285,6 +1393,17 @@ void crusnexo_state::scene_active_ready()
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_handover_log) {
+		const bool good=!ferror(m_handover_log) && !ferror(m_handover_cohorts);
+		const int closed=fclose(m_handover_log),cohorts_closed=fclose(m_handover_cohorts);
+		m_handover_log=nullptr;m_handover_cohorts=nullptr;
+		fprintf(stderr,"MIDZ_HOST_HANDOVER_RESULT complete=%u scenes=%llu captured=%llu submitted=%llu retired=%llu bytes=%llu snapshots=%u remaining=%u\n",
+			unsigned(good && !closed && !cohorts_closed && !m_handover_pending.pending() &&
+				m_handover_completed && m_handover_completed==m_waiting_scenes && m_handover_snapshots.empty()),
+			(unsigned long long)m_handover_completed,(unsigned long long)m_handover_captured,
+			(unsigned long long)m_handover_submitted,(unsigned long long)m_handover_retired,
+			(unsigned long long)m_handover_bytes,m_handover_saved,unsigned(m_handover_snapshots.size()));
+	}
 	if(m_waiting_log) {
 		const bool good=!ferror(m_waiting_log);const int closed=fclose(m_waiting_log);m_waiting_log=nullptr;
 		fprintf(stderr,"MIDZ_HOST_WAITING_RESULT complete=%u scenes=%llu candidates=%llu quads=%llu snapshots=%u remaining=%u\n",
