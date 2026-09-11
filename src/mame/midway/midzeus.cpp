@@ -39,6 +39,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/zeus_wide_packet.h"
 #include "cruisn/zeus_resource_lease.h"
 #include "cruisn/scenery_lifetimes.h"
+#include "cruisn/exotica_waiting.h"
 
 #include <algorithm>
 #include <chrono>
@@ -244,6 +245,11 @@ private:
 	uint32_t m_scene_first=0,m_scene_last=0,m_scene_multiplier=1,m_scene_cpu_frame=0;
 	uint64_t m_scene_serial=0;
 	uint32_t m_scene_future_mode=0;
+	uint32_t m_waiting_mode=0;
+	FILE *m_waiting_log=nullptr;
+	uint64_t m_waiting_scenes=0,m_waiting_candidates=0,m_waiting_quads=0;
+	uint32_t m_waiting_saved=0;
+	std::set<uint32_t> m_waiting_snapshots;
 	double m_scene_cpu_time=0;
 	bool m_scene_open=false,m_scene_armed=false,m_scene_bounds=false;
 	std::array<uint32_t,3> m_scene_camera{};
@@ -575,7 +581,11 @@ void crusnexo_state::lifetime_exit()
 void crusnexo_state::scene_observer_start()
 {
 	const char *mode=std::getenv("MIDZ_HOST_SCENE");
-	if(!mode || !strcmp(mode,"0"))return;
+	if(!mode || !strcmp(mode,"0")) {
+		const char *waiting=std::getenv("MIDZ_HOST_WAITING");
+		if(waiting && strcmp(waiting,"0"))fatalerror("Exotica waiting observation requires host scene mode\n");
+		return;
+	}
 	const char *ffb=std::getenv("MIDV_FFB");
 	if(strcmp(mode,"1") || !ffb || strcmp(ffb,"0") || strcmp(machine().system().name,"crusnexo"))
 		fatalerror("Exotica host observation requires crusnexo, MIDZ_HOST_SCENE=1 and MIDV_FFB=0\n");
@@ -630,6 +640,14 @@ void crusnexo_state::scene_observer_start()
 	}
 	if(number("MIDZ_HOST_FUTURE_PRESENT",0,1,0) && m_scene_future_mode!=2)
 		fatalerror("Exotica future presentation requires explicit future draw mode\n");
+	m_waiting_mode=number("MIDZ_HOST_WAITING",0,1,0);
+	if(m_waiting_mode) {
+		const char *lifetime=std::getenv("MIDZ_LIFETIME");
+		if(!m_scene_future_mode || !lifetime || strcmp(lifetime,"1") ||
+			number("MIDZ_LIFETIME_FIRST",1799,15999,0)!=1799 ||
+			number("MIDZ_LIFETIME_LAST",1799,15999,0)<=m_scene_last)
+			fatalerror("Exotica waiting observation requires future mode and lifetime coverage from1799 through hostlast+1\n");
+	}
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
 		memregion("maindata")->bytes()!=0x800000 || memregion("bankeddata")->bytes()!=0x3000000 ||
@@ -645,6 +663,14 @@ void crusnexo_state::scene_observer_start()
 			text=*end?end+1:end;
 			if(*end && !*text)fatalerror("Empty Exotica host snapshot\n");
 		}
+	}
+	if(m_waiting_mode) {
+		m_waiting_snapshots=m_scene_snapshots;
+		m_waiting_log=fopen("exotica-waiting-scenes.csv","w");
+		if(!m_waiting_log)fatalerror("Cannot create Exotica waiting log\n");
+		setvbuf(m_waiting_log,nullptr,_IOFBF,65536);
+		fprintf(m_waiting_log,"scene,frame,device_time,epoch,sequence,records,historical,unowned,submitted,future,bound_future,bound_future_submitted,candidates,instances,quads,hash,guest_cycles\n");
+		fprintf(stderr,"MIDZ_HOST_WAITING=1\n");
 	}
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
@@ -845,6 +871,50 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		if(offset>4*1024*1024 || n>4*1024*1024-offset)return false;
 		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);return true;
 	};
+	if(m_waiting_mode) {
+		if(!m_lifetime_started || p.frame<m_lifetime_first || p.frame>m_lifetime_last ||
+			m_lifetime_pending.kind || m_lifetime_owner_slot || m_waiting_scenes>=20000)
+			fatalerror("Exotica waiting incomplete lifetime boundary frame%u\n",p.frame);
+		const uint64_t table=uint64_t(read(0xe9))+read(0x1fbc);
+		if(table>UINT32_MAX)fatalerror("Exotica waiting track table overflow\n");
+		const uint64_t realm=(uint64_t(pending.bank+1)<<32)|table;
+		cruisn::exotica_waiting::Result waiting;
+		if(!cruisn::exotica_waiting::select(sources.sources,realm,m_lifetimes,read,waiting))
+			fatalerror("Exotica waiting source/generation/operand rejection frame%u\n",p.frame);
+		std::vector<cruisn::exotica_future::Source> selected;
+		std::vector<std::array<uint64_t,6>> owners;
+		for(const auto &item:waiting.items) {
+			const auto &h=item.owner;
+			if(item.source.future)fatalerror("Exotica waiting source state changed\n");
+			selected.push_back(item.source);
+			owners.push_back({{h.key.realm,h.key.section,h.key.source,h.slot,h.epoch,h.generation}});
+		}
+		auto wp=p;wp.early_depth=m_scene_depth_mode;
+		cruisn::exotica_scene::Result proposed;
+		if(!cruisn::exotica_scene::build(selected,wp,read,model_read,[](const cruisn::exotica_future::Source &){return true;},proposed))
+			fatalerror("Exotica waiting proposed geometry rejection frame%u\n",p.frame);
+		const auto hash=cruisn::exotica_scene::byte_hash(proposed.quads.data(),proposed.quads.size()*sizeof(proposed.quads[0]));
+		if(fprintf(m_waiting_log,"%llu,%u,%.12f,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0\n",
+			(unsigned long long)pending.scene,p.frame,now,(unsigned long long)m_lifetimes.epoch(),(unsigned long long)m_lifetimes.sequence(),(unsigned long long)m_lifetime_records,
+			unsigned(waiting.historical),unsigned(waiting.unowned),unsigned(waiting.submitted),unsigned(waiting.future),
+			unsigned(waiting.bound_future),unsigned(waiting.bound_future_submitted),unsigned(selected.size()),
+			unsigned(proposed.instances.size()),unsigned(proposed.quads.size()),(unsigned long long)hash)<0)
+			fatalerror("Exotica waiting log write\n");
+		if(m_waiting_snapshots.erase(p.frame)) {
+			auto dump=[](const std::string &name,const void *data,size_t bytes) {
+				FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open Exotica waiting snapshot\n");
+				const bool ok=fwrite(data,1,bytes,f)==bytes;const int closed=fclose(f);
+				if(!ok || closed)fatalerror("Cannot complete Exotica waiting snapshot\n");
+			};
+			const std::string prefix="exotica-waiting-"+std::to_string(p.frame);
+			const auto instances=cruisn::exotica_scene::instance_words(proposed);
+			dump(prefix+"-owners.bin",owners.data(),owners.size()*sizeof(owners[0]));
+			dump(prefix+"-quads.bin",proposed.quads.data(),proposed.quads.size()*sizeof(proposed.quads[0]));
+			dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));
+			++m_waiting_saved;
+		}
+		++m_waiting_scenes;m_waiting_candidates+=selected.size();m_waiting_quads+=proposed.quads.size();
+	}
 	cruisn::exotica_scene::Result scene;
 	p.early_depth=m_scene_depth_mode;
 	if(!cruisn::exotica_scene::build(sources.sources,p,read,model_read,[](const cruisn::exotica_future::Source &s){return s.future;},scene))
@@ -1215,6 +1285,13 @@ void crusnexo_state::scene_active_ready()
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_waiting_log) {
+		const bool good=!ferror(m_waiting_log);const int closed=fclose(m_waiting_log);m_waiting_log=nullptr;
+		fprintf(stderr,"MIDZ_HOST_WAITING_RESULT complete=%u scenes=%llu candidates=%llu quads=%llu snapshots=%u remaining=%u\n",
+			unsigned(good && !closed && m_waiting_scenes && m_waiting_scenes==m_scene_matched && m_waiting_snapshots.empty()),
+			(unsigned long long)m_waiting_scenes,(unsigned long long)m_waiting_candidates,(unsigned long long)m_waiting_quads,
+			m_waiting_saved,unsigned(m_waiting_snapshots.size()));
+	}
 	if(m_active_log) {
 		const int closed=fclose(m_active_log);m_active_log=nullptr;
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_RESULT complete=%u scenes=%llu quads=%llu remaining=%u\n",
