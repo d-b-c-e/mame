@@ -41,6 +41,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/scenery_lifetimes.h"
 #include "cruisn/exotica_waiting.h"
 #include "cruisn/exotica_waiting_handover.h"
+#include "cruisn/zeus_retained_materials.h"
 
 #include <algorithm>
 #include <chrono>
@@ -260,6 +261,9 @@ private:
 	std::set<uint32_t> m_handover_snapshots;
 	cruisn::exotica_waiting::Pending m_handover_pending;
 	cruisn::exotica_scene::Result m_handover_geometry;
+	cruisn::zeus_host::PaletteSet m_handover_palettes;
+	cruisn::zeus_wide::Packet m_handover_packet;
+	uint64_t m_handover_generation=0;
 	double m_scene_cpu_time=0;
 	bool m_scene_open=false,m_scene_armed=false,m_scene_bounds=false;
 	std::array<uint32_t,3> m_scene_camera{};
@@ -653,7 +657,8 @@ void crusnexo_state::scene_observer_start()
 	if(number("MIDZ_HOST_FUTURE_PRESENT",0,1,0) && m_scene_future_mode!=2)
 		fatalerror("Exotica future presentation requires explicit future draw mode\n");
 	m_waiting_mode=number("MIDZ_HOST_WAITING",0,1,0);
-	m_handover_mode=number("MIDZ_HOST_HANDOVER",0,1,0);
+	m_handover_mode=number("MIDZ_HOST_HANDOVER",0,2,0);
+	if(m_handover_mode==2 && (m_scene_future_mode!=2 || !m_scene_material_image))fatalerror("Exotica waiting draw requires private future drawing and materials\n");
 	if(m_handover_mode && (!m_waiting_mode || !m_scene_fence_log || m_active_mode))
 		fatalerror("Exotica waiting completion requires waiting/fence observation and excludes active margins\n");
 	if(m_waiting_mode) {
@@ -694,7 +699,8 @@ void crusnexo_state::scene_observer_start()
 		if(!m_handover_log || !m_handover_cohorts)fatalerror("Cannot create Exotica completion observation\n");
 		setvbuf(m_handover_log,nullptr,_IOFBF,65536);setvbuf(m_handover_cohorts,nullptr,_IOFBF,65536);
 		fprintf(m_handover_log,"scene,proposal_frame,proposal_time,proposal_records,end_records,ready_frame,ready_time,ready_records,epoch,captured,submitted,retired,retained,owners_hash,instances,quads,geometry_hash,guest_cycles\n");
-		fprintf(stderr,"MIDZ_HOST_HANDOVER=1\n");
+		fprintf(stderr,"MIDZ_HOST_HANDOVER=%u\n",m_handover_mode);
+		if(m_handover_mode==2)fprintf(stderr,"MIDZ_HOST_WAITING_DRAW=2\n");
 	}
 	m_scene_log=fopen("exotica-host-scenes.csv","w");
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
@@ -953,7 +959,17 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 			if(fwrite(header,1,sizeof(header),m_handover_cohorts)!=sizeof(header) ||
 				fwrite(owners.data(),sizeof(owners[0]),owners.size(),m_handover_cohorts)!=owners.size())
 				fatalerror("Exotica waiting cohort write\n");
-			m_handover_bytes+=bytes;m_handover_geometry=std::move(proposed);
+			m_handover_bytes+=bytes;
+			if(m_handover_mode==2) {
+				if(m_handover_generation || !cruisn::zeus_host::palettes(proposed.instances,
+					reinterpret_cast<const uint8_t *>(z.m_waveram.get()),0x1000000,m_handover_palettes))
+					fatalerror("Exotica waiting proposal palette/sequence ownership\n");
+				m_handover_packet=cruisn::zeus_wide::Packet{};
+				auto &packet=m_handover_packet;packet.materials.frame=p.frame;packet.materials.scene=pending.scene;
+				packet.materials.snapshot=m_scene_snapshots.count(p.frame)!=0;
+				packet.margin=uint32_t(m_scene_margin);packet.page=p.context.render[4];packet.multiplier=m_scene_multiplier;packet.draw=true;
+			}
+			m_handover_geometry=std::move(proposed);
 		}
 	}
 	cruisn::exotica_scene::Result scene;
@@ -1018,6 +1034,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		} else if(!m_zeus->midz_host_materials(wire.data(),wire.size()))fatalerror("Exotica private material queue rejected\n");
 		const auto material_queued=std::chrono::steady_clock::now();
 		if(!m_scene_material_image->apply(packet.wave))fatalerror("Exotica private material producer commit rejected\n");
+		if(m_handover_mode==2)m_handover_generation=m_scene_material_image->generation();
 		// No emulated writes can occur between staging and this emulation-thread commit.
 		if(m_scene_material_pages)m_zeus->midz_host_wave_commit();
 		const auto material_committed=std::chrono::steady_clock::now();
@@ -1131,9 +1148,11 @@ void crusnexo_state::scene_waiting_ready()
 		owners.push_back({{h.key.realm,h.key.section,h.key.source,h.slot,h.epoch,h.generation}});
 	}
 	// Filter already-built proposal geometry. Rebuilding against device-ready
-	// WaveRAM/context would silently mix two resource boundaries. No drawing here.
+	// WaveRAM/context would silently mix two resource boundaries.
 	cruisn::exotica_scene::Result filtered;
-	for(auto instance:m_handover_geometry.instances) {
+	std::map<uint32_t,uint32_t> palette_indices;
+	for(size_t i=0;i<m_handover_geometry.instances.size();++i) {
+		auto instance=m_handover_geometry.instances[i];
 		if(!retained.count({instance.entry,instance.source}))continue;
 		if(instance.first_quad>m_handover_geometry.quads.size() ||
 			instance.quad_count>m_handover_geometry.quads.size()-instance.first_quad)
@@ -1142,6 +1161,56 @@ void crusnexo_state::scene_waiting_ready()
 		instance.first_quad=filtered.quads.size();
 		filtered.quads.insert(filtered.quads.end(),begin,begin+instance.quad_count);
 		filtered.instances.push_back(instance);
+		if(m_handover_mode==2) {
+			if(i>=m_handover_palettes.instance_rows.size())fatalerror("Exotica waiting palette instance extent\n");
+			const auto source_row=m_handover_palettes.instance_rows[i];
+			if(source_row>=m_handover_palettes.rows.size())fatalerror("Exotica waiting palette row extent\n");
+			auto found=palette_indices.find(source_row);
+			if(found==palette_indices.end()) {
+				found=palette_indices.emplace(source_row,uint32_t(m_handover_packet.materials.rows.size())).first;
+				m_handover_packet.materials.rows.push_back(m_handover_palettes.rows[source_row]);
+			}
+			for(size_t j=0;j<instance.quad_count;++j) {
+				cruisn::zeus_wide::Quad q;q.polygon=*(begin+j);q.palette=found->second;m_handover_packet.quads.push_back(q);
+			}
+		}
+	}
+	if(m_handover_mode==2) {
+		const auto started=std::chrono::steady_clock::now();auto &packet=m_handover_packet;
+		if(!m_scene_material_image || !m_handover_generation || m_scene_material_image->generation()!=m_handover_generation ||
+			packet.materials.scene!=m_handover_scene || packet.materials.frame!=m_handover_frame ||
+			packet.page!=m_zeus->m_renderRegs[4] || packet.quads.size()!=filtered.quads.size() ||
+			!cruisn::zeus_host::retain(packet.materials,*m_scene_material_image))
+			fatalerror("Exotica waiting retained image/frame/page ownership\n");
+		const auto staged=std::chrono::steady_clock::now();std::vector<uint8_t> encoded,material;
+		if(!cruisn::zeus_wide::encode(packet,encoded) || !cruisn::zeus_host::encode(packet.materials,material))
+			fatalerror("Exotica waiting retained packet encoding\n");
+		const auto encoded_at=std::chrono::steady_clock::now();
+		if(!m_zeus->midz_host_waiting(encoded.data(),encoded.size()))fatalerror("Exotica waiting owned queue rejected\n");
+		const auto queued=std::chrono::steady_clock::now();
+		if(!cruisn::zeus_host::accept_retained(packet.materials,*m_scene_material_image))fatalerror("Exotica waiting producer commit rejected\n");
+		// No guest dirty-page commit here: guest writes since P belong to the NEXT
+		// future update, not this zero-page continuation of P's private image.
+		const auto committed=std::chrono::steady_clock::now();
+		auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+		if(fprintf(m_scene_material_log,"%llu,%u,%llu,0,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f\n",
+			(unsigned long long)packet.materials.scene,packet.materials.frame,(unsigned long long)packet.materials.wave.generation,
+			unsigned(packet.materials.rows.size()),unsigned(material.size()),(unsigned long long)packet.materials.wave.result_hash,
+			us(started,staged),us(staged,encoded_at),us(encoded_at,queued),us(queued,committed))<0)fatalerror("Exotica waiting material log write\n");
+		if(packet.materials.snapshot) {
+			auto dump=[](const std::string &name,const void *data,size_t bytes) {
+				FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open Exotica waiting draw snapshot\n");
+				const bool ok=fwrite(data,1,bytes,f)==bytes;const int closed=fclose(f);
+				if(!ok || closed)fatalerror("Cannot complete Exotica waiting draw snapshot\n");
+			};
+			const auto prefix="exotica-waiting-draw-"+std::to_string(m_handover_frame);
+			const auto instances=cruisn::exotica_scene::instance_words(filtered);
+			dump(prefix+".xwd",encoded.data(),encoded.size());dump(prefix+"-materials.bin",material.data(),material.size());
+			dump(prefix+"-wave.bin",m_scene_material_image->bytes().data(),m_scene_material_image->bytes().size());
+			dump(prefix+"-quads.bin",filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0]));
+			dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));
+		}
+		m_handover_generation=0;m_handover_packet=cruisn::zeus_wide::Packet{};m_handover_palettes=cruisn::zeus_host::PaletteSet{};
 	}
 	const auto owner_hash=cruisn::exotica_scene::byte_hash(owners.data(),owners.size()*sizeof(owners[0]));
 	const auto geometry_hash=cruisn::exotica_scene::byte_hash(filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0]));
@@ -1398,7 +1467,7 @@ void crusnexo_state::scene_observer_exit()
 		const int closed=fclose(m_handover_log),cohorts_closed=fclose(m_handover_cohorts);
 		m_handover_log=nullptr;m_handover_cohorts=nullptr;
 		fprintf(stderr,"MIDZ_HOST_HANDOVER_RESULT complete=%u scenes=%llu captured=%llu submitted=%llu retired=%llu bytes=%llu snapshots=%u remaining=%u\n",
-			unsigned(good && !closed && !cohorts_closed && !m_handover_pending.pending() &&
+			unsigned(good && !closed && !cohorts_closed && !m_handover_pending.pending() && !m_handover_generation &&
 				m_handover_completed && m_handover_completed==m_waiting_scenes && m_handover_snapshots.empty()),
 			(unsigned long long)m_handover_completed,(unsigned long long)m_handover_captured,
 			(unsigned long long)m_handover_submitted,(unsigned long long)m_handover_retired,

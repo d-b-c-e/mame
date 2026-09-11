@@ -14,6 +14,7 @@
 #include "../../mame/midway/cruisn/zeus_host_materials.h"
 #include "../../mame/midway/cruisn/zeus_margin_packet.h"
 #include "../../mame/midway/cruisn/zeus_wide_packet.h"
+#include "../../mame/midway/cruisn/zeus_retained_materials.h"
 
 #include "screen.h"
 
@@ -1003,7 +1004,7 @@ void thread_main()
 	uint32_t private_frame=0;
 	FILE *private_log=nullptr;
 	bool private_failed=false;
-	auto private_materials=[&](const std::vector<uint8_t> &wire,bool late=false)->bool {
+	auto private_materials=[&](const std::vector<uint8_t> &wire,bool late=false,bool retained=false)->bool {
 		using namespace cruisn::zeus_host;
 		const auto start=std::chrono::steady_clock::now();
 		const char *enabled=std::getenv("MIDZ_HOST_MATERIALS");
@@ -1014,9 +1015,9 @@ void thread_main()
 		if(late) {
 			if(packet.scene!=private_scene || packet.frame!=private_frame || packet.scene<=private_late_scene)return false;
 		} else if(packet.scene<=private_scene ||
-			(envi("MIDZ_HOST_ACTIVE",nullptr,0) && private_late_scene!=private_scene))return false;
+			((envi("MIDZ_HOST_ACTIVE",nullptr,0) || envi("MIDZ_HOST_HANDOVER",nullptr,0)==2) && private_late_scene!=private_scene))return false;
 		if(!private_image)private_image=std::make_unique<WaveImage>();
-		if(!accept(packet,*private_image))return false;
+		if(retained ? !accept_retained(packet,*private_image) : !accept(packet,*private_image))return false;
 		const auto decoded=std::chrono::steady_clock::now();
 		if(!private_log) {
 			private_log=fopen("exotica-host-materials-gpu.csv","w");
@@ -1072,7 +1073,7 @@ void thread_main()
 				const bool written=fwrite(data,1,bytes,file)==bytes;const int closed=fclose(file);
 				return written && !closed;
 			};
-			const auto prefix=std::string(late?"exotica-active-":"exotica-host-")+std::to_string(packet.frame);
+			const auto prefix=std::string(retained?"exotica-waiting-draw-":late?"exotica-active-":"exotica-host-")+std::to_string(packet.frame);
 			if(!save(prefix+"-gpu-wave.bin",wave.data(),wave.size()) ||
 				!save(prefix+"-gpu-palettes.bin",palettes.data(),colors.size()*4))return false;
 			++private_snapshots;
@@ -1385,15 +1386,24 @@ void thread_main()
 	cruisn::CaptureWriter future_writer;
 	FILE *future_log=nullptr;
 	uint64_t future_packets=0,future_quads=0,future_snapshots=0;
-	auto private_future=[&](const std::vector<uint8_t> &wire)->bool {
-		const auto started=std::chrono::steady_clock::now();const int mode=envi("MIDZ_HOST_FUTURE",nullptr,0);
+	cruisn::CaptureWriter waiting_writer;FILE *waiting_log=nullptr;
+	uint64_t waiting_packets=0,waiting_quads=0,waiting_snapshots=0;
+	uint32_t future_page=0,future_multiplier=0;
+	auto private_future=[&](const std::vector<uint8_t> &wire,bool waiting=false)->bool {
+		const auto started=std::chrono::steady_clock::now();const int mode=envi(waiting?"MIDZ_HOST_HANDOVER":"MIDZ_HOST_FUTURE",nullptr,0);
+		if(waiting && mode!=2)return false;
+		const char *prefix=waiting?"exotica-waiting-draw-":"exotica-future-";
+		auto &writer=waiting?waiting_writer:future_writer;auto &log=waiting?waiting_log:future_log;
+		auto &packets=waiting?waiting_packets:future_packets;auto &quads=waiting?waiting_quads:future_quads;
+		auto &snapshots=waiting?waiting_snapshots:future_snapshots;
 		cruisn::zeus_wide::Packet packet;
 		if(!mirror_fbo || !depth_mirror.wide || (mode!=1 && mode!=2) ||
 			!cruisn::zeus_wide::decode(wire.data(),wire.size(),packet) || packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
+		if(waiting && (!future_packets || packet.page!=future_page || packet.multiplier!=future_multiplier))return false;
 		// The ring dispatcher has finished buffered sky copies. Commit them to
 		// both original/private targets before any future geometry is inserted.
 		flush();std::vector<uint8_t> material;
-		if(!cruisn::zeus_host::encode(packet.materials,material) || !private_materials(material))return false;
+		if(!cruisn::zeus_host::encode(packet.materials,material) || !private_materials(material,waiting,waiting))return false;
 		auto read_texture=[&](uint texture,unsigned format,unsigned type) {
 			std::vector<uint8_t> bytes(size_t(fw)*fh*4);
 			gl.ActiveTexture(TEXTURE0+7);gl.BindTexture(0x0de1,texture);gl.PixelStorei(0x0d05,1);
@@ -1447,24 +1457,26 @@ void thread_main()
 			auto after_color=read_texture(mirror_color,RGBA,0x1401),after_depth=read_texture(mirror_depth,DEPTH_COMPONENT,0x1406);
 			if(original_color!=read_texture(fbTex,RGBA,0x1401) || original_depth!=read_texture(depthTex,DEPTH_COMPONENT,0x1405))return false;
 			auto save=[&](const char *suffix,std::vector<uint8_t> bytes) {
-				cruisn::CaptureWriter::Request request;request.path="exotica-future-"+std::to_string(packet.materials.frame)+suffix;request.bitmap=std::move(bytes);
-				return future_writer.submit(std::move(request),capture_paced?10000:0,&s_capture_pacing);
+				cruisn::CaptureWriter::Request request;request.path=std::string(prefix)+std::to_string(packet.materials.frame)+suffix;request.bitmap=std::move(bytes);
+				return writer.submit(std::move(request),capture_paced?10000:0,&s_capture_pacing);
 			};
 			if(!save("-before-color.bin",std::move(before_color)) || !save("-before-depth.bin",std::move(before_depth)) ||
 				!save("-after-color.bin",std::move(after_color)) || !save("-after-depth.bin",std::move(after_depth)))return false;
-			++future_snapshots;
+			++snapshots;
 		}
 		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0de1,waveTex);gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0de1,palTex);gl.ActiveTexture(TEXTURE0);
 		if(gl.GetError())return false;
-		if(!future_log) {
-			future_log=fopen("exotica-future-gpu.csv","w");if(!future_log)return false;setvbuf(future_log,nullptr,_IOFBF,65536);
-			fprintf(future_log,"scene,frame,mode,multiplier,page,quads,vertices,bytes,hash,snapshot,host_us\n");
+		if(!log) {
+			log=fopen((std::string(prefix)+"gpu.csv").c_str(),"w");if(!log)return false;setvbuf(log,nullptr,_IOFBF,65536);
+			fprintf(log,"scene,frame,mode,multiplier,page,quads,vertices,bytes,hash,snapshot,host_us\n");
 		}
 		const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
-		if(fprintf(future_log,"%llu,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%u,%.3f\n",(unsigned long long)packet.materials.scene,
+		if(fprintf(log,"%llu,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%u,%.3f\n",(unsigned long long)packet.materials.scene,
 			packet.materials.frame,unsigned(mode),packet.multiplier,packet.page,unsigned(packet.quads.size()),(unsigned long long)vertices,
 			(unsigned long long)wire.size(),(unsigned long long)hash,unsigned(packet.materials.snapshot),elapsed)<0)return false;
-		++future_packets;future_quads+=packet.quads.size();return true;
+		++packets;quads+=packet.quads.size();
+		if(!waiting){future_page=packet.page;future_multiplier=packet.multiplier;}
+		return true;
 	};
 
 	std::vector<uint8_t> rec;
@@ -1818,6 +1830,9 @@ void thread_main()
 			case 9:
 				if(!private_future(rec)) {private_failed=true;s_stopz.store(true);zlogf("private future validation/draw failed after %llu packets",(unsigned long long)future_packets);}
 				break;
+			case 10:
+				if(!private_future(rec,true)) {private_failed=true;s_stopz.store(true);zlogf("private waiting validation/draw failed after %llu packets",(unsigned long long)waiting_packets);}
+				break;
 			case 8:
 				if(!private_margin(rec)) {
 					private_failed=true;s_stopz.store(true);
@@ -2048,10 +2063,18 @@ void thread_main()
 	}
 	if(envi("MIDZ_HOST_FUTURE",nullptr,0)) {
 		const auto stats=future_writer.finish();const int closed=future_log?fclose(future_log):-1;
-		const bool complete=!private_failed && future_packets && future_packets==private_packets && !closed &&
+		const bool complete=!private_failed && future_packets && future_packets+(envi("MIDZ_HOST_HANDOVER",nullptr,0)==2?waiting_packets:0)==private_packets && !closed &&
 			stats.submitted==4*future_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
 		fprintf(stderr,"MIDZ_HOST_FUTURE_GPU_RESULT complete=%u scenes=%llu quads=%llu snapshots=%llu written=%llu failed=%llu rejected=%llu\n",
 			unsigned(complete),(unsigned long long)future_packets,(unsigned long long)future_quads,(unsigned long long)future_snapshots,
+			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
+	}
+	if(envi("MIDZ_HOST_HANDOVER",nullptr,0)==2) {
+		const auto stats=waiting_writer.finish();const int closed=waiting_log?fclose(waiting_log):-1;
+		const bool complete=!private_failed && waiting_packets && waiting_packets==future_packets && private_late_scene==private_scene && !closed &&
+			stats.submitted==4*waiting_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
+		fprintf(stderr,"MIDZ_HOST_WAITING_DRAW_GPU_RESULT complete=%u scenes=%llu quads=%llu snapshots=%llu written=%llu failed=%llu rejected=%llu\n",
+			unsigned(complete),(unsigned long long)waiting_packets,(unsigned long long)waiting_quads,(unsigned long long)waiting_snapshots,
 			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
 	}
 	if(depth_mirror.stream_frame) {
@@ -2181,6 +2204,18 @@ bool zeus2_device::midz_host_future(const uint8_t *data, size_t size)
 	if(midz_live && mode && (!strcmp(mode,"1") || !strcmp(mode,"2")) && ffb && !strcmp(ffb,"0") && mirror && !strcmp(mirror,"2") &&
 		!std::getenv("MIDZ_DEPTH_STREAM_FRAME") && data && size>=cruisn::zeus_wide::header_bytes && size<=cruisn::zeus_wide::maximum_bytes)
 		return mzgl::ring_push2(9,data,uint32_t(size),nullptr,0);
+#endif
+	return false;
+}
+
+bool zeus2_device::midz_host_waiting(const uint8_t *data,size_t size)
+{
+#ifdef _WIN32
+	const char *mode=std::getenv("MIDZ_HOST_HANDOVER"),*ffb=std::getenv("MIDV_FFB"),*future=std::getenv("MIDZ_HOST_FUTURE"),*mirror=std::getenv("MIDZ_DEPTH_MIRROR");
+	if(midz_live && mode && !strcmp(mode,"2") && ffb && !strcmp(ffb,"0") && future && !strcmp(future,"2") && mirror && !strcmp(mirror,"2") &&
+		!std::getenv("MIDZ_DEPTH_STREAM_FRAME") && (!std::getenv("MIDZ_HOST_ACTIVE") || !strcmp(std::getenv("MIDZ_HOST_ACTIVE"),"0")) &&
+		data && size>=cruisn::zeus_wide::header_bytes && size<=cruisn::zeus_wide::maximum_bytes)
+		return mzgl::ring_push2(10,data,uint32_t(size),nullptr,0);
 #endif
 	return false;
 }

@@ -156,6 +156,7 @@ public:
 	// Owned, bounded private texture uploads only; no original GPU resource writes.
 	bool midz_host_materials(const uint8_t *data, size_t size);
 	bool midz_host_future(const uint8_t *data, size_t size);
+	bool midz_host_waiting(const uint8_t *data, size_t size);
 	bool midz_host_margin(const uint8_t *data,size_t size);
 	// Emulation-thread-only notifications, independent of original upload spans.
 	void midz_host_wave_enable() { m_host_wave_pages=std::make_unique<cruisn::WrittenPages<0x1000000,4096>>(); }
