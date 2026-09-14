@@ -1558,6 +1558,7 @@ void crusnexo_state::scene_waiting_ready()
 		dump(prefix+"-owners.bin",owners.data(),owners.size()*sizeof(owners[0]));
 		dump(prefix+"-instances.bin",instances.data(),instances.size()*sizeof(instances[0]));
 		dump(prefix+"-quads.bin",filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0]));
+		if(m_handover_early)dump(prefix+"-control-quads.bin",control_filtered.quads.data(),control_filtered.quads.size()*sizeof(control_filtered.quads[0]));
 		++m_handover_saved;
 	}
 	++m_handover_completed;m_handover_captured+=completion.captured;
@@ -1797,6 +1798,12 @@ void crusnexo_state::scene_active_ready()
 		m_compose_scene=0;m_compose_waiting={};m_compose_owners.clear();m_compose_sealed_owners.clear();++m_compose_completed;
 	}
 	if(m_active_early) {
+		if(m_active_snapshots.count(p.frame)) {
+			const auto name="exotica-active-"+std::to_string(p.frame)+"-control-quads.bin";
+			FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open private active control\n");
+			const auto bytes=scene.quads.size()*sizeof(scene.quads[0]);const bool good=fwrite(scene.quads.data(),1,bytes,f)==bytes;
+			const int closed=fclose(f);if(!good || closed)fatalerror("Private active control write\n");
+		}
 		cruisn::exotica_scene::Result completed;
 		if(!cruisn::exotica_scene_endpoint::select(original_scene,endpoint_scene,scene,true,completed))reject("filtered active endpoint");
 		scene=std::move(completed);
