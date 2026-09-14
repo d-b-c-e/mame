@@ -43,6 +43,8 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/exotica_waiting_handover.h"
 #include "cruisn/exotica_composition.h"
 #include "cruisn/zeus_retained_materials.h"
+#include "cruisn/exotica_command_owners.h"
+#include "cruisn/exotica_model_endpoint.h"
 
 #include <algorithm>
 #include <chrono>
@@ -186,6 +188,7 @@ protected:
 		visibility_start();
 		scene_observer_start();
 		lifetime_start();
+		endpoint_start();
 	}
 
 	virtual void machine_reset() override
@@ -197,6 +200,22 @@ protected:
 	}
 
 private:
+	struct LifetimeOwner;
+	void endpoint_start();
+	void endpoint_commit(uint32_t end,uint32_t flags,const LifetimeOwner &owner);
+	void endpoint_model(uint32_t base,uint32_t count,uint32_t yscale);
+	void endpoint_exit();
+	struct EndpointPending {
+		cruisn::scenery_lifetimes::Handle owner;
+		cruisn::exotica_state::Operands operands;
+		uint32_t frame=0;double time=0;
+	};
+	cruisn::exotica_commands::Owners m_endpoint_owners;
+	std::map<uint64_t,EndpointPending> m_endpoint_pending;
+	FILE *m_endpoint_log=nullptr,*m_endpoint_inputs=nullptr;
+	uint32_t m_endpoint_first=0,m_endpoint_last=0,m_endpoint_snapshot=0;
+	uint64_t m_endpoint_commits=0,m_endpoint_consumed=0,m_endpoint_untracked=0;
+	uint64_t m_endpoint_prepared=0,m_endpoint_rejected=0,m_endpoint_saved=0,m_endpoint_bytes=0;
 
 	void lifetime_start();
 	bool lifetime_scope();
@@ -580,6 +599,7 @@ void crusnexo_state::lifetime_start()
 			if(flags&0x04000000){reason|=2;owner.faded=true;++m_lifetime_fading_draws;}
 			else if(owner.faded && !owner.opaque){reason|=4;owner.opaque=true;++m_lifetime_opaque;}
 			if(reason){++m_lifetime_draw_records;lifetime_emit('D',slot,owner.handle.generation,owner.serial,owner.handle.key,reason,flags);}
+			endpoint_commit(data,flags,owner);
 		});
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::lifetime_exit,this));
 	fprintf(stderr,"MIDZ_LIFETIME=1 first=%u last=%u\n",m_lifetime_first,m_lifetime_last);
@@ -597,6 +617,161 @@ void crusnexo_state::lifetime_exit()
 		(unsigned long long)m_lifetime_bindings,(unsigned long long)m_lifetime_emissions,(unsigned long long)m_lifetime_owned,
 		(unsigned long long)m_lifetime_draw_records,(unsigned long long)m_lifetime_first_draws,(unsigned long long)m_lifetime_fading_draws,
 		(unsigned long long)m_lifetime_opaque,(unsigned long long)m_lifetimes.epoch());
+}
+
+// Read-only qualification of original-command endpoints. No guest register,
+// WaveRAM, palette, GPU or visibility-admission changes are made here.
+void crusnexo_state::endpoint_start()
+{
+	const char *mode=std::getenv("MIDZ_MODEL_ENDPOINT");
+	if(!mode || !strcmp(mode,"0"))return;
+	const char *ffb=std::getenv("MIDV_FFB");
+	if(strcmp(mode,"1") || !ffb || strcmp(ffb,"0") || !m_lifetime_log || strcmp(machine().system().name,"crusnexo"))
+		fatalerror("Exotica endpoint observation requires lifetimes and physical FFB=0\n");
+	auto number=[](const char *name) {
+		const char *s=std::getenv(name);if(!s || !*s)fatalerror("Missing endpoint bound %s\n",name);
+		for(const char *p=s;*p;++p)if(*p<'0' || *p>'9')fatalerror("Invalid endpoint bound %s\n",name);
+		char *end=nullptr;auto v=strtoul(s,&end,10);
+		if(*end || v<1800 || v>15998)fatalerror("Endpoint range %s\n",name);
+		return uint32_t(v);
+	};
+	m_endpoint_first=number("MIDZ_MODEL_ENDPOINT_FIRST");m_endpoint_last=number("MIDZ_MODEL_ENDPOINT_LAST");
+	m_endpoint_snapshot=number("MIDZ_MODEL_ENDPOINT_SNAPSHOT");
+	if(m_endpoint_first>m_endpoint_last || m_endpoint_last-m_endpoint_first>120 ||
+		m_endpoint_snapshot<m_endpoint_first || m_endpoint_snapshot>m_endpoint_last ||
+		m_lifetime_first>=m_endpoint_first || m_lifetime_last<=m_endpoint_last)
+		fatalerror("Endpoint interval requires surrounding lifetime coverage\n");
+	m_endpoint_log=fopen("exotica-endpoint-models.csv","w");
+	m_endpoint_inputs=fopen("exotica-endpoint-inputs.txt","w");
+	if(!m_endpoint_log || !m_endpoint_inputs)fatalerror("Cannot create endpoint observer files\n");
+	setvbuf(m_endpoint_log,nullptr,_IOFBF,65536);setvbuf(m_endpoint_inputs,nullptr,_IOFBF,65536);
+	fprintf(m_endpoint_log,"id,commit_frame,commit_time,device_frame,device_time,epoch,generation,slot,realm,section,source,end,opcode,base,flags,packed,status,quads,changed,snapshot\n");
+	m_zeus->set_midz_model_observer([this](uint32_t base,uint32_t count,uint32_t scale) {
+		endpoint_model(base,count,scale);scene_observer_model(base,count,scale);
+	});
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::endpoint_exit,this));
+	fprintf(stderr,"MIDZ_MODEL_ENDPOINT=1 first=%u last=%u snapshot=%u\n",m_endpoint_first,m_endpoint_last,m_endpoint_snapshot);
+}
+
+void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeOwner &owner)
+{
+	const uint32_t frame=uint32_t(m_screen->frame_number());
+	if(!m_endpoint_log || frame<m_endpoint_first || frame>m_endpoint_last)return;
+	const auto cycles=m_maincpu->total_cycles();
+	if(!m_endpoint_commits) {
+		const std::pair<uint32_t,uint32_t> signatures[]={{0xb472,0x880000},{0xb681,0x0828046d},
+			{0xb684,0x08403001},{0xb685,0x15400608},{0xb686,0x1528046d}};
+		for(const auto &s:signatures)if(m_ram_base[s.first]!=s.second)fatalerror("Endpoint consumer signature %x\n",s.first);
+	}
+	if(m_endpoint_owners.epoch()!=owner.handle.epoch && !m_endpoint_owners.reset(owner.handle.epoch))
+		fatalerror("Endpoint epoch changed with pending commands\n");
+	const uint32_t opcode=m_ram_base[0x30000+((end-0x30000+0x1ffe)&0x1fff)];
+	const uint32_t base=m_ram_base[0x30000+((end-0x30000+0x1fff)&0x1fff)];
+	const uint64_t id=++m_endpoint_commits;
+	if(id>65536 || !m_endpoint_owners.submit(id,end,opcode,base))fatalerror("Endpoint commit bounds/order\n");
+	EndpointPending p;p.owner=owner.handle;p.frame=frame;p.time=machine().time().as_double();p.operands.flags=flags;
+	auto &a=p.operands;
+	std::copy_n(m_ram_base+owner.handle.slot,32,a.object.begin());
+	if(flags&0x04000000) {
+		a.cache.fill(UINT32_MAX);a.palette_setup=scene_read(0x15f2);
+		for(unsigned i=0;i<12;++i)a.constants[i]=scene_read(0x67d0+i);
+		for(unsigned i=0;i<46;++i)a.commands[i]=scene_read(0xb479+i);
+		const uint32_t pointers[]={0xe7c1,0xe7c7,0xe7d3,0xe7d9};
+		for(unsigned i=0;i<4;++i) {
+			a.programs[i]=scene_read(pointers[i]);
+			if(!cruisn::exotica_future::span(a.programs[i],4))fatalerror("Endpoint program span\n");
+			for(unsigned j=0;j<4;++j)a.bodies[i][j]=scene_read(a.programs[i]+j);
+		}
+		const uint32_t d=scene_read(0xe4);
+		if(!cruisn::exotica_future::span(d,1))fatalerror("Endpoint default pointer\n");
+		const uint32_t n=scene_read(d);
+		if(n>=16 || !cruisn::exotica_future::span(d,n+2))fatalerror("Endpoint default span\n");
+		for(unsigned i=0;i<=n;++i)a.defaults.push_back(scene_read(d+1+i));
+	}
+	if(!m_endpoint_pending.emplace(id,std::move(p)).second || m_maincpu->total_cycles()!=cycles)
+		fatalerror("Endpoint capture identity/cycles\n");
+}
+
+void crusnexo_state::endpoint_model(uint32_t base,uint32_t count,uint32_t yscale)
+{
+	const uint32_t frame=uint32_t(m_screen->frame_number());
+	if(!m_endpoint_log || frame<m_endpoint_first || (frame>m_endpoint_last && m_endpoint_pending.empty()))return;
+	if(m_maincpu->state_int(TMS320C3X_PC)!=0xb686){++m_endpoint_untracked;return;}
+	const uint32_t end=uint32_t(m_maincpu->state_int(TMS320C3X_AR0));
+	if(!cruisn::exotica_commands::Owners::cursor(end))fatalerror("Endpoint consumer ring bounds\n");
+	const uint32_t opcode=m_ram_base[0x30000+((end-0x30000+0x1ffe)&0x1fff)];
+	if(m_ram_base[0x30000+((end-0x30000+0x1fff)&0x1fff)]!=base || opcode!=(0x24860000|count))
+		fatalerror("Endpoint actual device packet differs\n");
+	if(!m_endpoint_owners.epoch()){++m_endpoint_untracked;return;}
+	cruisn::exotica_commands::Ticket ticket;
+	const auto status=m_endpoint_owners.consume(end,opcode,base,ticket);
+	if(status==cruisn::exotica_commands::Status::untracked){++m_endpoint_untracked;return;}
+	if(status!=cruisn::exotica_commands::Status::matched)fatalerror("Endpoint device ownership/order\n");
+	const auto cycles=m_maincpu->total_cycles();
+	auto found=m_endpoint_pending.find(ticket.id);
+	if(found==m_endpoint_pending.end())fatalerror("Endpoint missing owned operands\n");
+	const auto &p=found->second;const auto &a=p.operands;const auto &h=p.owner;
+	const double now=machine().time().as_double();
+	if(now<p.time || now-p.time>.05 || frame>m_lifetime_last || ticket.epoch!=h.epoch)
+		fatalerror("Endpoint command age/epoch\n");
+	cruisn::exotica_endpoint::Result result;cruisn::zeus_state::Context c;
+	std::vector<uint32_t> words;unsigned prepared=0;
+	if(a.flags&0x04000000) {
+		const auto &z=*m_zeus;
+		c.quad_size=z.zeus_quad_size;c.ucode=z.m_curUCodeSrc;c.palette=z.m_curPalTableSrc;
+		c.texture=z.zeus_texbase;c.yscale=yscale;c.zoffset=z.m_useZOffset;
+		std::memcpy(c.matrix.data(),z.zeus_matrix,sizeof(z.zeus_matrix));
+		std::copy_n(z.zeus_trans,4,c.translation.begin());std::copy_n(z.zeus_light,3,c.light.begin());
+		std::copy_n(z.m_zeusbase,128,c.regs.begin());std::copy_n(z.m_renderRegs,80,c.render.begin());
+		const size_t offset=2*(size_t(base%1024)+size_t((base>>16)%2048)*1024),n=2*(size_t(count)+1);
+		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);
+		prepared=cruisn::exotica_endpoint::prepare(c,frame,base,count,z.m_upstream_render,words,a,result)?1:2;
+		if(prepared==1)++m_endpoint_prepared;else ++m_endpoint_rejected;
+	}
+	const bool snapshot=frame==m_endpoint_snapshot && prepared;
+	if(snapshot) {
+		if(++m_endpoint_saved>1024)fatalerror("Endpoint snapshot count\n");
+		// Decimal words use the standalone analyzer's bounded input format.
+		auto word=[this](uint32_t w){if(fprintf(m_endpoint_inputs,"%u ",w)<0)fatalerror("Endpoint input write\n");};
+		auto array=[&](const auto &values){for(auto v:values)word(v);};
+		auto floats=[&](const auto &values){for(float f:values){uint32_t w;std::memcpy(&w,&f,4);word(w);}};
+		for(uint32_t v:{uint32_t(ticket.id),frame,base,count,uint32_t(m_zeus->m_upstream_render),c.quad_size,c.ucode,c.palette,c.texture,c.yscale,c.zoffset})word(v);
+		floats(c.matrix);floats(c.translation);floats(c.light);array(c.regs);array(c.render);
+		word(a.flags);word(a.palette_setup);array(a.object);array(a.cache);array(a.constants);array(a.commands);array(a.programs);
+		for(const auto &body:a.bodies)array(body);
+		word(uint32_t(a.defaults.size()));array(a.defaults);array(words);
+		if(fputc('\n',m_endpoint_inputs)==EOF || ftell(m_endpoint_inputs)<0 || ftell(m_endpoint_inputs)>64*1024*1024)
+			fatalerror("Endpoint input budget/write\n");
+		if(prepared==1)for(unsigned endpoint=0;endpoint<2;++endpoint) {
+			const auto &quads=endpoint?result.replacement:result.original;
+			const size_t bytes=quads.size()*sizeof(quads[0]);m_endpoint_bytes+=bytes;
+			if(m_endpoint_bytes>64*1024*1024)fatalerror("Endpoint geometry budget\n");
+			const auto name=std::string("exotica-endpoint-")+std::to_string(ticket.id)+(endpoint?"-endpoint.bin":"-original.bin");
+			FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Endpoint snapshot create\n");
+			const bool good=!bytes || fwrite(quads.data(),1,bytes,f)==bytes;
+			const int closed=fclose(f);if(!good || closed)fatalerror("Endpoint snapshot write\n");
+		}
+	}
+	if(fprintf(m_endpoint_log,"%llu,%u,%.17g,%u,%.17g,%llu,%llu,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+		(unsigned long long)ticket.id,p.frame,p.time,frame,now,(unsigned long long)h.epoch,(unsigned long long)h.generation,h.slot,
+		(unsigned long long)h.key.realm,h.key.section,h.key.source,end,opcode,base,a.flags,a.object[16],prepared,
+		unsigned(result.original.size()),unsigned(result.changed),unsigned(snapshot))<0)fatalerror("Endpoint journal write\n");
+	++m_endpoint_consumed;m_endpoint_pending.erase(found);
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Endpoint observation changed CPU cycles\n");
+}
+
+void crusnexo_state::endpoint_exit()
+{
+	if(!m_endpoint_log)return;
+	bool complete=m_screen->frame_number()>m_endpoint_last && m_endpoint_commits && m_endpoint_pending.empty() &&
+		!m_endpoint_owners.pending() && m_endpoint_commits==m_endpoint_consumed && !ferror(m_endpoint_log) && !ferror(m_endpoint_inputs);
+	if(fclose(m_endpoint_log))complete=false;
+	if(fclose(m_endpoint_inputs))complete=false;
+	m_endpoint_log=nullptr;m_endpoint_inputs=nullptr;
+	fprintf(stderr,"MIDZ_MODEL_ENDPOINT_RESULT complete=%u commits=%llu consumed=%llu untracked=%llu prepared=%llu rejected=%llu snapshots=%llu bytes=%llu remaining=%llu\n",
+		unsigned(complete),(unsigned long long)m_endpoint_commits,(unsigned long long)m_endpoint_consumed,(unsigned long long)m_endpoint_untracked,
+		(unsigned long long)m_endpoint_prepared,(unsigned long long)m_endpoint_rejected,(unsigned long long)m_endpoint_saved,
+		(unsigned long long)m_endpoint_bytes,(unsigned long long)m_endpoint_pending.size());
 }
 
 void crusnexo_state::scene_observer_start()
