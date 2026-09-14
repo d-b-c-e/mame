@@ -325,7 +325,6 @@ void midvunit_base_state::world_host_start()
 		if(strcmp(roads,"0") && strcmp(roads,"1"))fatalerror("MIDV_WORLD_HOST_ROADS requires 0/1\n");
 		m_host_roads=!strcmp(roads,"1");
 	}
-	if(m_host_roads && m_host_revision!=24)fatalerror("Host road decoder requires World 2.4\n");
 	if(const char *layer=std::getenv("MIDV_WORLD_HOST_LAYER"))
 	{
 		if(strlen(layer)!=1 || layer[0]<'0' || layer[0]>'3')fatalerror("MIDV_WORLD_HOST_LAYER requires 0..3\n");
@@ -394,7 +393,7 @@ void midvunit_base_state::world_host_start()
 				auto disabler=machine().disable_side_effects();
 				return s.read_dword(p);
 			};
-			if(m_host_roads && !cruisn::world_road::code_matches(read))
+			if(m_host_roads && !cruisn::world_road::code_matches(read,m_host_revision))
 				fatalerror("World road template/descriptor code guard failed\n");
 			std::vector<cruisn::world_host::Descriptor> future;
 			cruisn::world_future::Stats future_stats;
