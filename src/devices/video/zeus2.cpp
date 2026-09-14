@@ -1400,6 +1400,9 @@ void thread_main()
 		if(!mirror_fbo || !depth_mirror.wide || (mode!=1 && mode!=2) ||
 			!cruisn::zeus_wide::decode(wire.data(),wire.size(),packet) || packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
 		if(waiting && (!future_packets || packet.page!=future_page || packet.multiplier!=future_multiplier))return false;
+		// Paced diagnostics include texture readback/copy/validation, not just
+		// queue admission. The producer retains its independent10s hard limit.
+		cruisn::CapturePacingScope capture_scope(capture_paced && packet.materials.snapshot ? &s_capture_pacing : nullptr);
 		// The ring dispatcher has finished buffered sky copies. Commit them to
 		// both original/private targets before any future geometry is inserted.
 		flush();std::vector<uint8_t> material;
@@ -1525,6 +1528,7 @@ void thread_main()
 		uint64_t colors=0,depths=0;double snapshot_us=0;
 		const bool snapshot=depth_mirror.snapshots.erase(frame)!=0;
 		if(snapshot) {
+			cruisn::CapturePacingScope capture_scope(capture_paced ? &s_capture_pacing : nullptr);
 			const auto began=std::chrono::steady_clock::now();
 			const size_t pixels=size_t(fw)*fh,bytes=pixels*4;
 			if(bytes>64*1024*1024)return false;
