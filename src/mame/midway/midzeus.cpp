@@ -225,6 +225,7 @@ private:
 	uint32_t m_endpoint_first=0,m_endpoint_last=0,m_endpoint_snapshot=0;
 	bool m_endpoint_draw=false;
 	bool m_endpoint_early=false,m_active_early=false,m_handover_early=false;
+	bool m_endpoint_marked=false;
 	std::set<uint32_t> m_endpoint_active_slots;
 	cruisn::exotica_scene::Result m_handover_control;
 	FILE *m_endpoint_early_log=nullptr;
@@ -646,11 +647,14 @@ void crusnexo_state::lifetime_exit()
 void crusnexo_state::endpoint_start()
 {
 	const char *mode=std::getenv("MIDZ_MODEL_ENDPOINT");
+	const char *marked=std::getenv("MIDZ_ENDPOINT_MARKED");
+	if(marked && strcmp(marked,"0") && strcmp(marked,"1"))fatalerror("Invalid endpoint observation scope\n");
+	m_endpoint_marked=marked && !strcmp(marked,"1");
 	const char *early=std::getenv("MIDZ_ENDPOINT_EARLY");
 	if(early && strcmp(early,"0") && strcmp(early,"1"))fatalerror("Invalid private early visibility mode\n");
 	m_endpoint_early=early && !strcmp(early,"1");
 	if(!mode || !strcmp(mode,"0")) {
-		if(m_endpoint_early)fatalerror("Private early visibility requires endpoint drawing\n");
+		if(m_endpoint_early || m_endpoint_marked)fatalerror("Private visibility/scope requires endpoint observation\n");
 		return;
 	}
 	const char *ffb=std::getenv("MIDV_FFB");
@@ -678,7 +682,7 @@ void crusnexo_state::endpoint_start()
 		fprintf(m_endpoint_admit_log,"id,admitted,first_sequence,first_frame,last_sequence,last_frame,packets,records\n");
 		fprintf(stderr,"MIDZ_MODEL_ADMIT_FIRST=%u\n",m_endpoint_admit_from);
 	}
-	if(m_endpoint_first>m_endpoint_last || m_endpoint_last-m_endpoint_first>120 ||
+	if(m_endpoint_first>m_endpoint_last || (!m_endpoint_marked && m_endpoint_last-m_endpoint_first>120) ||
 		m_endpoint_snapshot<m_endpoint_first || m_endpoint_snapshot>m_endpoint_last ||
 		m_lifetime_first>=m_endpoint_first || m_lifetime_last<=m_endpoint_last)
 		fatalerror("Endpoint interval requires surrounding lifetime coverage\n");
@@ -686,6 +690,7 @@ void crusnexo_state::endpoint_start()
 	if(m_endpoint_early && (!m_endpoint_draw || !m_compose || m_active_mode!=2 || m_handover_mode!=2))
 		fatalerror("Private early visibility requires original handover and composed private margins\n");
 	fprintf(stderr,"MIDZ_ENDPOINT_EARLY=%u\n",unsigned(m_endpoint_early));
+	fprintf(stderr,"MIDZ_ENDPOINT_MARKED=%u\n",unsigned(m_endpoint_marked));
 	if(m_endpoint_early) {
 		m_endpoint_early_log=fopen("exotica-early-active.csv","w");
 		if(!m_endpoint_early_log)fatalerror("Cannot create private visibility journal\n");
@@ -708,6 +713,9 @@ void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeO
 {
 	const uint32_t frame=uint32_t(m_screen->frame_number());
 	if(!m_endpoint_log || frame<m_endpoint_first || frame>m_endpoint_last)return;
+	// Exact FIFO ownership is still required for every eligible command. Other
+	// commands remain explicitly untracked; never match only by model address.
+	if(m_endpoint_marked && !(flags&0x04000000))return;
 	const auto cycles=m_maincpu->total_cycles();
 	if(!m_endpoint_commits) {
 		const std::pair<uint32_t,uint32_t> signatures[]={{0xb472,0x880000},{0xb681,0x0828046d},
@@ -802,7 +810,9 @@ void crusnexo_state::endpoint_model(uint32_t base,uint32_t count,uint32_t yscale
 	if(m_endpoint_draw && p.admitted && prepared==1 && !result.original.empty() &&
 		!m_zeus->midz_endpoint_begin(uint32_t(ticket.id),frame,result.original.data(),result.replacement.data(),result.original.size()))
 		fatalerror("Endpoint private model preparation rejected\n");
-	const bool snapshot=frame==m_endpoint_snapshot && prepared;
+	// A full drive can encounter a new unsupported state far from the selected
+	// snapshot. Retain the first rejected model's owned operands without a rerun.
+	const bool snapshot=(frame==m_endpoint_snapshot && prepared) || (m_endpoint_marked && prepared==2 && m_endpoint_rejected==1);
 	if(snapshot) {
 		if(++m_endpoint_saved>1024)fatalerror("Endpoint snapshot count\n");
 		// Decimal words use the standalone analyzer's bounded input format.
@@ -1615,7 +1625,7 @@ void crusnexo_state::scene_active_seal()
 			if(status==cruisn::exotica_admissions::Status::invalid)fatalerror("Private active endpoint stale admission\n");
 			if(status==cruisn::exotica_admissions::Status::matched) {
 				m_endpoint_active_slots.insert(source.source);const auto &h=admission.owner;
-				if(++m_endpoint_early_rows>65536 || fprintf(m_endpoint_early_log,"%llu,%u,%llu,%llu,%u,%llu,%llu,%llu,%u,%u,%llu,%u,%llu,%u\n",
+				if(++m_endpoint_early_rows>(m_endpoint_marked?200000U:65536U) || fprintf(m_endpoint_early_log,"%llu,%u,%llu,%llu,%u,%llu,%llu,%llu,%u,%u,%llu,%u,%llu,%u\n",
 					(unsigned long long)m_scene_fence_scene,m_active_seed.frame,(unsigned long long)m_lifetime_records,
 					(unsigned long long)m_endpoint_admit_sequence,h.slot,(unsigned long long)h.epoch,(unsigned long long)h.generation,
 					(unsigned long long)h.key.realm,h.key.section,h.key.source,(unsigned long long)admission.first_sequence,admission.first_frame,

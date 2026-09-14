@@ -1197,6 +1197,7 @@ void thread_main()
 	cruisn::zeus_endpoint_pair::Order endpoint_order;
 	cruisn::zeus_endpoint_pair::Pair endpoint_pair;
 	uint64_t endpoint_pairs=0;
+	const uint64_t endpoint_pair_limit=envi("MIDZ_ENDPOINT_MARKED",nullptr,0)==1?1000000:131072;
 	FILE *endpoint_log=nullptr;
 	if(envi("MIDZ_MODEL_ENDPOINT",nullptr,0)==2) {
 		if(!mirror_fbo || !depth_mirror.wide) {zlogf("endpoint replacement requires private wide target");return;}
@@ -1745,7 +1746,7 @@ void thread_main()
 						cruisn::zeus_model::Quad actual,replacement;
 						static_assert(sizeof(actual)==sizeof(q),"endpoint original quad ABI");
 						std::memcpy(&actual,&q,sizeof(q));
-						if(!endpoint_order.consume(actual,replacement) || ++endpoint_pairs>131072) {
+						if(!endpoint_order.consume(actual,replacement) || ++endpoint_pairs>endpoint_pair_limit) {
 							private_failed=true;s_stopz.store(true);zlogf("endpoint actual original mismatch/order");break;
 						}
 						// Finish earlier commands. Never blend both versions into the
