@@ -46,6 +46,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/exotica_command_owners.h"
 #include "cruisn/exotica_model_endpoint.h"
 #include "cruisn/exotica_admissions.h"
+#include "cruisn/exotica_scene_endpoint.h"
 
 #include <algorithm>
 #include <chrono>
@@ -223,6 +224,11 @@ private:
 	FILE *m_endpoint_log=nullptr,*m_endpoint_inputs=nullptr;
 	uint32_t m_endpoint_first=0,m_endpoint_last=0,m_endpoint_snapshot=0;
 	bool m_endpoint_draw=false;
+	bool m_endpoint_early=false,m_active_early=false,m_handover_early=false;
+	std::set<uint32_t> m_endpoint_active_slots;
+	cruisn::exotica_scene::Result m_handover_control;
+	FILE *m_endpoint_early_log=nullptr;
+	uint64_t m_endpoint_early_rows=0,m_endpoint_early_scenes=0;
 	uint64_t m_endpoint_commits=0,m_endpoint_consumed=0,m_endpoint_untracked=0;
 	uint64_t m_endpoint_prepared=0,m_endpoint_rejected=0,m_endpoint_saved=0,m_endpoint_bytes=0;
 
@@ -640,7 +646,13 @@ void crusnexo_state::lifetime_exit()
 void crusnexo_state::endpoint_start()
 {
 	const char *mode=std::getenv("MIDZ_MODEL_ENDPOINT");
-	if(!mode || !strcmp(mode,"0"))return;
+	const char *early=std::getenv("MIDZ_ENDPOINT_EARLY");
+	if(early && strcmp(early,"0") && strcmp(early,"1"))fatalerror("Invalid private early visibility mode\n");
+	m_endpoint_early=early && !strcmp(early,"1");
+	if(!mode || !strcmp(mode,"0")) {
+		if(m_endpoint_early)fatalerror("Private early visibility requires endpoint drawing\n");
+		return;
+	}
 	const char *ffb=std::getenv("MIDV_FFB");
 	if((strcmp(mode,"1") && strcmp(mode,"2")) || !ffb || strcmp(ffb,"0") || !m_lifetime_log || strcmp(machine().system().name,"crusnexo"))
 		fatalerror("Exotica endpoint observation requires lifetimes and physical FFB=0\n");
@@ -671,6 +683,15 @@ void crusnexo_state::endpoint_start()
 		m_lifetime_first>=m_endpoint_first || m_lifetime_last<=m_endpoint_last)
 		fatalerror("Endpoint interval requires surrounding lifetime coverage\n");
 	if(m_endpoint_draw && !m_endpoint_admit_from)fatalerror("Endpoint private drawing requires actual admission observation\n");
+	if(m_endpoint_early && (!m_endpoint_draw || !m_compose || m_active_mode!=2 || m_handover_mode!=2))
+		fatalerror("Private early visibility requires original handover and composed private margins\n");
+	fprintf(stderr,"MIDZ_ENDPOINT_EARLY=%u\n",unsigned(m_endpoint_early));
+	if(m_endpoint_early) {
+		m_endpoint_early_log=fopen("exotica-early-active.csv","w");
+		if(!m_endpoint_early_log)fatalerror("Cannot create private visibility journal\n");
+		setvbuf(m_endpoint_early_log,nullptr,_IOFBF,65536);
+		fprintf(m_endpoint_early_log,"scene,frame,records,packets,slot,epoch,generation,realm,section,source,first_sequence,first_frame,last_sequence,last_frame\n");
+	}
 	m_endpoint_log=fopen("exotica-endpoint-models.csv","w");
 	m_endpoint_inputs=fopen("exotica-endpoint-inputs.txt","w");
 	if(!m_endpoint_log || !m_endpoint_inputs)fatalerror("Cannot create endpoint observer files\n");
@@ -821,6 +842,11 @@ void crusnexo_state::endpoint_exit()
 	if(fclose(m_endpoint_log))complete=false;
 	if(fclose(m_endpoint_inputs))complete=false;
 	m_endpoint_log=nullptr;m_endpoint_inputs=nullptr;
+	if(m_endpoint_early_log) {
+		bool good=!ferror(m_endpoint_early_log);if(fclose(m_endpoint_early_log))good=false;m_endpoint_early_log=nullptr;
+		fprintf(stderr,"MIDZ_ENDPOINT_EARLY_RESULT complete=%u scenes=%llu permissions=%llu\n",unsigned(complete && good && m_endpoint_early_scenes),
+			(unsigned long long)m_endpoint_early_scenes,(unsigned long long)m_endpoint_early_rows);
+	}
 	if(m_endpoint_admit_log) {
 		bool good=!ferror(m_endpoint_admit_log) && !ferror(m_endpoint_admit_packets);
 		if(fclose(m_endpoint_admit_log))good=false;
@@ -1151,6 +1177,8 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	std::copy_n(z.zeus_trans,4,c.translation.begin());std::copy_n(z.zeus_light,3,c.light.begin());
 	std::copy_n(z.m_zeusbase,128,c.regs.begin());std::copy_n(z.m_renderRegs,80,c.render.begin());
 	if(m_active_mode) {m_active_seed=p;m_active_seed_scene=pending.scene;m_active_seed_bank=pending.bank;}
+	m_active_early=m_endpoint_early && p.frame>=m_endpoint_first && p.frame<=m_endpoint_last;
+	if(m_endpoint_early)p.complete_fade=m_active_early;
 	cruisn::exotica_future::Result sources;
 	if(m_scene_source_cache) {
 		// Cache lifetime is this machine instance. ROM regions are immutable in
@@ -1203,6 +1231,13 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		cruisn::exotica_scene::Result proposed;
 		if(!cruisn::exotica_scene::build(selected,wp,read,model_read,[](const cruisn::exotica_future::Source &){return true;},proposed))
 			fatalerror("Exotica waiting proposed geometry rejection frame%u\n",p.frame);
+		m_handover_early=m_active_early;m_handover_control={};
+		if(m_handover_early) {
+			auto control=wp;control.complete_fade=false;cruisn::exotica_scene::Result checked;
+			if(!cruisn::exotica_scene::build(selected,control,read,model_read,[](const cruisn::exotica_future::Source &){return true;},m_handover_control) ||
+				!cruisn::exotica_scene_endpoint::select(m_handover_control,proposed,m_handover_control,false,checked))
+				fatalerror("Private waiting endpoint changed original geometry/materials\n");
+		}
 		const auto hash=cruisn::exotica_scene::byte_hash(proposed.quads.data(),proposed.quads.size()*sizeof(proposed.quads[0]));
 		if(fprintf(m_waiting_log,"%llu,%u,%.12f,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0\n",
 			(unsigned long long)pending.scene,p.frame,now,(unsigned long long)m_lifetimes.epoch(),(unsigned long long)m_lifetimes.sequence(),(unsigned long long)m_lifetime_records,
@@ -1428,7 +1463,7 @@ void crusnexo_state::scene_waiting_ready()
 	}
 	// Filter already-built proposal geometry. Rebuilding against device-ready
 	// WaveRAM/context would silently mix two resource boundaries.
-	cruisn::exotica_scene::Result filtered;
+	cruisn::exotica_scene::Result filtered,control_filtered;
 	std::map<uint32_t,uint32_t> palette_indices;
 	for(size_t i=0;i<m_handover_geometry.instances.size();++i) {
 		auto instance=m_handover_geometry.instances[i];
@@ -1437,6 +1472,13 @@ void crusnexo_state::scene_waiting_ready()
 			instance.quad_count>m_handover_geometry.quads.size()-instance.first_quad)
 			fatalerror("Exotica waiting completion geometry extent\n");
 		const auto begin=m_handover_geometry.quads.begin()+instance.first_quad;
+		if(m_handover_early) {
+			auto original=m_handover_control.instances.at(i);
+			const auto first=m_handover_control.quads.begin()+original.first_quad;
+			original.first_quad=control_filtered.quads.size();
+			control_filtered.quads.insert(control_filtered.quads.end(),first,first+original.quad_count);
+			control_filtered.instances.push_back(original);
+		}
 		instance.first_quad=filtered.quads.size();
 		filtered.quads.insert(filtered.quads.end(),begin,begin+instance.quad_count);
 		filtered.instances.push_back(instance);
@@ -1523,11 +1565,14 @@ void crusnexo_state::scene_waiting_ready()
 	if(m_compose) {
 		if(m_compose_scene || m_handover_frame!=m_active_seed.frame || m_handover_scene!=m_active_seed_scene)
 			fatalerror("Exotica composition proposal/active scene mismatch\n");
-		m_compose_waiting=std::move(filtered);m_compose_owners.clear();
+		// Composition compares the unmodified controls, before endpoint changes
+		// can conceal a differing fade or material state between P and E.
+		m_compose_waiting=m_handover_early?std::move(control_filtered):std::move(filtered);m_compose_owners.clear();
 		for(const auto &item:completion.items)m_compose_owners.push_back(item.owner);
 		m_compose_scene=m_handover_scene;
 	}
 	m_handover_geometry=cruisn::exotica_scene::Result{};
+	m_handover_control={};m_handover_early=false;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica waiting completion changed CPU cycles\n");
 }
 
@@ -1558,6 +1603,25 @@ void crusnexo_state::scene_active_seal()
 	// FIFO still drains. Seal owned render operands before that simulation work.
 	if(m_active_sealed_scene || !m_active_capture.finish(read,m_active_submitted,m_active_sealed))
 		fatalerror("Exotica active scene-end list/render ownership rejected at scene%llu\n",(unsigned long long)m_scene_fence_scene);
+	m_endpoint_active_slots.clear();
+	if(m_active_early && m_endpoint_admissions.epoch()) {
+		// Copy permission at E, alongside the sealed operands. A later slot
+		// occupant at R cannot grant permission to this older scene's object.
+		for(const auto &list:m_active_sealed.lists)for(const auto &source:list.sources) {
+			const auto found=m_lifetime_owners.find(source.source);if(found==m_lifetime_owners.end())continue;
+			cruisn::exotica_admissions::Entry admission;
+			const auto status=m_endpoint_admissions.qualify(found->second.handle,admission);
+			if(status==cruisn::exotica_admissions::Status::invalid)fatalerror("Private active endpoint stale admission\n");
+			if(status==cruisn::exotica_admissions::Status::matched) {
+				m_endpoint_active_slots.insert(source.source);const auto &h=admission.owner;
+				if(++m_endpoint_early_rows>65536 || fprintf(m_endpoint_early_log,"%llu,%u,%llu,%llu,%u,%llu,%llu,%llu,%u,%u,%llu,%u,%llu,%u\n",
+					(unsigned long long)m_scene_fence_scene,m_active_seed.frame,(unsigned long long)m_lifetime_records,
+					(unsigned long long)m_endpoint_admit_sequence,h.slot,(unsigned long long)h.epoch,(unsigned long long)h.generation,
+					(unsigned long long)h.key.realm,h.key.section,h.key.source,(unsigned long long)admission.first_sequence,admission.first_frame,
+					(unsigned long long)admission.last_sequence,admission.last_frame)<0)fatalerror("Private visibility journal bound/write\n");
+			}
+		}
+	}
 	std::copy_n(m_ram_base.target(),m_active_ram.size(),m_active_ram.begin());
 	// This reader has its own pending set: GPU material commits must not erase
 	// writes made since the preceding CPU scene end. First seal/postload is full.
@@ -1658,7 +1722,7 @@ void crusnexo_state::scene_active_ready()
 		++model_checks;model_bytes+=n*4;
 		words.assign(z.m_waveram.get()+offset,z.m_waveram.get()+offset+n);return true;
 	};
-	cruisn::exotica_scene::Result scene;size_t excluded=0;
+	cruisn::exotica_scene::Result scene,endpoint_scene;size_t excluded=0;
 	for(const auto &list:selected.lists) {
 		const auto &owned=list.parameters;
 		if(owned.camera!=p.camera || owned.view!=p.view || owned.alternate!=p.alternate ||
@@ -1667,6 +1731,18 @@ void crusnexo_state::scene_active_ready()
 		cruisn::exotica_scene::Result part;
 		if(!cruisn::exotica_scene::build_active(list.sources,p,read,model_read,part))
 			reject("current geometry",0xbbb5+unsigned(&list-selected.lists.data()));
+		cruisn::exotica_scene::Result endpoint_part;
+		if(m_active_early) {
+			auto sources=list.sources;
+			for(auto &source:sources)if(m_endpoint_active_slots.count(source.source)) {
+				cruisn::ExoticaFadeStep completed;
+				if(!cruisn::exotica_finish_marked_fade(source.words[16],source.words[15],completed))reject("active marked endpoint",source.source);
+				source.words[16]=completed.packed;source.words[15]=completed.flags;
+			}
+			cruisn::exotica_scene::Result checked;
+			if(!cruisn::exotica_scene::build_active(sources,p,read,model_read,endpoint_part) ||
+				!cruisn::exotica_scene_endpoint::select(part,endpoint_part,part,true,checked))reject("active endpoint invariants");
+		}
 		for(auto instance:part.instances) {
 			bool valid=true;
 			for(size_t j=0;j<instance.quad_count;++j)
@@ -1674,10 +1750,16 @@ void crusnexo_state::scene_active_ready()
 			if(!valid){++excluded;continue;}
 			if(scene.instances.size()>=4096 || instance.quad_count>131072-scene.quads.size())fatalerror("Exotica active scene budget\n");
 			const auto first=part.quads.begin()+instance.first_quad;
+			if(m_active_early) {
+				auto endpoint=instance;const auto q=endpoint_part.quads.begin()+instance.first_quad;
+				endpoint.first_quad=endpoint_scene.quads.size();
+				endpoint_scene.quads.insert(endpoint_scene.quads.end(),q,q+instance.quad_count);endpoint_scene.instances.push_back(endpoint);
+			}
 			instance.first_quad=scene.quads.size();scene.quads.insert(scene.quads.end(),first,first+instance.quad_count);
 			scene.instances.push_back(instance);
 		}
 	}
+	const auto original_scene=m_active_early?scene:cruisn::exotica_scene::Result{};
 	if(m_compose) {
 		// Intervening unrelated allocations are legal. Every retained owner must
 		// still match its identity at active sealing, not just its reused slot.
@@ -1713,6 +1795,12 @@ void crusnexo_state::scene_active_ready()
 			unsigned(input_instances),unsigned(input_quads),unsigned(counts.overlaps),unsigned(counts.removed_quads),unsigned(counts.texture_pages),
 			unsigned(scene.instances.size()),unsigned(scene.quads.size()))<0)fatalerror("Composition log write\n");
 		m_compose_scene=0;m_compose_waiting={};m_compose_owners.clear();m_compose_sealed_owners.clear();++m_compose_completed;
+	}
+	if(m_active_early) {
+		cruisn::exotica_scene::Result completed;
+		if(!cruisn::exotica_scene_endpoint::select(original_scene,endpoint_scene,scene,true,completed))reject("filtered active endpoint");
+		scene=std::move(completed);
+		++m_endpoint_early_scenes;
 	}
 	const auto check_started=std::chrono::steady_clock::now();
 	cruisn::zeus_lease::Coverage coverage;
