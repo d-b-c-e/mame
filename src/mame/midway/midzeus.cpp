@@ -1030,6 +1030,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 			cruisn::zeus_wide::Packet future;
 			future.materials=packet;future.margin=uint32_t(m_scene_margin);future.page=p.context.render[4];
 			future.multiplier=m_scene_multiplier;future.draw=m_scene_future_mode==2;
+			future.quads.reserve(scene.quads.size());
 			for(size_t i=0;i<scene.instances.size();++i) {
 				const auto &instance=scene.instances[i];
 				for(size_t j=0;j<instance.quad_count;++j) {
