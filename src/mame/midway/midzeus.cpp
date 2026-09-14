@@ -41,6 +41,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/scenery_lifetimes.h"
 #include "cruisn/exotica_waiting.h"
 #include "cruisn/exotica_waiting_handover.h"
+#include "cruisn/exotica_composition.h"
 #include "cruisn/zeus_retained_materials.h"
 
 #include <algorithm>
@@ -261,6 +262,11 @@ private:
 	std::set<uint32_t> m_handover_snapshots;
 	cruisn::exotica_waiting::Pending m_handover_pending;
 	cruisn::exotica_scene::Result m_handover_geometry;
+	bool m_compose=false;
+	cruisn::exotica_scene::Result m_compose_waiting;
+	std::vector<cruisn::scenery_lifetimes::Handle> m_compose_owners;
+	uint64_t m_compose_scene=0,m_compose_sealed_records=0,m_compose_completed=0;
+	FILE *m_compose_log=nullptr;
 	cruisn::zeus_host::PaletteSet m_handover_palettes;
 	cruisn::zeus_wide::Packet m_handover_packet;
 	uint64_t m_handover_generation=0;
@@ -617,6 +623,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_bounds=number("MIDZ_HOST_BOUNDS",0,1,0)!=0;
 	m_scene_depth_mode=number("MIDZ_HOST_EARLY_DEPTH",0,2,0);
 	m_active_mode=number("MIDZ_HOST_ACTIVE",0,2,0);
+	m_compose=number("MIDZ_HOST_COMPOSE",0,1,0)!=0;
 	if(number("MIDZ_HOST_FENCE",0,1,0)) {
 		m_scene_fence_log=fopen("exotica-host-fences.csv","w");
 		if(!m_scene_fence_log)fatalerror("Cannot create Exotica command-fence log\n");
@@ -650,7 +657,7 @@ void crusnexo_state::scene_observer_start()
 	m_scene_future_mode=number("MIDZ_HOST_FUTURE",0,2,0);
 	if(m_scene_future_mode) {
 		const char *mirror=std::getenv("MIDZ_DEPTH_MIRROR");
-		if(!m_scene_material_image || m_active_mode || !m_zeus->midz_live || !mirror || strcmp(mirror,"2") || std::getenv("MIDZ_DEPTH_STREAM_FRAME"))
+		if(!m_scene_material_image || (m_active_mode && !m_compose) || !m_zeus->midz_live || !mirror || strcmp(mirror,"2") || std::getenv("MIDZ_DEPTH_STREAM_FRAME"))
 			fatalerror("Exotica future drawing requires private materials/wide mirror and no late margins/command journal\n");
 		fprintf(stderr,"MIDZ_HOST_FUTURE=%u\n",m_scene_future_mode);
 	}
@@ -659,8 +666,16 @@ void crusnexo_state::scene_observer_start()
 	m_waiting_mode=number("MIDZ_HOST_WAITING",0,1,0);
 	m_handover_mode=number("MIDZ_HOST_HANDOVER",0,2,0);
 	if(m_handover_mode==2 && (m_scene_future_mode!=2 || !m_scene_material_image))fatalerror("Exotica waiting draw requires private future drawing and materials\n");
-	if(m_handover_mode && (!m_waiting_mode || !m_scene_fence_log || m_active_mode))
+	if(m_handover_mode && (!m_waiting_mode || !m_scene_fence_log || (m_active_mode && !m_compose)))
 		fatalerror("Exotica waiting completion requires waiting/fence observation and excludes active margins\n");
+	if(m_compose) {
+		if(m_active_mode!=2 || m_scene_future_mode!=2 || m_handover_mode!=2 || !m_scene_material_pages)
+			fatalerror("Exotica composition requires active/future/waiting drawing and tracked materials\n");
+		m_compose_log=fopen("exotica-compose-scenes.csv","w");if(!m_compose_log)fatalerror("Cannot create composition log\n");
+		setvbuf(m_compose_log,nullptr,_IOFBF,65536);
+		fprintf(m_compose_log,"scene,frame,end_records,ready_records,input_instances,input_quads,overlaps,removed_quads,texture_pages,instances,quads\n");
+		fprintf(stderr,"MIDZ_HOST_COMPOSE=1\n");
+	}
 	if(m_waiting_mode) {
 		const char *lifetime=std::getenv("MIDZ_LIFETIME");
 		if(!m_scene_future_mode || !lifetime || strcmp(lifetime,"1") ||
@@ -1236,6 +1251,13 @@ void crusnexo_state::scene_waiting_ready()
 	}
 	++m_handover_completed;m_handover_captured+=completion.captured;
 	m_handover_submitted+=completion.submitted;m_handover_retired+=completion.retired;
+	if(m_compose) {
+		if(m_compose_scene || m_handover_frame!=m_active_seed.frame || m_handover_scene!=m_active_seed_scene)
+			fatalerror("Exotica composition proposal/active scene mismatch\n");
+		m_compose_waiting=std::move(filtered);m_compose_owners.clear();
+		for(const auto &item:completion.items)m_compose_owners.push_back(item.owner);
+		m_compose_scene=m_handover_scene;
+	}
 	m_handover_geometry=cruisn::exotica_scene::Result{};
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica waiting completion changed CPU cycles\n");
 }
@@ -1283,6 +1305,7 @@ void crusnexo_state::scene_active_seal()
 	m_zeus->midz_active_wave_commit();
 	for(unsigned i=0;i<m_active_internal.size();++i)m_active_internal[i]=read(0x87fe00+i);
 	m_active_sealed_scene=m_scene_fence_scene;m_active_sealed_loading=m_scene_loading!=0;
+	if(m_compose)m_compose_sealed_records=m_lifetime_records;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active sealing changed CPU cycles\n");
 	m_active_seal_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
 }
@@ -1380,6 +1403,39 @@ void crusnexo_state::scene_active_ready()
 			scene.instances.push_back(instance);
 		}
 	}
+	if(m_compose) {
+		// Until per-owner sealing is captured, reject ANY intervening lifetime
+		// event. Never identify a sealed object solely by its reused RAM slot.
+		if(m_compose_scene!=m_scene_fence_scene || m_compose_sealed_records!=m_lifetime_records ||
+			m_lifetime_pending.kind || m_lifetime_owner_slot || !m_scene_material_image)
+			reject("composition lifetime boundary");
+		for(const auto &owner:m_compose_owners) {
+			cruisn::scenery_lifetimes::State state;
+			if(!m_lifetimes.inspect(owner,state) || state.last_submission)reject("composition stale owner",owner.slot);
+		}
+		const auto input_instances=scene.instances.size(),input_quads=scene.quads.size();
+		if(m_active_snapshots.count(p.frame)) {
+			const auto words=cruisn::exotica_scene::instance_words(scene);
+			const auto prefix="exotica-compose-"+std::to_string(p.frame);
+			auto save=[](const std::string &name,const void *data,size_t bytes) {
+				FILE *f=fopen(name.c_str(),"wb");if(!f)fatalerror("Cannot open composition snapshot\n");
+				const bool ok=fwrite(data,1,bytes,f)==bytes;const int closed=fclose(f);
+				if(!ok || closed)fatalerror("Cannot complete composition snapshot\n");
+			};
+			save(prefix+"-input-instances.bin",words.data(),words.size()*sizeof(words[0]));
+			save(prefix+"-input-quads.bin",scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
+		}
+		cruisn::exotica_scene::Result filtered;cruisn::exotica_composition::Counts counts;
+		if(!cruisn::exotica_composition::filter(scene,m_compose_waiting,m_compose_owners,
+			m_scene_material_image->bytes().data(),wave,m_scene_material_image->bytes().size(),filtered,counts))
+			reject("composition overlap/materials");
+		scene=std::move(filtered);
+		if(fprintf(m_compose_log,"%llu,%u,%llu,%llu,%u,%u,%u,%u,%u,%u,%u\n",
+			(unsigned long long)m_compose_scene,p.frame,(unsigned long long)m_compose_sealed_records,(unsigned long long)m_lifetime_records,
+			unsigned(input_instances),unsigned(input_quads),unsigned(counts.overlaps),unsigned(counts.removed_quads),unsigned(counts.texture_pages),
+			unsigned(scene.instances.size()),unsigned(scene.quads.size()))<0)fatalerror("Composition log write\n");
+		m_compose_scene=0;m_compose_waiting={};m_compose_owners.clear();++m_compose_completed;
+	}
 	const auto check_started=std::chrono::steady_clock::now();
 	cruisn::zeus_lease::Coverage coverage;
 	for(const auto &quad:scene.quads)if(!coverage.add(quad))fatalerror("Exotica active texture footprint rejected\n");
@@ -1462,6 +1518,11 @@ void crusnexo_state::scene_active_ready()
 void crusnexo_state::scene_observer_exit()
 {
 	if(!m_scene_log)return;
+	if(m_compose_log) {
+		const bool good=!ferror(m_compose_log);const int closed=fclose(m_compose_log);m_compose_log=nullptr;
+		fprintf(stderr,"MIDZ_HOST_COMPOSE_RESULT complete=%u scenes=%llu\n",unsigned(good && !closed && !m_compose_scene &&
+			m_compose_completed==m_active_scenes && m_compose_completed==m_handover_completed),(unsigned long long)m_compose_completed);
+	}
 	if(m_handover_log) {
 		const bool good=!ferror(m_handover_log) && !ferror(m_handover_cohorts);
 		const int closed=fclose(m_handover_log),cohorts_closed=fclose(m_handover_cohorts);
