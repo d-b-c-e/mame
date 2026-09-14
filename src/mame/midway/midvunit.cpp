@@ -325,6 +325,14 @@ void midvunit_base_state::world_host_start()
 		if(strcmp(roads,"0") && strcmp(roads,"1"))fatalerror("MIDV_WORLD_HOST_ROADS requires 0/1\n");
 		m_host_roads=!strcmp(roads,"1");
 	}
+	if(const char *detail=std::getenv("MIDV_WORLD_HOST_ROAD_DETAIL"))
+	{
+		if(strcmp(detail,"0") && strcmp(detail,"1"))fatalerror("MIDV_WORLD_HOST_ROAD_DETAIL requires 0/1\n");
+		m_host_full_roads=!strcmp(detail,"1");
+	}
+	if(m_host_full_roads && !m_host_roads)fatalerror("Full road detail requires host roads\n");
+	osd_printf_info("World host revision=%u roads=%u full_road_detail=%u; original guest LOD unchanged\n",
+		m_host_revision,unsigned(m_host_roads),unsigned(m_host_full_roads));
 	if(const char *layer=std::getenv("MIDV_WORLD_HOST_LAYER"))
 	{
 		if(strlen(layer)!=1 || layer[0]<'0' || layer[0]>'3')fatalerror("MIDV_WORLD_HOST_LAYER requires 0..3\n");
@@ -405,7 +413,7 @@ void midvunit_base_state::world_host_start()
 			}
 			const auto future_prepared=std::chrono::steady_clock::now();
 			// Main RAM is read directly: no tap recursion or guest speedup handler.
-			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision))
+			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision,m_host_full_roads))
 				fatalerror("World host scenery pointer/model/projection guard failed\n");
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
