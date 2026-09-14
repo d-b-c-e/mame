@@ -222,6 +222,7 @@ private:
 	std::map<uint64_t,EndpointPending> m_endpoint_pending;
 	FILE *m_endpoint_log=nullptr,*m_endpoint_inputs=nullptr;
 	uint32_t m_endpoint_first=0,m_endpoint_last=0,m_endpoint_snapshot=0;
+	bool m_endpoint_draw=false;
 	uint64_t m_endpoint_commits=0,m_endpoint_consumed=0,m_endpoint_untracked=0;
 	uint64_t m_endpoint_prepared=0,m_endpoint_rejected=0,m_endpoint_saved=0,m_endpoint_bytes=0;
 
@@ -641,8 +642,9 @@ void crusnexo_state::endpoint_start()
 	const char *mode=std::getenv("MIDZ_MODEL_ENDPOINT");
 	if(!mode || !strcmp(mode,"0"))return;
 	const char *ffb=std::getenv("MIDV_FFB");
-	if(strcmp(mode,"1") || !ffb || strcmp(ffb,"0") || !m_lifetime_log || strcmp(machine().system().name,"crusnexo"))
+	if((strcmp(mode,"1") && strcmp(mode,"2")) || !ffb || strcmp(ffb,"0") || !m_lifetime_log || strcmp(machine().system().name,"crusnexo"))
 		fatalerror("Exotica endpoint observation requires lifetimes and physical FFB=0\n");
+	m_endpoint_draw=!strcmp(mode,"2");
 	auto number=[](const char *name) {
 		const char *s=std::getenv(name);if(!s || !*s)fatalerror("Missing endpoint bound %s\n",name);
 		for(const char *p=s;*p;++p)if(*p<'0' || *p>'9')fatalerror("Invalid endpoint bound %s\n",name);
@@ -668,6 +670,7 @@ void crusnexo_state::endpoint_start()
 		m_endpoint_snapshot<m_endpoint_first || m_endpoint_snapshot>m_endpoint_last ||
 		m_lifetime_first>=m_endpoint_first || m_lifetime_last<=m_endpoint_last)
 		fatalerror("Endpoint interval requires surrounding lifetime coverage\n");
+	if(m_endpoint_draw && !m_endpoint_admit_from)fatalerror("Endpoint private drawing requires actual admission observation\n");
 	m_endpoint_log=fopen("exotica-endpoint-models.csv","w");
 	m_endpoint_inputs=fopen("exotica-endpoint-inputs.txt","w");
 	if(!m_endpoint_log || !m_endpoint_inputs)fatalerror("Cannot create endpoint observer files\n");
@@ -677,7 +680,7 @@ void crusnexo_state::endpoint_start()
 		endpoint_model(base,count,scale);scene_observer_model(base,count,scale);
 	});
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::endpoint_exit,this));
-	fprintf(stderr,"MIDZ_MODEL_ENDPOINT=1 first=%u last=%u snapshot=%u\n",m_endpoint_first,m_endpoint_last,m_endpoint_snapshot);
+	fprintf(stderr,"MIDZ_MODEL_ENDPOINT=%u first=%u last=%u snapshot=%u\n",m_endpoint_draw?2:1,m_endpoint_first,m_endpoint_last,m_endpoint_snapshot);
 }
 
 void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeOwner &owner)
@@ -775,6 +778,9 @@ void crusnexo_state::endpoint_model(uint32_t base,uint32_t count,uint32_t yscale
 		prepared=cruisn::exotica_endpoint::prepare(c,frame,base,count,z.m_upstream_render,words,a,result)?1:2;
 		if(prepared==1)++m_endpoint_prepared;else ++m_endpoint_rejected;
 	}
+	if(m_endpoint_draw && p.admitted && prepared==1 && !result.original.empty() &&
+		!m_zeus->midz_endpoint_begin(uint32_t(ticket.id),frame,result.original.data(),result.replacement.data(),result.original.size()))
+		fatalerror("Endpoint private model preparation rejected\n");
 	const bool snapshot=frame==m_endpoint_snapshot && prepared;
 	if(snapshot) {
 		if(++m_endpoint_saved>1024)fatalerror("Endpoint snapshot count\n");

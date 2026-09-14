@@ -158,6 +158,7 @@ public:
 	bool midz_host_future(const uint8_t *data, size_t size);
 	bool midz_host_waiting(const uint8_t *data, size_t size);
 	bool midz_host_margin(const uint8_t *data,size_t size);
+	bool midz_endpoint_begin(uint32_t model,uint32_t frame,const void *original,const void *replacement,size_t quads);
 	// Emulation-thread-only notifications, independent of original upload spans.
 	void midz_host_wave_enable() { m_host_wave_pages=std::make_unique<cruisn::WrittenPages<0x1000000,4096>>(); }
 	std::vector<uint32_t> midz_host_wave_pages() const { return m_host_wave_pages ? m_host_wave_pages->pages() : std::vector<uint32_t>(); }
@@ -221,6 +222,8 @@ protected:
 private:
 	std::function<void(uint32_t,uint32_t,uint32_t)> m_midz_model_observer;
 	std::function<void(bool)> m_midz_fifo_observer;
+	std::vector<uint8_t> m_midz_endpoint_original,m_midz_endpoint_replacement;
+	uint32_t m_midz_endpoint_model=0,m_midz_endpoint_frame=0,m_midz_endpoint_count=0,m_midz_endpoint_index=0;
 	std::unique_ptr<cruisn::WrittenPages<0x1000000,4096>> m_host_wave_pages;
 	std::unique_ptr<cruisn::WrittenPages<0x1000000,4096>> m_active_wave_pages;
 	TIMER_CALLBACK_MEMBER(int_timer_callback);

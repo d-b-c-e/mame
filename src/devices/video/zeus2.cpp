@@ -15,6 +15,7 @@
 #include "../../mame/midway/cruisn/zeus_margin_packet.h"
 #include "../../mame/midway/cruisn/zeus_wide_packet.h"
 #include "../../mame/midway/cruisn/zeus_retained_materials.h"
+#include "../../mame/midway/cruisn/zeus_endpoint_pair.h"
 
 #include "screen.h"
 
@@ -1140,7 +1141,7 @@ void thread_main()
 		batches.push_back({ nv, 0, blend, dtest, dwrite, cmask, rowbase,
 			{ int(clip[0]), int(clip[1]), int(clip[2]), int(clip[3]) } });
 	};
-	auto flush = [&]()
+	auto flush = [&](unsigned targets=3u)
 	{
 		if (palette_trace) palette_life.clear();
 		if (fdata.empty()) { batches.clear(); return; }
@@ -1173,8 +1174,8 @@ void thread_main()
 			// (0..511) shifted by MARGIN would cut the margins off.
 			gl.Scissor(0, (b.rowbase + b.clip[1]) * S, fw,
 				(b.clip[3] - b.clip[1] + 1) * S);
-			gl.DrawArrays(0x0004, b.first, b.count);
-			if(mirror_fbo) {
+			if(targets&1)gl.DrawArrays(0x0004, b.first, b.count);
+			if(mirror_fbo && (targets&2)) {
 				const auto began=std::chrono::steady_clock::now();
 				gl.UseProgram(mirror_prog);gl.BindFramebuffer(FRAMEBUFFER,mirror_fbo);
 				gl.DrawArrays(0x0004,b.first,b.count);
@@ -1193,6 +1194,17 @@ void thread_main()
 		batches.clear();
 	};
 	bool had_quads_iter = false, had_writes_iter = false, wide_mode = false;
+	cruisn::zeus_endpoint_pair::Order endpoint_order;
+	cruisn::zeus_endpoint_pair::Pair endpoint_pair;
+	uint64_t endpoint_pairs=0;
+	FILE *endpoint_log=nullptr;
+	if(envi("MIDZ_MODEL_ENDPOINT",nullptr,0)==2) {
+		if(!mirror_fbo || !depth_mirror.wide) {zlogf("endpoint replacement requires private wide target");return;}
+		endpoint_log=fopen("exotica-endpoint-gpu.csv","w");
+		if(!endpoint_log){zlogf("cannot create endpoint GPU receipt");return;}
+		setvbuf(endpoint_log,nullptr,_IOFBF,65536);
+		fprintf(endpoint_log,"frame,model,index,count\n");
+	}
 	auto add_quad = [&](const midz_quad_rec &r)
 	{
 		if (palette_trace) palette_life.use(pal_slot);
@@ -1713,7 +1725,10 @@ void thread_main()
 			}
 			// Finish before changing palettes/uploads/pages or presenting. Stored
 			// tiles retain the current material only within this uninterrupted span.
-			if (sky_enabled && hdr[0]!=1 && hdr[0]!=7 && !sky_quads.empty()) finish_sky();
+			if (sky_enabled && hdr[0]!=1 && hdr[0]!=7 && hdr[0]!=11 && !sky_quads.empty()) finish_sky();
+			if(endpoint_order.pending() && hdr[0]!=1) {
+				private_failed=true;s_stopz.store(true);zlogf("endpoint pair missing immediate original quad");break;
+			}
 			switch (hdr[0])
 			{
 			case 1:
@@ -1726,7 +1741,23 @@ void thread_main()
 							else { sky_tiles.clear(); sky_quads.clear(); sky_open=false; ++sky_budget_rejected; }
 						} else finish_sky();
 					}
-					add_quad(q);
+					if(endpoint_order.pending()) {
+						cruisn::zeus_model::Quad actual,replacement;
+						static_assert(sizeof(actual)==sizeof(q),"endpoint original quad ABI");
+						std::memcpy(&actual,&q,sizeof(q));
+						if(!endpoint_order.consume(actual,replacement) || ++endpoint_pairs>131072) {
+							private_failed=true;s_stopz.store(true);zlogf("endpoint actual original mismatch/order");break;
+						}
+						// Finish earlier commands. Never blend both versions into the
+						// private target: each target receives exactly its one version.
+						flush();add_quad(q);flush(1);
+						midz_quad_rec changed;std::memcpy(&changed,&replacement,sizeof(changed));
+						add_quad(changed);flush(2);
+						if(!endpoint_log || fprintf(endpoint_log,"%u,%u,%u,%u\n",endpoint_pair.frame,endpoint_pair.model,
+							endpoint_pair.index,endpoint_pair.count)<0) {
+							private_failed=true;s_stopz.store(true);zlogf("endpoint GPU journal failure");break;
+						}
+					} else add_quad(q);
 				}
 				break;
 			case 2:
@@ -1845,6 +1876,12 @@ void thread_main()
 					zlogf("private material validation/upload failed after %llu packets",(unsigned long long)private_packets);
 				}
 				break;
+			case 11:
+				if(!endpoint_log || !cruisn::zeus_endpoint_pair::decode(rec.data(),rec.size(),endpoint_pair) ||
+					!endpoint_order.expect(endpoint_pair)) {
+					private_failed=true;s_stopz.store(true);zlogf("endpoint pair contract/order rejected");
+				}
+				break;
 			case 9:
 				if(!private_future(rec)) {private_failed=true;s_stopz.store(true);zlogf("private future validation/draw failed after %llu packets",(unsigned long long)future_packets);}
 				break;
@@ -1864,7 +1901,10 @@ void thread_main()
 		s_rr.store(r, std::memory_order_release);
 		flush();
 
-		if(frame_ready && !mirror_frame(completed_frame)) {
+        if(frame_ready && !endpoint_order.complete()) {
+			private_failed=true;s_stopz.store(true);zlogf("endpoint model incomplete at frame boundary");break;
+		}
+        if(frame_ready && !mirror_frame(completed_frame)) {
 			mirror_failed=true;s_stopz.store(true);zlogf("depth mirror comparison failed at frame%u",completed_frame);break;
 		}
 		if(frame_ready && !stream_boundary(completed_frame)) {
@@ -2066,6 +2106,11 @@ void thread_main()
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
 
+	if(endpoint_log) {
+		const bool good=!ferror(endpoint_log);const int closed=fclose(endpoint_log);
+		fprintf(stderr,"MIDZ_ENDPOINT_GPU_RESULT complete=%u pairs=%llu\n",
+			unsigned(!private_failed && good && !closed && endpoint_order.complete()),(unsigned long long)endpoint_pairs);
+	}
 	if(mirror_log) {
 		const auto stats=mirror_writer.finish();
 		const int closed=fclose(mirror_log);
@@ -2400,6 +2445,17 @@ void zeus2_device::midz_screen_hook(bool completed)
 	}
 }
 
+bool zeus2_device::midz_endpoint_begin(uint32_t model,uint32_t frame,const void *original,const void *replacement,size_t quads)
+{
+	const char *mode=std::getenv("MIDZ_MODEL_ENDPOINT");
+	if(!mode || strcmp(mode,"2") || !midz_live || !model || model<=m_midz_endpoint_model || !frame ||
+		!quads || quads>131072 || !original || !replacement || m_midz_endpoint_count)return false;
+	const auto *a=static_cast<const uint8_t *>(original),*b=static_cast<const uint8_t *>(replacement);
+	m_midz_endpoint_original.assign(a,a+quads*260);m_midz_endpoint_replacement.assign(b,b+quads*260);
+	m_midz_endpoint_model=model;m_midz_endpoint_frame=frame;m_midz_endpoint_count=uint32_t(quads);m_midz_endpoint_index=0;
+	return true;
+}
+
 void zeus2_device::midz_cap_quad(int numverts, const void *verts,
 		const zeus2_poly_extra_data &extra, uint32_t texdata)
 {
@@ -2446,6 +2502,28 @@ void zeus2_device::midz_cap_quad(int numverts, const void *verts,
 		r.verts[i][1] = v[i].y;
 		for (int p = 0; p < 4; p++)
 			r.verts[i][2 + p] = v[i].p[p];
+	}
+	if(m_midz_endpoint_count) {
+		if(m_midz_endpoint_index>=m_midz_endpoint_count)fatalerror("Endpoint model emitted extra original quad\n");
+		cruisn::zeus_endpoint_pair::Pair pair;pair.frame=m_midz_endpoint_frame;pair.model=m_midz_endpoint_model;
+		pair.index=m_midz_endpoint_index;pair.count=m_midz_endpoint_count;
+		std::memcpy(&pair.original,m_midz_endpoint_original.data()+260*pair.index,260);
+		std::memcpy(&pair.replacement,m_midz_endpoint_replacement.data()+260*pair.index,260);
+		// Ordinary live records omit frame numbers outside a native capture.
+		if(pair.original.state[0]!=pair.frame || pair.replacement.state[0]!=pair.frame)
+			fatalerror("Endpoint prepared frame differs\n");
+		pair.original.state[0]=r.frame;pair.replacement.state[0]=r.frame;
+		if(std::memcmp(&pair.original,&r,sizeof(r)))fatalerror("Endpoint actual original geometry/state differs\n");
+		std::array<uint8_t,544> encoded;
+		if(!cruisn::zeus_endpoint_pair::encode(pair,encoded))fatalerror("Endpoint pair encoding rejected\n");
+#ifdef _WIN32
+		// This side record affects the private target only. Original native
+		// capture remains the same type1 record and the same material stream.
+		if(!mzgl::ring_push2(11,encoded.data(),uint32_t(encoded.size()),nullptr,0))fatalerror("Endpoint pair queue failed\n");
+#else
+		fatalerror("Endpoint private rendering requires the Windows GL consumer\n");
+#endif
+		++m_midz_endpoint_index;
 	}
 	midz_rec(1, &r, sizeof(r));
 }
@@ -3795,6 +3873,7 @@ bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 
 void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit)
 {
+	if(m_midz_endpoint_count)fatalerror("Endpoint previous original model incomplete\n");
 	if (m_midz_model_observer) m_midz_model_observer(baseaddr,count,uint32_t(m_yScale));
 	midz_model_rec captured;
 	std::vector<uint32_t> captured_words;
@@ -3960,6 +4039,10 @@ void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit
 				logerror("-- Unused data\n");
 			}
 		}
+	}
+	if(m_midz_endpoint_count) {
+		if(m_midz_endpoint_index!=m_midz_endpoint_count)fatalerror("Endpoint original model missing quads\n");
+		m_midz_endpoint_count=0;m_midz_endpoint_original.clear();m_midz_endpoint_replacement.clear();
 	}
 	if (capture_model)
 	{
