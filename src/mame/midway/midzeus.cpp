@@ -673,19 +673,27 @@ void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeO
 	auto &a=p.operands;
 	std::copy_n(m_ram_base+owner.handle.slot,32,a.object.begin());
 	if(flags&0x04000000) {
+		// Setup programs/defaults are copied into RAM. The scenery source span
+		// helper intentionally accepts ROM only and is not this operand domain.
+		auto span=[](uint32_t address,uint32_t count) {
+			const uint64_t end=uint64_t(address)+count;
+			return address && count && ((address<0x40000 && end<=0x40000) ||
+				(address>=0xa00000 && address<0xc00000 && end<=0xc00000) ||
+				(address>=0xc00000 && end<=0x1000000));
+		};
 		a.cache.fill(UINT32_MAX);a.palette_setup=scene_read(0x15f2);
 		for(unsigned i=0;i<12;++i)a.constants[i]=scene_read(0x67d0+i);
 		for(unsigned i=0;i<46;++i)a.commands[i]=scene_read(0xb479+i);
 		const uint32_t pointers[]={0xe7c1,0xe7c7,0xe7d3,0xe7d9};
 		for(unsigned i=0;i<4;++i) {
 			a.programs[i]=scene_read(pointers[i]);
-			if(!cruisn::exotica_future::span(a.programs[i],4))fatalerror("Endpoint program span\n");
+			if(!span(a.programs[i],4))fatalerror("Endpoint program span\n");
 			for(unsigned j=0;j<4;++j)a.bodies[i][j]=scene_read(a.programs[i]+j);
 		}
 		const uint32_t d=scene_read(0xe4);
-		if(!cruisn::exotica_future::span(d,1))fatalerror("Endpoint default pointer\n");
+		if(!span(d,1))fatalerror("Endpoint default pointer\n");
 		const uint32_t n=scene_read(d);
-		if(n>=16 || !cruisn::exotica_future::span(d,n+2))fatalerror("Endpoint default span\n");
+		if(n>=16 || !span(d,n+2))fatalerror("Endpoint default span\n");
 		for(unsigned i=0;i<=n;++i)a.defaults.push_back(scene_read(d+1+i));
 	}
 	if(!m_endpoint_pending.emplace(id,std::move(p)).second || m_maincpu->total_cycles()!=cycles)
