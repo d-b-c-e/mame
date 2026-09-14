@@ -265,6 +265,7 @@ private:
 	bool m_compose=false;
 	cruisn::exotica_scene::Result m_compose_waiting;
 	std::vector<cruisn::scenery_lifetimes::Handle> m_compose_owners;
+	std::map<uint32_t,cruisn::scenery_lifetimes::Handle> m_compose_sealed_owners;
 	uint64_t m_compose_scene=0,m_compose_sealed_records=0,m_compose_completed=0;
 	FILE *m_compose_log=nullptr;
 	cruisn::zeus_host::PaletteSet m_handover_palettes;
@@ -1305,7 +1306,13 @@ void crusnexo_state::scene_active_seal()
 	m_zeus->midz_active_wave_commit();
 	for(unsigned i=0;i<m_active_internal.size();++i)m_active_internal[i]=read(0x87fe00+i);
 	m_active_sealed_scene=m_scene_fence_scene;m_active_sealed_loading=m_scene_loading!=0;
-	if(m_compose)m_compose_sealed_records=m_lifetime_records;
+	if(m_compose) {
+		m_compose_sealed_records=m_lifetime_records;m_compose_sealed_owners.clear();
+		for(const auto &item:m_handover_pending.selection().items) {
+			cruisn::scenery_lifetimes::State state;
+			if(m_lifetimes.inspect(item.owner,state))m_compose_sealed_owners.emplace(item.owner.slot,item.owner);
+		}
+	}
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active sealing changed CPU cycles\n");
 	m_active_seal_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
 }
@@ -1404,14 +1411,17 @@ void crusnexo_state::scene_active_ready()
 		}
 	}
 	if(m_compose) {
-		// Until per-owner sealing is captured, reject ANY intervening lifetime
-		// event. Never identify a sealed object solely by its reused RAM slot.
-		if(m_compose_scene!=m_scene_fence_scene || m_compose_sealed_records!=m_lifetime_records ||
+		// Intervening unrelated allocations are legal. Every retained owner must
+		// still match its identity at active sealing, not just its reused slot.
+		if(m_compose_scene!=m_scene_fence_scene || m_compose_sealed_records>m_lifetime_records ||
 			m_lifetime_pending.kind || m_lifetime_owner_slot || !m_scene_material_image)
 			reject("composition lifetime boundary");
 		for(const auto &owner:m_compose_owners) {
 			cruisn::scenery_lifetimes::State state;
-			if(!m_lifetimes.inspect(owner,state) || state.last_submission)reject("composition stale owner",owner.slot);
+			const auto sealed=m_compose_sealed_owners.find(owner.slot);
+			if(sealed==m_compose_sealed_owners.end() || sealed->second.epoch!=owner.epoch || sealed->second.generation!=owner.generation ||
+				!(sealed->second.key==owner.key) || !m_lifetimes.inspect(owner,state) || state.last_submission)
+				reject("composition stale owner",owner.slot);
 		}
 		const auto input_instances=scene.instances.size(),input_quads=scene.quads.size();
 		if(m_active_snapshots.count(p.frame)) {
@@ -1434,7 +1444,7 @@ void crusnexo_state::scene_active_ready()
 			(unsigned long long)m_compose_scene,p.frame,(unsigned long long)m_compose_sealed_records,(unsigned long long)m_lifetime_records,
 			unsigned(input_instances),unsigned(input_quads),unsigned(counts.overlaps),unsigned(counts.removed_quads),unsigned(counts.texture_pages),
 			unsigned(scene.instances.size()),unsigned(scene.quads.size()))<0)fatalerror("Composition log write\n");
-		m_compose_scene=0;m_compose_waiting={};m_compose_owners.clear();++m_compose_completed;
+		m_compose_scene=0;m_compose_waiting={};m_compose_owners.clear();m_compose_sealed_owners.clear();++m_compose_completed;
 	}
 	const auto check_started=std::chrono::steady_clock::now();
 	cruisn::zeus_lease::Coverage coverage;
