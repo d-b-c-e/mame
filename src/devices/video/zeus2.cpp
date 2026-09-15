@@ -886,6 +886,9 @@ void thread_main()
 	}
 
 	const bool future_present=envi("MIDZ_HOST_FUTURE_PRESENT",nullptr,0)==1;
+	uint32_t retire_frame=0;
+	uint64_t retire_scene=0;
+	bool retire_presented=false;
 	if(future_present) {
 		if(!mirror_fbo || !depth_mirror.wide || envi("MIDZ_HOST_FUTURE",nullptr,0)!=2) {
 			zlogf("future presentation requires owned draw and wide target");return;
@@ -1727,6 +1730,9 @@ void thread_main()
 			// Finish before changing palettes/uploads/pages or presenting. Stored
 			// tiles retain the current material only within this uninterrupted span.
 			if (sky_enabled && hdr[0]!=1 && hdr[0]!=7 && hdr[0]!=11 && !sky_quads.empty()) finish_sky();
+			if(retire_frame && hdr[0]>=7 && hdr[0]<=12) {
+				private_failed=true;s_stopz.store(true);zlogf("auxiliary submission after private retirement");break;
+			}
 			if(endpoint_order.pending() && hdr[0]!=1) {
 				private_failed=true;s_stopz.store(true);zlogf("endpoint pair missing immediate original quad");break;
 			}
@@ -1877,6 +1883,18 @@ void thread_main()
 					zlogf("private material validation/upload failed after %llu packets",(unsigned long long)private_packets);
 				}
 				break;
+			case 12:
+			{
+				std::array<uint32_t,4> request{};
+				if(rec.size()==sizeof(request))std::memcpy(request.data(),rec.data(),sizeof(request));
+				if(!future_present || envi("MIDZ_HOST_FAILURE_POLICY",nullptr,0)!=1 ||
+					request[0]!=0x31545258 || request[1]<1 || request[1]>16000 || (!request[2] && !request[3])) {
+					private_failed=true;s_stopz.store(true);zlogf("private retirement receipt rejected");break;
+				}
+				flush();retire_frame=request[1];retire_scene=uint64_t(request[2])|(uint64_t(request[3])<<32);
+				fprintf(stderr,"EXOTICA_HOST_RETIRE_GPU frame=%u scene=%llu\n",retire_frame,(unsigned long long)retire_scene);
+				break;
+			}
 			case 11:
 				if(!endpoint_log || !cruisn::zeus_endpoint_pair::decode(rec.data(),rec.size(),endpoint_pair) ||
 					!endpoint_order.expect(endpoint_pair)) {
@@ -1963,7 +1981,11 @@ void thread_main()
 		gl.Uniform1f(gl.GetUniformLocation(present, "uSampX0"),
 			wide_mode ? 0.0f : float(MARGIN));
 		gl.ActiveTexture(TEXTURE0 + 3);
-		gl.BindTexture(0x0DE1, future_present?mirror_color:fbTex);
+		gl.BindTexture(0x0DE1, future_present && (!retire_frame || completed_frame<retire_frame)?mirror_color:fbTex);
+		if(retire_frame && completed_frame>=retire_frame && !retire_presented) {
+			retire_presented=true;
+			fprintf(stderr,"EXOTICA_HOST_RETIRE_PRESENT frame=%u scene=%llu\n",completed_frame,(unsigned long long)retire_scene);
+		}
 		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
 		gl.BindVertexArray(vao_empty);
 		gl.DrawArrays(0x0004, 0, 3);
@@ -2269,6 +2291,19 @@ bool zeus2_device::midz_host_future(const uint8_t *data, size_t size)
 	if(midz_live && mode && (!strcmp(mode,"1") || !strcmp(mode,"2")) && ffb && !strcmp(ffb,"0") && mirror && !strcmp(mirror,"2") &&
 		!std::getenv("MIDZ_DEPTH_STREAM_FRAME") && data && size>=cruisn::zeus_wide::header_bytes && size<=cruisn::zeus_wide::maximum_bytes)
 		return mzgl::ring_push2(9,data,uint32_t(size),nullptr,0);
+#endif
+	return false;
+}
+
+bool zeus2_device::midz_host_retire(uint32_t frame,uint64_t scene)
+{
+#ifdef _WIN32
+	const char *policy=std::getenv("MIDZ_HOST_FAILURE_POLICY"),*ffb=std::getenv("MIDV_FFB");
+	if(midz_live && midz_fifo_empty() && policy && !strcmp(policy,"1") && ffb && !strcmp(ffb,"0") &&
+		frame>=1 && frame<=16000 && scene) {
+		const std::array<uint32_t,4> request{{0x31545258,frame,uint32_t(scene),uint32_t(scene>>32)}};
+		return mzgl::ring_push2(12,request.data(),sizeof(request),nullptr,0);
+	}
 #endif
 	return false;
 }

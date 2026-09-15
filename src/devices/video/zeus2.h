@@ -156,6 +156,7 @@ public:
 	// Owned, bounded private texture uploads only; no original GPU resource writes.
 	bool midz_host_materials(const uint8_t *data, size_t size);
 	bool midz_host_future(const uint8_t *data, size_t size);
+	bool midz_host_retire(uint32_t frame,uint64_t scene);
 	bool midz_host_waiting(const uint8_t *data, size_t size);
 	bool midz_host_margin(const uint8_t *data,size_t size);
 	bool midz_endpoint_begin(uint32_t model,uint32_t frame,const void *original,const void *replacement,size_t quads);

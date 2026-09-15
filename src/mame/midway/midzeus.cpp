@@ -284,6 +284,9 @@ private:
 	FILE *m_scene_log=nullptr;
 	uint32_t m_scene_first=0,m_scene_last=0,m_scene_multiplier=1,m_scene_cpu_frame=0;
 	uint64_t m_scene_serial=0;
+	bool m_scene_failure_original=false,m_scene_retired=false;
+	uint32_t m_scene_inject_frame=0,m_scene_failed_frame=0;
+	uint64_t m_scene_failed_scene=0;
 	uint32_t m_scene_future_mode=0;
 	uint32_t m_waiting_mode=0;
 	FILE *m_waiting_log=nullptr;
@@ -747,7 +750,7 @@ void crusnexo_state::endpoint_start()
 void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeOwner &owner)
 {
 	const uint32_t frame=uint32_t(m_screen->frame_number());
-	if(!m_endpoint_log || frame<m_endpoint_first || frame>m_endpoint_last)return;
+	if(!m_endpoint_log || m_scene_failed_scene || frame<m_endpoint_first || frame>m_endpoint_last)return;
 	// Exact FIFO ownership is still required for every eligible command. Other
 	// commands remain explicitly untracked; never match only by model address.
 	if(m_endpoint_marked && !(flags&0x04000000))return;
@@ -809,7 +812,7 @@ void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeO
 void crusnexo_state::endpoint_model(uint32_t base,uint32_t count,uint32_t yscale)
 {
 	const uint32_t frame=uint32_t(m_screen->frame_number());
-	if(!m_endpoint_log || frame<m_endpoint_first || (frame>m_endpoint_last && m_endpoint_pending.empty()))return;
+	if(!m_endpoint_log || frame<m_endpoint_first || ((frame>m_endpoint_last || m_scene_failed_scene) && m_endpoint_pending.empty()))return;
 	if(m_maincpu->state_int(TMS320C3X_PC)!=0xb686){++m_endpoint_untracked;return;}
 	const uint32_t end=uint32_t(m_maincpu->state_int(TMS320C3X_AR0));
 	if(!cruisn::exotica_commands::Owners::cursor(end))fatalerror("Endpoint consumer ring bounds\n");
@@ -1014,6 +1017,17 @@ void crusnexo_state::scene_observer_start()
 			fatalerror("Exotica waiting observation requires future mode and lifetime coverage from1799 through hostlast+1\n");
 	}
 	m_scene_margin=float(number("MIDZ_GL_MARGIN",0,120,number("MIDV_GL_MARGIN",0,120,88)));
+	const char *failure=std::getenv("MIDZ_HOST_FAILURE_POLICY");
+	const char *inject=std::getenv("MIDZ_HOST_FAILURE_FRAME");
+	if(failure || inject) {
+		if(!failure || (strcmp(failure,"0") && strcmp(failure,"1")) || !m_compose || m_scene_future_mode!=2 ||
+			!std::getenv("MIDZ_HOST_FUTURE_PRESENT") || strcmp(std::getenv("MIDZ_HOST_FUTURE_PRESENT"),"1") ||
+			!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0"))
+			fatalerror("Exotica failure trial requires explicit policy, combined private draw and FFB0\n");
+		m_scene_failure_original=!strcmp(failure,"1");
+		if(inject)m_scene_inject_frame=number("MIDZ_HOST_FAILURE_FRAME",m_scene_first,m_scene_last,0);
+		fprintf(stderr,"EXOTICA_HOST_FAILURE_POLICY original=%u inject=%u\n",unsigned(m_scene_failure_original),m_scene_inject_frame);
+	}
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
 		memregion("maindata")->bytes()!=0x800000 || memregion("bankeddata")->bytes()!=0x3000000 ||
 		m_ram_base.bytes()!=0x100000 || m_zeus->m_upstream_render)
@@ -1100,13 +1114,14 @@ void crusnexo_state::scene_observer_start()
 				if(!m_scene_open || m_scene_armed || m_ram_base[0x67f5]!=0x15200ff2 ||
 					m_ram_base[0x681f]!=0x082fbbb5 || m_ram_base[0x6835]!=0x082fbbb9)
 					fatalerror("Exotica host scene list signature/order\n");
-				m_scene_armed=m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last;
+				m_scene_armed=!m_scene_failed_scene && m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last;
 			} else if(offset==0xbbb9 && pc==0x6836) {
 				if(!m_scene_open)fatalerror("Exotica host scene end order\n");
 				if(m_scene_fence_log && m_scene_fence_selected)scene_fence_end();
 				m_scene_open=false;m_scene_armed=false;
 			}
-			if(m_active_mode && m_scene_open && m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last &&
+			if(m_active_mode && m_scene_open && (!m_scene_failed_scene || m_scene_serial==m_scene_failed_scene) &&
+				m_scene_cpu_frame>=m_scene_first && m_scene_cpu_frame<=m_scene_last &&
 				((offset==0xbbb5 && pc==0x6820) || (offset==0xbbb6 && pc==0x6824) ||
 				 (offset==0xbbb7 && pc==0x6830) || (offset==0xbbb8 && pc==0x6834)))scene_active_list(offset,data);
 		});
@@ -1328,8 +1343,19 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 	}
 	cruisn::exotica_scene::Result scene;
 	p.early_depth=m_scene_depth_mode;
-	if(!cruisn::exotica_scene::build(sources.sources,p,read,model_read,[](const cruisn::exotica_future::Source &s){return s.future;},scene))
-		fatalerror("Exotica host live scene rejected\n");
+	const bool injected=m_scene_inject_frame && p.frame>=m_scene_inject_frame;
+	if(injected || !cruisn::exotica_scene::build(sources.sources,p,read,model_read,[](const cruisn::exotica_future::Source &s){return s.future;},scene)) {
+		if(m_maincpu->total_cycles()!=cycles || m_scene_failed_scene || pending.scene!=m_scene_serial)
+			fatalerror("Invalid Exotica preparation failure boundary\n");
+		fprintf(stderr,"EXOTICA_HOST_PREP_FAILURE frame=%u scene=%llu injected=%u fallback=%u\n",
+			p.frame,(unsigned long long)pending.scene,unsigned(injected),unsigned(m_scene_failure_original));
+		if(!m_scene_failure_original)fatalerror("%s\n",injected?"Injected Exotica future assembly failure":"Exotica host live scene rejected");
+		// The current waiting proposal and active capture already own operands.
+		// Finish those and their ordinary FIFO fence; never discard pending tickets.
+		// An empty future packet maintains material sequencing but admits no source.
+		scene=cruisn::exotica_scene::Result{};
+		m_scene_failed_scene=pending.scene;m_scene_failed_frame=p.frame;
+	}
 	if(m_scene_depth_mode && (scene.depth_tests!=scene.selected-scene.unsupported_transform ||
 		(m_scene_depth_mode==2 && scene.depth_verified!=scene.depth_tests)))
 		fatalerror("Exotica host incomplete depth comparison\n");
@@ -1485,6 +1511,15 @@ void crusnexo_state::scene_fence_ready(bool immediate)
 	++m_scene_fence_completed;m_scene_fence_immediate+=immediate;
 	if(m_handover_mode)scene_waiting_ready();
 	if(m_active_mode)scene_active_ready();
+	if(m_scene_failed_scene && !m_scene_retired) {
+		if(m_scene_fence_scene!=m_scene_failed_scene || frame<m_scene_failed_frame || frame>m_scene_failed_frame+1 ||
+			!m_scene_pending.empty() || !m_endpoint_pending.empty() ||
+			m_handover_pending.pending() || m_handover_generation ||
+			!m_zeus->midz_host_retire(frame,m_scene_failed_scene))
+			fatalerror("Exotica private retirement boundary/queue rejected\n");
+		m_scene_retired=true;
+		fprintf(stderr,"EXOTICA_HOST_RETIRE_QUEUED frame=%u scene=%llu\n",frame,(unsigned long long)m_scene_failed_scene);
+	}
 }
 
 void crusnexo_state::scene_waiting_ready()
