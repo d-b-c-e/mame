@@ -125,6 +125,14 @@ void midvunit_base_state::offroad_host_start()
 		if(m_offroad_host_clip_admission && (m_host_mode!=2 || m_offroad_host_multiplier!=3 || !m_host_future || !ffb || strcmp(ffb,"0")))
 			fatalerror("Off Road clip admission requires 3x future draw and physical FFB0\n");
 	}
+	if(const char *partial=std::getenv("MIDV_OFFROAD_HOST_RECOVER_PARTIAL"))
+	{
+		if(strcmp(partial,"0") && strcmp(partial,"1"))fatalerror("Invalid Off Road partial recovery\n");
+		m_offroad_host_recover_partial=!strcmp(partial,"1");
+		const char *ffb=std::getenv("MIDV_FFB");
+		if(m_offroad_host_recover_partial && (m_host_mode!=2 || m_offroad_host_multiplier!=3 || !m_host_future || !ffb || strcmp(ffb,"0")))
+			fatalerror("Off Road partial recovery requires 3x future draw and physical FFB0\n");
+	}
 	if(const char *layer=std::getenv("MIDV_OFFROAD_HOST_LAYER"))
 	{
 		if(strlen(layer)!=1 || *layer<'0' || *layer>'3')fatalerror("Invalid Off Road host layer\n");
@@ -166,7 +174,7 @@ void midvunit_base_state::offroad_host_start()
 				!cruisn::offroad_future::code_matches(read))fatalerror("Off Road host revision/stock-code guard failed\n");
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::offroad_host::Scene scene;
-			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission))
+			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,false,m_offroad_host_recover_partial))
 				fatalerror("Off Road host scene/model/material guard failed at frame %llu\n",(unsigned long long)frame);
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
@@ -186,7 +194,8 @@ void midvunit_base_state::offroad_host_start()
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("Off Road host inspection changed guest cycles\n");
 			const auto submitted=std::chrono::steady_clock::now();
 			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
-			const unsigned definitions=m_host_future && !scene.pretrack && !scene.deferred ? unsigned(m_offroad_host_cache.future.value.sources.size()):0;
+			const unsigned definitions=m_host_future && !scene.pretrack && !scene.deferred ? unsigned(m_offroad_host_cache.future.value.sources.size())+scene.partial_recovered:0;
+			if(scene.partial_recovered)osd_printf_info("OFFROAD_PARTIAL frame=%llu sources=%u\n",(unsigned long long)frame,scene.partial_recovered);
 			fprintf(m_host_scene_log,"%llu,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
 				(unsigned long long)frame,time,m_page_control,m_host_mode,m_offroad_host_multiplier,unsigned(m_host_future),
 				scene.pending,scene.future,definitions,scene.unsupported,scene.near,scene.far,scene.projection,scene.material,unsigned(scene.objects.size()),
