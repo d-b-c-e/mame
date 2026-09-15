@@ -26,8 +26,10 @@ template<class Read> bool collect(Read read,std::vector<world_host::Descriptor> 
             world_host::Descriptor d;d.id=0xc0000000|p;d.active_margin=true;
             for(unsigned i=0;i<32;++i)d.words[i]=read(p+i);
             p=d.words[0];
-            if((d.words[14]&0x3000)!=0x1000)return false;
-            if((d.words[14]&0x861)!=1 || d.words[16]>65535 || d.words[17]>65535)continue;
+            // The renderer also traverses menu/effect objects (e.g. captured
+            // 0x3020). Valid topology does not make those ordinary active roads.
+            // Exclude them without aborting a scene or granting draw permission.
+            if((d.words[14]&0x3861)!=0x1001 || d.words[16]>65535 || d.words[17]>65535)continue;
             result.push_back(d);
         }
     }
