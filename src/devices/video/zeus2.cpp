@@ -6,7 +6,7 @@
 
 **************************************************************************/
 #include "emu.h"
-#include "../../mame/midway/cruisn/diagnostic_journal.h"
+#include "../../mame/midway/cruisn/exotica_journal_policy.h"
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
 #include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
@@ -721,6 +721,12 @@ void thread_main()
 	struct DoneGuard { ~DoneGuard() { s_donez.store(true); } } done_guard;
 	if (std::getenv("MIDZ_GL_LOG"))
 		s_zlog = fopen("midz_gl.log", "w");
+	cruisn::DiagnosticJournal::Policy journal_policy;
+	const char *journal_mode=std::getenv("MIDZ_HOST_JOURNALS");
+	if(!cruisn::exotica_journals::select(journal_mode,[](const char *key){return std::getenv(key);},journal_policy)) {
+		zlogf("invalid Exotica journal policy or missing combined-renderer requirements");return;
+	}
+	if(journal_mode)fprintf(stderr,"MIDZ_HOST_JOURNALS gpu=%s\n",journal_mode);
 	auto envi = [](const char *a, const char *b, int dflt) -> int
 	{
 		if (const char *v = std::getenv(a)) return atoi(v);
@@ -881,7 +887,7 @@ void thread_main()
 		gl.Uniform1f(gl.GetUniformLocation(mirror_prog,"uMargin"),float(MARGIN));
 		gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"waveram"),0);
 		gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"palTex"),1);
-		mirror_log.open("zeus-depth-mirror.csv","w",cruisn::DiagnosticJournal::Policy::capture);if(!mirror_log) {zlogf("depth mirror log failed");return;}
+		mirror_log.open("zeus-depth-mirror.csv","w",journal_policy);if(!mirror_log) {zlogf("depth mirror log failed");return;}
 		mirror_log.buffer(nullptr,_IOFBF,65536);
 		mirror_log.print("frame,width,height,batches,vertices,clears,snapshot,color_differences,depth_differences,mirror_us,snapshot_us\n");
 	}
@@ -1029,7 +1035,7 @@ void thread_main()
 		if(retained ? !accept_retained(packet,*private_image) : !accept(packet,*private_image))return false;
 		const auto decoded=std::chrono::steady_clock::now();
 		if(!private_log) {
-			private_log.open("exotica-host-materials-gpu.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+			private_log.open("exotica-host-materials-gpu.csv","w",journal_policy);
 			if(!private_log)return false;
 			private_log.buffer(nullptr,_IOFBF,65536);
 			private_log.print("scene,frame,generation,pages,palettes,bytes,hash,decode_us,upload_us,snapshot_us\n");
@@ -1205,7 +1211,7 @@ void thread_main()
 	cruisn::DiagnosticJournal endpoint_log;
 	if(envi("MIDZ_MODEL_ENDPOINT",nullptr,0)==2) {
 		if(!mirror_fbo || !depth_mirror.wide) {zlogf("endpoint replacement requires private wide target");return;}
-		endpoint_log.open("exotica-endpoint-gpu.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		endpoint_log.open("exotica-endpoint-gpu.csv","w",journal_policy);
 		if(!endpoint_log){zlogf("cannot create endpoint GPU receipt");return;}
 		endpoint_log.buffer(nullptr,_IOFBF,65536);
 		endpoint_log.print("frame,model,index,count\n");
@@ -1404,7 +1410,7 @@ void thread_main()
 		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0DE1,waveTex);
 		gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0DE1,palTex);gl.ActiveTexture(TEXTURE0);
 		if(!margin_log) {
-			margin_log.open("exotica-active-gpu.csv","w",cruisn::DiagnosticJournal::Policy::capture);if(!margin_log)return false;
+			margin_log.open("exotica-active-gpu.csv","w",journal_policy);if(!margin_log)return false;
 			margin_log.buffer(nullptr,_IOFBF,65536);
 			margin_log.print("scene,frame,mode,quads,vertices,width,height,page,margin,snapshot,host_us\n");
 		}
@@ -1501,7 +1507,7 @@ void thread_main()
 		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0de1,waveTex);gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0de1,palTex);gl.ActiveTexture(TEXTURE0);
 		if(gl.GetError())return false;
 		if(!log) {
-			log.open((std::string(prefix)+"gpu.csv").c_str(),"w",cruisn::DiagnosticJournal::Policy::capture);if(!log)return false;log.buffer(nullptr,_IOFBF,65536);
+			log.open((std::string(prefix)+"gpu.csv").c_str(),"w",journal_policy);if(!log)return false;log.buffer(nullptr,_IOFBF,65536);
 			log.print("scene,frame,mode,multiplier,page,quads,vertices,bytes,hash,snapshot,host_us\n");
 		}
 		const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();

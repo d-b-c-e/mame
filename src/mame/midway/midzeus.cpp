@@ -27,7 +27,7 @@ The Grid         v1.2   10/18/2000
 **************************************************************************/
 
 #include "emu.h"
-#include "cruisn/diagnostic_journal.h"
+#include "cruisn/exotica_journal_policy.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/hud_drivetrain.h"
 #include "cruisn/exotica_visibility.h"
@@ -213,6 +213,7 @@ private:
 	cruisn::exotica_admissions::Ledger m_endpoint_admissions;
 	uint32_t m_endpoint_admit_from=0;
 	uint64_t m_endpoint_admit_sequence=0,m_endpoint_admit_bytes=0;
+	cruisn::DiagnosticJournal::Policy m_journal_policy=cruisn::DiagnosticJournal::Policy::capture;
 	cruisn::DiagnosticJournal m_endpoint_admit_packets,m_endpoint_admit_log;
 	struct EndpointPending {
 		cruisn::scenery_lifetimes::Handle owner;
@@ -512,7 +513,7 @@ void crusnexo_state::lifetime_start()
 	m_lifetime_first=number("MIDZ_LIFETIME_FIRST");m_lifetime_last=number("MIDZ_LIFETIME_LAST");
 	if(m_lifetime_last<m_lifetime_first || m_lifetime_last-m_lifetime_first>10000 || m_ram_base.bytes()!=0x100000)
 		fatalerror("Exotica lifetime interval/space bounds\n");
-	m_lifetime_log.open("exotica-lifetime-events.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+	m_lifetime_log.open("exotica-lifetime-events.csv","w",m_journal_policy);
 	if(!m_lifetime_log)fatalerror("Cannot open Exotica lifetime journal\n");
 	m_lifetime_log.buffer(nullptr,_IOFBF,65536);
 	if(m_lifetime_log.print("event,frame,time,sequence,epoch,generation,slot,owner,realm,section,source,reason,flags\n")<0)
@@ -714,8 +715,8 @@ void crusnexo_state::endpoint_start()
 		if(m_scene_future_mode!=2 || !m_scene_material_image || m_endpoint_admit_from>m_endpoint_first ||
 			m_endpoint_admit_from<m_scene_first || m_scene_last<m_endpoint_last)
 			fatalerror("Endpoint admissions require actual private future drawing and covered frames\n");
-		m_endpoint_admit_packets.open("exotica-admission-packets.bin","wb",cruisn::DiagnosticJournal::Policy::capture);
-		m_endpoint_admit_log.open("exotica-endpoint-admissions.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		m_endpoint_admit_packets.open("exotica-admission-packets.bin","wb",m_journal_policy);
+		m_endpoint_admit_log.open("exotica-endpoint-admissions.csv","w",m_journal_policy);
 		if(!m_endpoint_admit_packets || !m_endpoint_admit_log)fatalerror("Endpoint admission files\n");
 		m_endpoint_admit_packets.buffer(nullptr,_IOFBF,65536);m_endpoint_admit_log.buffer(nullptr,_IOFBF,65536);
 		m_endpoint_admit_log.print("id,admitted,first_sequence,first_frame,last_sequence,last_frame,packets,records\n");
@@ -731,13 +732,13 @@ void crusnexo_state::endpoint_start()
 	fprintf(stderr,"MIDZ_ENDPOINT_EARLY=%u\n",unsigned(m_endpoint_early));
 	fprintf(stderr,"MIDZ_ENDPOINT_MARKED=%u\n",unsigned(m_endpoint_marked));
 	if(m_endpoint_early) {
-		m_endpoint_early_log.open("exotica-early-active.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		m_endpoint_early_log.open("exotica-early-active.csv","w",m_journal_policy);
 		if(!m_endpoint_early_log)fatalerror("Cannot create private visibility journal\n");
 		m_endpoint_early_log.buffer(nullptr,_IOFBF,65536);
 		m_endpoint_early_log.print("scene,frame,records,packets,slot,epoch,generation,realm,section,source,first_sequence,first_frame,last_sequence,last_frame\n");
 	}
-	m_endpoint_log.open("exotica-endpoint-models.csv","w",cruisn::DiagnosticJournal::Policy::capture);
-	m_endpoint_inputs.open("exotica-endpoint-inputs.txt","w",cruisn::DiagnosticJournal::Policy::capture);
+	m_endpoint_log.open("exotica-endpoint-models.csv","w",m_journal_policy);
+	m_endpoint_inputs.open("exotica-endpoint-inputs.txt","w",m_journal_policy);
 	if(!m_endpoint_log || !m_endpoint_inputs)fatalerror("Cannot create endpoint observer files\n");
 	m_endpoint_log.buffer(nullptr,_IOFBF,65536);m_endpoint_inputs.buffer(nullptr,_IOFBF,65536);
 	m_endpoint_log.print("id,commit_frame,commit_time,device_frame,device_time,epoch,generation,slot,realm,section,source,end,opcode,base,flags,packed,status,quads,changed,snapshot\n");
@@ -934,6 +935,11 @@ void crusnexo_state::endpoint_admit(uint64_t scene,uint32_t frame,uint64_t realm
 
 void crusnexo_state::scene_observer_start()
 {
+	const char *journal_mode=std::getenv("MIDZ_HOST_JOURNALS");
+	if(!cruisn::exotica_journals::select(journal_mode,[](const char *key){return std::getenv(key);},m_journal_policy))
+		fatalerror("Invalid Exotica journal policy or missing combined-renderer requirements\n");
+	if(journal_mode)fprintf(stderr,"MIDZ_HOST_JOURNALS cpu=%s\n",journal_mode);
+
 	const char *mode=std::getenv("MIDZ_HOST_SCENE");
 	if(!mode || !strcmp(mode,"0")) {
 		const char *waiting=std::getenv("MIDZ_HOST_WAITING");
@@ -959,7 +965,7 @@ void crusnexo_state::scene_observer_start()
 	m_active_mode=number("MIDZ_HOST_ACTIVE",0,2,0);
 	m_compose=number("MIDZ_HOST_COMPOSE",0,1,0)!=0;
 	if(number("MIDZ_HOST_FENCE",0,1,0)) {
-		m_scene_fence_log.open("exotica-host-fences.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		m_scene_fence_log.open("exotica-host-fences.csv","w",m_journal_policy);
 		if(!m_scene_fence_log)fatalerror("Cannot create Exotica command-fence log\n");
 		m_scene_fence_log.buffer(nullptr,_IOFBF,65536);
 		m_scene_fence_log.print("scene,scene_frame,end_frame,end_time,ready_frame,ready_time,consumer,target,words,immediate,guest_cycles,page\n");
@@ -977,7 +983,7 @@ void crusnexo_state::scene_observer_start()
 		fatalerror("Exotica written pages require private materials\n");
 	if(number("MIDZ_HOST_MATERIALS",0,1,0)) {
 		m_scene_material_image=std::make_unique<cruisn::zeus_host::WaveImage>();
-		m_scene_material_log.open("exotica-host-materials.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		m_scene_material_log.open("exotica-host-materials.csv","w",m_journal_policy);
 		if(!m_scene_material_log)fatalerror("Cannot create Exotica material log\n");
 		m_scene_material_log.buffer(nullptr,_IOFBF,65536);
 		m_scene_material_log.print("scene,frame,generation,pages,palettes,bytes,hash,stage_us,encode_us,queue_us,commit_us\n");
@@ -1005,7 +1011,7 @@ void crusnexo_state::scene_observer_start()
 	if(m_compose) {
 		if(m_active_mode!=2 || m_scene_future_mode!=2 || m_handover_mode!=2 || !m_scene_material_pages)
 			fatalerror("Exotica composition requires active/future/waiting drawing and tracked materials\n");
-		m_compose_log.open("exotica-compose-scenes.csv","w",cruisn::DiagnosticJournal::Policy::capture);if(!m_compose_log)fatalerror("Cannot create composition log\n");
+		m_compose_log.open("exotica-compose-scenes.csv","w",m_journal_policy);if(!m_compose_log)fatalerror("Cannot create composition log\n");
 		m_compose_log.buffer(nullptr,_IOFBF,65536);
 		m_compose_log.print("scene,frame,end_records,ready_records,input_instances,input_quads,overlaps,removed_quads,texture_pages,instances,quads\n");
 		fprintf(stderr,"MIDZ_HOST_COMPOSE=1\n");
@@ -1046,7 +1052,7 @@ void crusnexo_state::scene_observer_start()
 	}
 	if(m_waiting_mode) {
 		m_waiting_snapshots=m_scene_snapshots;
-		m_waiting_log.open("exotica-waiting-scenes.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		m_waiting_log.open("exotica-waiting-scenes.csv","w",m_journal_policy);
 		if(!m_waiting_log)fatalerror("Cannot create Exotica waiting log\n");
 		m_waiting_log.buffer(nullptr,_IOFBF,65536);
 		m_waiting_log.print("scene,frame,device_time,epoch,sequence,records,historical,unowned,submitted,future,bound_future,bound_future_submitted,candidates,instances,quads,hash,guest_cycles\n");
@@ -1054,15 +1060,15 @@ void crusnexo_state::scene_observer_start()
 	}
 	if(m_handover_mode) {
 		m_handover_snapshots=m_scene_snapshots;
-		m_handover_log.open("exotica-handover-scenes.csv","w",cruisn::DiagnosticJournal::Policy::capture);
-		m_handover_cohorts.open("exotica-handover-cohorts.bin","wb",cruisn::DiagnosticJournal::Policy::capture);
+		m_handover_log.open("exotica-handover-scenes.csv","w",m_journal_policy);
+		m_handover_cohorts.open("exotica-handover-cohorts.bin","wb",m_journal_policy);
 		if(!m_handover_log || !m_handover_cohorts)fatalerror("Cannot create Exotica completion observation\n");
 		m_handover_log.buffer(nullptr,_IOFBF,65536);m_handover_cohorts.buffer(nullptr,_IOFBF,65536);
 		m_handover_log.print("scene,proposal_frame,proposal_time,proposal_records,end_records,ready_frame,ready_time,ready_records,epoch,captured,submitted,retired,retained,owners_hash,instances,quads,geometry_hash,guest_cycles\n");
 		fprintf(stderr,"MIDZ_HOST_HANDOVER=%u\n",m_handover_mode);
 		if(m_handover_mode==2)fprintf(stderr,"MIDZ_HOST_WAITING_DRAW=2\n");
 	}
-	m_scene_log.open("exotica-host-scenes.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+	m_scene_log.open("exotica-host-scenes.csv","w",m_journal_policy);
 	if(!m_scene_log)fatalerror("Cannot create Exotica host scene log\n");
 	m_scene_log.buffer(nullptr,_IOFBF,65536);
 	m_scene_log.print("frame,cpu_frame,cpu_time,device_time,base,count,bank,page,multiplier,partial,sources,instances,quads,viewport,hash,source_us,assembly_us,hash_us,snapshot_us,guest_cycles,scene,scene_frame,scene_time,bounds,culled_bounds,materials_us,source_cache,depth_mode,depth_tests,depth_verified,depth_skipped\n");
@@ -1071,7 +1077,7 @@ void crusnexo_state::scene_observer_start()
 		if(!m_scene_fence_log || !m_scene_material_image || !m_zeus->midz_live)
 			fatalerror("Exotica active margins require command fence, private materials and live GL\n");
 		m_active_snapshots=m_scene_snapshots;
-		m_active_log.open("exotica-active-scenes.csv","w",cruisn::DiagnosticJournal::Policy::capture);
+		m_active_log.open("exotica-active-scenes.csv","w",m_journal_policy);
 		if(!m_active_log)fatalerror("Cannot create Exotica active-scene log\n");
 		m_active_log.buffer(nullptr,_IOFBF,65536);
 		m_active_log.print("scene,scene_frame,frame,ready_frame,objects,candidates,already_submitted,instances,quads,excluded_raster,hash,guest_cycles,assembly_us,materials_us,sealed_frame,camera_advanced,changed_objects,binding_checks,seal_us,bindings_advanced,model_checks,model_bytes,palette_checks,texture_pages,lease_us,ram_models,seal_pages,seal_verified\n");
