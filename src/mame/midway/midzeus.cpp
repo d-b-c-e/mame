@@ -251,7 +251,7 @@ private:
 	};
 	std::map<uint32_t,LifetimeOwner> m_lifetime_owners;
 	uint32_t m_lifetime_first=0,m_lifetime_last=0,m_lifetime_owner_slot=0,m_lifetime_owner_source=0,m_lifetime_owner_entry=0;
-	uint32_t m_lifetime_initial_head=0,m_lifetime_initial_count=0;
+	uint32_t m_lifetime_initial_head=0,m_lifetime_initial_count=0,m_lifetime_pool_base=0;
 	bool m_lifetime_started=false;
 	uint64_t m_lifetime_records=0,m_lifetime_bindings=0,m_lifetime_emissions=0,m_lifetime_owned=0;
 	uint64_t m_lifetime_first_draws=0,m_lifetime_fading_draws=0,m_lifetime_opaque=0,m_lifetime_draw_records=0;
@@ -547,7 +547,7 @@ void crusnexo_state::lifetime_start()
 						cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
 						if(!m_lifetimes.reset(layout))fatalerror("Exotica global clear registry\n");
 						if(m_endpoint_admissions.epoch() && !m_endpoint_admissions.reset(m_lifetimes.epoch()))fatalerror("Endpoint global clear reset\n");
-						m_lifetime_owners.clear();lifetime_emit('C',0,0,0,{},0x85b4,0);
+						m_lifetime_owners.clear();m_lifetime_pool_base=0;lifetime_emit('C',0,0,0,{},0x85b4,0);
 						p=LifetimePending();m_lifetime_reset_tap.remove();
 					});
 			} else if(pc==0xbbf7) {
@@ -590,7 +590,7 @@ void crusnexo_state::lifetime_start()
 						cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
 						if(!m_lifetimes.reset(layout))fatalerror("Exotica lifetime reset registry\n");
 						if(m_endpoint_admissions.epoch() && !m_endpoint_admissions.reset(m_lifetimes.epoch()))fatalerror("Endpoint admission reset\n");
-						m_lifetime_owners.clear();lifetime_emit('R',p.base,0,0,{},1201,1200);
+						m_lifetime_owners.clear();m_lifetime_pool_base=p.base;lifetime_emit('R',p.base,0,0,{},1201,1200);
 						p=LifetimePending();m_lifetime_reset_tap.remove();
 					});
 				return;
@@ -601,7 +601,11 @@ void crusnexo_state::lifetime_start()
 				fatalerror("Exotica lifetime paired count\n");
 			const double now=machine().time().as_double();if(now<p.time || now-p.time>=.001)fatalerror("Exotica lifetime paired duration\n");
 			uint64_t generation=0;bool unknown=false;
-			if(p.kind==1 ? !m_lifetimes.allocate(p.slot,generation) : !m_lifetimes.release(p.slot,unknown))
+			// The menu also constructs objects outside this allocator, then adopts
+			// them through the same verified free/link/count transaction. After a
+			// rebuild, an unseen address INSIDE the known free pool is never live.
+			const bool external=m_lifetime_pool_base && (p.slot<m_lifetime_pool_base || p.slot>=m_lifetime_pool_base+1201*31);
+			if(p.kind==1 ? !m_lifetimes.allocate(p.slot,generation) : !m_lifetimes.release(p.slot,unknown,external))
 				fatalerror("Exotica lifetime registry transaction\n");
 			const auto retiring=m_lifetime_owners.find(p.slot);
 			if(p.kind==2 && m_endpoint_admissions.epoch() && retiring!=m_lifetime_owners.end() &&
