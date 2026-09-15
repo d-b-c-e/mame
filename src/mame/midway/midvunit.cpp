@@ -380,6 +380,19 @@ void midvunit_base_state::world_host_start()
 	if(m_host_far_coverage && (m_host_far!=240000 || m_host_mode!=2 || !m_host_future ||
 		!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0")))
 		fatalerror("World far coverage requires 3x future draw and physical FFB0\n");
+	if(const char *fade=std::getenv("MIDV_WORLD_HOST_FADE_METADATA"))
+	{
+		if(strcmp(fade,"0") && strcmp(fade,"1"))fatalerror("Invalid host fade metadata mode\n");
+		m_host_fade_metadata=!strcmp(fade,"1");
+	}
+	if(m_host_fade_metadata)
+	{
+		if(!m_host_far_coverage || m_host_layer!=3 || !std::getenv("MIDV_GL_ORIGINAL_MIRROR") ||
+			strcmp(std::getenv("MIDV_GL_ORIGINAL_MIRROR"),"1"))fatalerror("Fade metadata requires qualified World3x mirror/coverage\n");
+		m_host_fade_log=fopen("vunit-fade-producer.bin","wb");
+		if(!m_host_fade_log || fwrite("VFD1",1,4,m_host_fade_log)!=4)fatalerror("Cannot create fade producer evidence\n");
+		setvbuf(m_host_fade_log,nullptr,_IOFBF,65536);
+	}
 	for(auto pair:{std::make_pair("MIDV_WORLD_HOST_FIRST",&m_host_first),std::make_pair("MIDV_WORLD_HOST_LAST",&m_host_last)})
 		if(const char *text=std::getenv(pair.first))
 		{
@@ -459,13 +472,16 @@ void midvunit_base_state::world_host_start()
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			std::vector<std::array<uint32_t,4>> depths;
+			std::vector<uint32_t> policies;
 			size_t count=0;for(const auto &o:scene.objects)count+=o.quads.size();
 			quads.reserve(count);
 			if(m_host_far_coverage)depths.reserve(count);
 			uint64_t hash=cruisn::world_host::hash_seed;
+			if(m_host_fade_metadata)policies.reserve(count);
 			for(const auto &o:scene.objects)for(size_t qi=0;qi<o.quads.size();++qi)
 			{
 				const auto &q=o.quads[qi];
+				if(m_host_fade_metadata)policies.push_back(o.protected_road?1:0);
 				if(m_host_far_coverage){if(o.depths.size()!=o.quads.size())fatalerror("Missing World far depths\n");depths.push_back(o.depths[qi]);}
 				quads.push_back(q);
 				hash=cruisn::world_host::quad_hash(hash,q);
@@ -478,7 +494,7 @@ void midvunit_base_state::world_host_start()
 				fputc('\n',m_host_quad_log);
 			}
 			const auto logged=std::chrono::steady_clock::now();
-			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr);
+			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr,m_host_fade_metadata?&policies:nullptr);
 			if(m_maincpu->total_cycles()!=guest_cycles)
 				fatalerror("World host inspection changed emulated CPU cycles\n");
 			const auto submitted=std::chrono::steady_clock::now();
@@ -500,6 +516,7 @@ void midvunit_base_state::world_host_start()
 
 void midvunit_base_state::world_host_exit()
 {
+	if(m_host_fade_log){FILE *fp=m_host_fade_log;m_host_fade_log=nullptr;if(fclose(fp))fatalerror("Fade producer close failed\n");}
 	if(m_host_scene_log){fclose(m_host_scene_log);m_host_scene_log=nullptr;}
 	if(m_host_quad_log){fclose(m_host_quad_log);m_host_quad_log=nullptr;}
 	if(m_host_clip_log){fclose(m_host_clip_log);m_host_clip_log=nullptr;}

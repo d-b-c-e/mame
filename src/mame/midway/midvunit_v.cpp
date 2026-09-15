@@ -18,6 +18,7 @@
 #include "cruisn/retained_texture.h"
 #include "cruisn/cpu_upload_spans.h"
 #include "cruisn/vunit_far_coverage.h"
+#include "cruisn/vunit_distance_fade.h"
 
 #include "williamssound.h"
 
@@ -1129,6 +1130,9 @@ void thread_main()
 	bool const original_mirror = std::getenv("MIDV_GL_ORIGINAL_MIRROR") &&
 		!strcmp(std::getenv("MIDV_GL_ORIGINAL_MIRROR"), "1");
 	int const mirror_frame = std::getenv("MIDV_GL_MIRROR_FRAME") ? atoi(std::getenv("MIDV_GL_MIRROR_FRAME")) : 0;
+	bool const fade_metadata = std::getenv("MIDV_WORLD_HOST_FADE_METADATA") &&
+		!strcmp(std::getenv("MIDV_WORLD_HOST_FADE_METADATA"),"1");
+	if(fade_metadata && !original_mirror)fatalerror("Fade metadata requires original mirror\n");
 	if (original_mirror)
 	{
 		if (!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0") || mirror_frame<1 || mirror_frame>1000000 ||
@@ -1394,6 +1398,14 @@ void thread_main()
 	int original_cpu_written[2]{};
 	uint64_t mirror_ordinary=0,mirror_auxiliary=0,mirror_cpu_blits=0,mirror_resets=0;
 	bool mirror_captured=false;
+	struct FadeFile { FILE *fp=nullptr; ~FadeFile(){if(fp)fclose(fp);} } fade_file;
+	uint64_t fade_packets=0,fade_roads=0,fade_captured=0;
+	if(fade_metadata)
+	{
+		fade_file.fp=fopen("vunit-fade-consumer.bin","wb");
+		if(!fade_file.fp || fwrite("VFD1",1,4,fade_file.fp)!=4)fatalerror("Cannot create fade consumer evidence\n");
+		setvbuf(fade_file.fp,nullptr,_IOFBF,65536);
+	}
 	uint64_t n_flips = 0;
 	auto complete_run = [&]()
 	{
@@ -1659,7 +1671,7 @@ void thread_main()
 			uint32_t const type = hdr[0], len = hdr[1];
 			if (len > staging.size()) staging.resize(len);
 			ring_read(r + 8, staging.data(), len);
-			if (type >= 1 && type <= 7 && len >= 4)
+			if (type >= 1 && type <= 8 && len >= 4)
 				memcpy(&last_received_frame, staging.data(), 4);
 			r += (8 + len + 7) & ~7u;
 			ring_store(lv.rpos, r);
@@ -1668,16 +1680,32 @@ void thread_main()
 			{
 			case 1:
 			case 7:
+			case 8:
 			{
-				if(len!=(type==1?40:60))fatalerror("Invalid V-Unit quad payload length\n");
+				if(len!=(type==1?40:type==7?60:64))fatalerror("Invalid V-Unit quad payload length\n");
 				QuadMsg q{};
-				memcpy(&q, staging.data(),len);
+				bool far_packet=type==7;
+				memcpy(&q, staging.data(),type==1?40:60);
 				if(type==7){std::array<double,4> depths;if(!cruisn::vunit_far::decode(q.coverage,depths))fatalerror("Invalid far quad metadata\n");}
+				if(type==8)
+				{
+					cruisn::vunit_fade::Packet packet;memcpy(&packet,staging.data(),sizeof(packet));
+					std::array<float,4> depths;
+					if(!fade_metadata || !cruisn::vunit_fade::decode(packet,depths,far_packet))fatalerror("Invalid host fade metadata\n");
+					++fade_packets;fade_roads+=packet.policy;
+					if(int(q.frame)==mirror_frame)
+					{
+						if(fwrite(&packet,1,sizeof(packet),fade_file.fp)!=sizeof(packet))fatalerror("Fade consumer write failed\n");
+						++fade_captured;
+					}
+					if(!far_packet)q.coverage={}; // ordinary inside quad; preserve old clipping dispatch
+				}
+				else if(fade_metadata && q.pad)fatalerror("Host quad missing fade metadata\n");
 				if (run_pc != 0xffff && (q.pc != run_pc ||
 					(!run.empty() && ((q.pad ^ run.back().pad) & 2)))) complete_run();
 				run_pc = q.pc;
 				run.push_back(q);
-				run_far|=type==7;
+				run_far|=far_packet;
 				++n_quads;
 				break;
 			}
@@ -1921,6 +1949,13 @@ void thread_main()
 		if(frame_complete)s_presented_frame.store(completed_frame);
 	}
 	const auto capture_stats = snapshot_writer.finish();
+	if(fade_metadata)
+	{
+		FILE *fp=fade_file.fp;fade_file.fp=nullptr;
+		if(fclose(fp))fatalerror("Fade consumer close failed\n");
+		std::fprintf(stderr,"MIDV_FADE_METADATA packets=%llu roads=%llu captured=%llu\n",
+			(unsigned long long)fade_packets,(unsigned long long)fade_roads,(unsigned long long)fade_captured);
+	}
 	if (snapdir) {
 		std::fprintf(stderr, "MIDV_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu paced=%u waits=%llu wait_us=%llu\n",
 			(unsigned long long)capture_stats.submitted, (unsigned long long)capture_stats.written,
@@ -3305,18 +3340,34 @@ void midvunit_base_state::observe_numeric_hud()
 }
 
 void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
-	const std::vector<std::array<uint32_t,4>> *depths)
+	const std::vector<std::array<uint32_t,4>> *depths, const std::vector<uint32_t> *policies)
 {
 	if(!live().enabled)fatalerror("World host scenery drawing requires the live GL renderer\n");
 	if(quads.empty())return;
 	if(depths && (!m_host_far_coverage || depths->size()!=quads.size()))fatalerror("Host far depths mismatch\n");
+	if(policies && (!m_host_fade_metadata || !depths || policies->size()!=quads.size()))fatalerror("Host fade policies mismatch\n");
 	const uint32_t frame=uint32_t(m_screen->frame_number());
 	live().last_frame=frame;
 	live().sync_state(frame,m_paletteram.target(),uint32_t(m_paletteram.bytes()),
 		m_textureram.target(),uint32_t(m_textureram.bytes()));
 	struct {uint32_t frame;uint16_t pc,pad;} h={frame,m_page_control,m_host_layer};
+	const char *capture_text=policies?std::getenv("MIDV_GL_MIRROR_FRAME"):nullptr;
+	int const fade_frame=capture_text?atoi(capture_text):0;
 	for(size_t i=0;i<quads.size();++i)
 	{
+		if(policies)
+		{
+			cruisn::vunit_fade::Packet packet;
+			packet.quad.frame=frame;packet.quad.pc=m_page_control;packet.quad.pad=m_host_layer;
+			std::copy(quads[i].begin(),quads[i].end(),packet.quad.dma);
+			packet.quad.coverage.far_limit=m_host_far;packet.quad.coverage.words=(*depths)[i];packet.policy=(*policies)[i];
+			std::array<float,4> decoded;bool crossing;
+			if(!cruisn::vunit_fade::decode(packet,decoded,crossing))fatalerror("Invalid emitted host fade metadata\n");
+			if(crossing && m_host_clip_log && fwrite(&packet.quad,1,sizeof(packet.quad),m_host_clip_log)!=sizeof(packet.quad))fatalerror("Far producer receipt write failed\n");
+			if(int(frame)==fade_frame &&
+				fwrite(&packet,1,sizeof(packet),m_host_fade_log)!=sizeof(packet))fatalerror("Fade producer write failed\n");
+			live().write_msg(8,&packet,sizeof(packet));continue;
+		}
 		bool crossing=false;
 		if(depths)for(auto word:(*depths)[i])crossing|=cruisn::scenery::Float::load(word).fix()>=int32_t(m_host_far);
 		if(!crossing){live().write_msg(1,&h,8,quads[i].data(),32);continue;}
