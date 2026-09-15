@@ -47,6 +47,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/exotica_model_endpoint.h"
 #include "cruisn/exotica_admissions.h"
 #include "cruisn/exotica_scene_endpoint.h"
+#include "cruisn/exotica_pool_clear.h"
 
 #include <algorithm>
 #include <chrono>
@@ -527,7 +528,29 @@ void crusnexo_state::lifetime_start()
 			p.old_head=m_ram_base[0x10a8];p.count=m_ram_base[0x10a9];p.new_head=data;p.time=machine().time().as_double();
 			if((p.old_head && !lifetime_slot(p.old_head)) || (data && !lifetime_slot(data)) || p.count>4096)
 				fatalerror("Exotica lifetime head/count bounds\n");
-			if(pc==0xbbf7) {
+			if(pc==0x85b4) {
+				auto valid=[this](uint32_t address,uint32_t value,uint32_t bits) {
+					return cruisn::exotica_pool_clear::valid([this](uint32_t at){return uint32_t(m_ram_base[at]);},
+						address,value,bits,uint32_t(m_maincpu->state_int(TMS320C3X_PC)),uint32_t(m_maincpu->state_int(TMS320C3X_R0)),
+						uint32_t(m_maincpu->state_int(TMS320C3X_AR0)),uint32_t(m_maincpu->state_int(TMS320C3X_RC)),
+						uint32_t(m_maincpu->state_int(TMS320C3X_RS)),uint32_t(m_maincpu->state_int(TMS320C3X_RE)));
+				};
+				if(!valid(0x10a8,data,mask))fatalerror("Exotica lifetime global clear head\n");
+				p.kind=4;
+				m_lifetime_reset_tap=m_maincpu->space(AS_PROGRAM).install_write_tap(0x11cb,0x11cb,"exotica_lifetime_clear_tail",
+					[this,valid](offs_t address,uint32_t &value,uint32_t bits) {
+						if(machine().side_effects_disabled())return;
+						auto &p=m_lifetime_pending;const double now=machine().time().as_double();
+						if(p.kind!=4 || !p.head_time || !valid(uint32_t(address),value,bits) ||
+							now<p.head_time || p.head_time<p.time || now-p.time>=.001)
+							fatalerror("Exotica lifetime global clear tail\n");
+						cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
+						if(!m_lifetimes.reset(layout))fatalerror("Exotica global clear registry\n");
+						if(m_endpoint_admissions.epoch() && !m_endpoint_admissions.reset(m_lifetimes.epoch()))fatalerror("Endpoint global clear reset\n");
+						m_lifetime_owners.clear();lifetime_emit('C',0,0,0,{},0x85b4,0);
+						p=LifetimePending();m_lifetime_reset_tap.remove();
+					});
+			} else if(pc==0xbbf7) {
 				p.kind=1;p.slot=uint32_t(m_maincpu->state_int(TMS320C3X_AR0));
 				if(!lifetime_slot(p.slot) || p.slot!=p.old_head || !p.count || m_ram_base[p.slot]!=data)
 					fatalerror("Exotica lifetime allocation link\n");
@@ -542,6 +565,14 @@ void crusnexo_state::lifetime_start()
 			if(!lifetime_scope())return;
 			if(mask!=UINT32_MAX)fatalerror("Exotica lifetime partial count write\n");
 			auto &p=m_lifetime_pending;const auto pc=m_maincpu->state_int(TMS320C3X_PC);
+			if(p.kind==4) {
+				if(pc!=0x85b4 || data || p.head_time || m_ram_base[0x10a8] || m_ram_base[0x10a9]!=p.count ||
+					uint32_t(m_maincpu->state_int(TMS320C3X_R0)) || uint32_t(m_maincpu->state_int(TMS320C3X_AR0))!=0x10aa ||
+					uint32_t(m_maincpu->state_int(TMS320C3X_RC))!=0x122 || uint32_t(m_maincpu->state_int(TMS320C3X_RS))!=0x85b3 ||
+					uint32_t(m_maincpu->state_int(TMS320C3X_RE))!=0x85b3)
+					fatalerror("Exotica lifetime global clear count\n");
+				p.head_time=machine().time().as_double();return;
+			}
 			if(!p.kind && pc==0xbbc9) {
 				p.kind=3;p.base=m_ram_base[0xbbbc];p.old_head=m_ram_base[0x10a8];p.count=m_ram_base[0x10a9];p.time=machine().time().as_double();
 				if(data!=1200 || m_ram_base[0xbbba]!=0x10a8 || !lifetime_slot(p.base) || uint64_t(p.base)+1201*31>0x40000 || (p.base<0x32000 && uint64_t(p.base)+1201*31>0x30000))
