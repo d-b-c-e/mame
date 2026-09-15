@@ -34,6 +34,7 @@
 #include "cruisn/world_scenery.h"
 #include "cruisn/world_distance.h"
 #include "cruisn/world_host_scenery.h"
+#include "cruisn/world_active_roads.h"
 #include <chrono>
 #include "cruisn/usa_distance.h"
 #include "cruisn/usa_host_scenery.h"
@@ -394,6 +395,16 @@ void midvunit_base_state::world_host_start()
 		if(strcmp(fade,"0") && strcmp(fade,"1"))fatalerror("Invalid host fade metadata mode\n");
 		m_host_fade_metadata=!strcmp(fade,"1");
 	}
+	bool active_roads=false;
+	if(const char *active=std::getenv("MIDV_WORLD_HOST_ACTIVE_ROADS"))
+	{
+		if(strcmp(active,"0") && strcmp(active,"1"))fatalerror("Invalid active road margins\n");
+		active_roads=!strcmp(active,"1");
+	}
+	if(active_roads && (m_host_mode!=2 || !m_host_future || !m_host_roads || m_host_full_roads ||
+		m_host_layer!=3 || !std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0")))
+		fatalerror("Active road margins require future draw, stock roads, both layers and FFB0\n");
+	if(active_roads)osd_printf_info("World active road margins enabled; original 4:3 geometry and guest state unchanged\n");
 	if(m_host_fade_metadata)
 	{
 		if(!m_host_far_coverage || m_host_layer!=3 || !std::getenv("MIDV_GL_ORIGINAL_MIRROR") ||
@@ -436,7 +447,7 @@ void midvunit_base_state::world_host_start()
 	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&midvunit_base_state::world_host_exit,this));
 	auto &space=m_maincpu->space(AS_PROGRAM);
 	m_host_scene_tap=space.install_read_tap(profile->scene,profile->scene,"world_host_scene",
-		[this](offs_t offset,uint32_t &data,uint32_t mask)
+		[this,active_roads](offs_t offset,uint32_t &data,uint32_t mask)
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6a)return;
 			uint64_t frame=m_screen->frame_number();
@@ -474,6 +485,8 @@ void midvunit_base_state::world_host_start()
 					!cruisn::world_future::collect(read,m_host_future_cache,future,future_stats,64,m_host_roads,m_host_revision))
 					fatalerror("World future section code/pointer/frontier guard failed\n");
 			}
+			if(active_roads && !cruisn::world_active_roads::collect(read,future,m_host_revision))
+				fatalerror("World active road list/code/membership guard failed\n");
 			const auto future_prepared=std::chrono::steady_clock::now();
 			// Main RAM is read directly: no tap recursion or guest speedup handler.
 			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision,m_host_full_roads,m_host_far_coverage))
