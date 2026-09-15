@@ -692,6 +692,7 @@ struct GL
 	void (WINAPI *ActiveTexture)(unsigned);
 	void (WINAPI *DrawBuffers)(int, const unsigned *);
 	void (WINAPI *ClearBufferuiv)(unsigned, int, const uint *);
+	void (WINAPI *GetTexImage)(unsigned, int, unsigned, unsigned, void *) = nullptr;
 
 	template <typename T> void load1(T &fn, const char *name)
 	{
@@ -1124,9 +1125,23 @@ void thread_main()
 	}
 	if (gl.SwapIntervalEXT) gl.SwapIntervalEXT(1);
 
-	uint prog = link(gl, MVGL_VS, MVGL_FS);
+	// Diagnostic only: keep original indices separate; presentation is unchanged.
+	bool const original_mirror = std::getenv("MIDV_GL_ORIGINAL_MIRROR") &&
+		!strcmp(std::getenv("MIDV_GL_ORIGINAL_MIRROR"), "1");
+	int const mirror_frame = std::getenv("MIDV_GL_MIRROR_FRAME") ? atoi(std::getenv("MIDV_GL_MIRROR_FRAME")) : 0;
+	if (original_mirror)
+	{
+		if (!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0") || mirror_frame<1 || mirror_frame>1000000 ||
+			(std::getenv("MIDV_GL_BATCH_VRAM") && strcmp(std::getenv("MIDV_GL_BATCH_VRAM"),"1")) ||
+			(std::getenv("MIDV_WORLD_HOST_SCENERY") && !strcmp(std::getenv("MIDV_WORLD_HOST_SCENERY"),"2") &&
+			 (!std::getenv("MIDV_WORLD_HOST_LAYER") || strcmp(std::getenv("MIDV_WORLD_HOST_LAYER"),"3"))))
+			fatalerror("Original mirror requires FFB0, bounded frame, batched CPU writes and split/tagged host draws\n");
+		gl.load1(gl.GetTexImage,"glGetTexImage");
+		if(!gl.GetTexImage)fatalerror("Original mirror texture readback unavailable\n");
+	}
+	uint prog = link(gl, MVGL_VS, original_mirror ? MVGL_MIRROR_FS : MVGL_FS);
 	uint pal = link(gl, MVGL_PAL_VS, MVGL_PAL_FS);
-	uint cpu_copy = link(gl, MVGL_PAL_VS, MVGL_CPU_FS);
+	uint cpu_copy = link(gl, MVGL_PAL_VS, original_mirror ? MVGL_MIRROR_CPU_FS : MVGL_CPU_FS);
 	if (!prog || !pal || !cpu_copy) return;
 
 	gl.PixelStorei(0x0CF5 /*GL_UNPACK_ALIGNMENT*/, 1);
@@ -1152,6 +1167,14 @@ void thread_main()
 	// the palette pass fills unwritten slivers (hardware quad cracks that
 	// would show the stale page) from axis-bounded neighbours
 	uint maskTex[2] = { make_tex(fw, fh, R8UI), make_tex(fw, fh, R8UI) };
+	uint originalTex[2]{}, originalMask[2]{}, originalFbo[2]{};
+	if(original_mirror)
+	{
+		gl.GenFramebuffers(2,originalFbo);
+		for(int i=0;i<2;++i){originalTex[i]=make_tex(fw,fh,R16UI);originalMask[i]=make_tex(fw,fh,R8UI);}
+	}
+	unsigned const mirror_bufs[5]={COLOR_ATTACHMENT0,COLOR_ATTACHMENT0+1,0,COLOR_ATTACHMENT0+3,COLOR_ATTACHMENT0+4};
+	unsigned const extended_bufs[2]={COLOR_ATTACHMENT0,COLOR_ATTACHMENT0+1};
 	uint fbo[2];
 	gl.GenFramebuffers(2, fbo);
 	for (int i = 0; i < 2; i++)
@@ -1161,9 +1184,24 @@ void thread_main()
 		gl.FramebufferTexture2D(FRAMEBUFFER, COLOR_ATTACHMENT0 + 1, 0x0DE1, maskTex[i], 0);
 		unsigned const bufs[2] = { COLOR_ATTACHMENT0, COLOR_ATTACHMENT0 + 1 };
 		gl.DrawBuffers(2, bufs);
+		if(original_mirror)
+		{
+			gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0+3,0x0DE1,originalTex[i],0);
+			gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0+4,0x0DE1,originalMask[i],0);
+			gl.DrawBuffers(5,mirror_bufs);
+			if(gl.CheckFramebufferStatus(FRAMEBUFFER)!=FRAMEBUFFER_COMPLETE)fatalerror("Original mirror MRT incomplete\n");
+		}
 		if (gl.CheckFramebufferStatus(FRAMEBUFFER) != FRAMEBUFFER_COMPLETE)
 			logf("fbo %d incomplete", i);
 		gl.Clear(0x4000);
+		if(original_mirror)
+		{
+			gl.BindFramebuffer(FRAMEBUFFER,originalFbo[i]);
+			gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0,0x0DE1,originalTex[i],0);
+			gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0+1,0x0DE1,originalMask[i],0);
+			gl.DrawBuffers(2,bufs);
+			if(gl.CheckFramebufferStatus(FRAMEBUFFER)!=FRAMEBUFFER_COMPLETE)fatalerror("Original mirror reset target incomplete\n");
+		}
 	}
 	gl.BindFramebuffer(FRAMEBUFFER, 0);
 
@@ -1352,11 +1390,23 @@ void thread_main()
 		memcpy(dst, lv.data + o, first);
 		if (len > first) memcpy((uint8_t *)dst + first, lv.data, len - first);
 	};
+	uint16_t original_active_pc=0xffff;
+	int original_cpu_written[2]{};
+	uint64_t mirror_ordinary=0,mirror_auxiliary=0,mirror_cpu_blits=0,mirror_resets=0;
+	bool mirror_captured=false;
 	uint64_t n_flips = 0;
 	auto complete_run = [&]()
 	{
 		if (run.empty()) return;
 		int const pg = (run_pc & 4) ? 1 : 0;
+		bool const auxiliary = original_mirror && (run.front().pad & 2);
+		if(original_mirror)
+		{
+			for(auto const &q:run)if(q.pad!=(auxiliary?3:0))fatalerror("Original mirror unqualified layer ownership\n");
+			if(auxiliary)mirror_auxiliary+=run.size();
+			else {mirror_ordinary+=run.size();original_cpu_written[pg]=0;}
+		}
+		bool const new_original_scene=original_mirror && !auxiliary && original_active_pc!=run_pc;
 		bool const new_scene = active_pc != run_pc;
 		if (new_scene) { quad_count[pg] = 0; scene_axis[pg] = 0; host_layers[pg] = false; active_pc = run_pc; }
 		n_aligned += build_vertices(run, float(MARGIN), fdata, udata, align_joins,run_far?&far_masks:nullptr,far_log);
@@ -1396,6 +1446,7 @@ void thread_main()
 		gl.BindBuffer(ARRAY_BUFFER, vbo_u);
 		gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
 		gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
+		if(original_mirror)gl.DrawBuffers(2,extended_bufs); // host resets cannot clear original history
 		gl.Viewport(0, 0, fw, fh);
 		if (new_scene)
 		{
@@ -1427,6 +1478,24 @@ void thread_main()
 			gl.Clear(0x4000);
 			gl.Disable(0x0C11);
 		}
+		if(new_original_scene)
+		{
+			original_active_pc=run_pc;++mirror_resets;
+			gl.BindFramebuffer(FRAMEBUFFER,originalFbo[pg]);
+			uint const zero[4]={0,0,0,0};gl.ClearBufferuiv(0x1800,1,zero);
+			gl.Enable(0x0C11);gl.ClearColor(0,0,0,0);
+			int const os=2*S;
+			gl.Scissor(0,0,MARGIN*S+os,fh);gl.Clear(0x4000);
+			gl.Scissor(fw-MARGIN*S-os,0,MARGIN*S+os,fh);gl.Clear(0x4000);
+			gl.Scissor(0,0,fw,os);gl.Clear(0x4000);
+			gl.Scissor(0,fh-os,fw,os);gl.Clear(0x4000);
+			gl.Disable(0x0C11);
+		}
+		if(original_mirror)
+		{
+			gl.BindFramebuffer(FRAMEBUFFER,fbo[pg]);
+			gl.DrawBuffers(auxiliary?2:5,auxiliary?extended_bufs:mirror_bufs);
+		}
 		gl.ActiveTexture(TEXTURE0);
 		gl.BindTexture(0x0DE1, texram);
 		gl.DrawArrays(0x0004 /*TRIANGLES*/, 0, int(run.size() * 6));
@@ -1455,6 +1524,7 @@ void thread_main()
 				gl.BindTexture(0x0DE1, cpu_dirty_tex);
 				gl.TexSubImage2D(0x0DE1, 0, 0, 0, 512, H, RED_INTEGER, 0x1401, cpu_dirty.mask(pg));
 				gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
+				if(original_mirror){gl.DrawBuffers(5,mirror_bufs);++mirror_cpu_blits;}
 				gl.Viewport(0, 0, fw, fh);
 				gl.UseProgram(cpu_copy);
 				gl.BindVertexArray(vao_empty);
@@ -1649,6 +1719,11 @@ void thread_main()
 					memcpy(&shadow[pg][rel], staging.data() + 12, (end - rel) * 2);
 					cpu_dirty.mark(pg, rel, end - rel);
 					if (!batch_cpu) flush_cpu(); // explicit immediate-upload control
+					if(original_mirror)
+					{
+						original_cpu_written[pg]+=end-rel;
+						if(original_cpu_written[pg]>=H*512*7/10)original_active_pc=0xffff;
+					}
 					cpu_written[pg] += end - rel;
 					if (cpu_written[pg] >= H * 512 * 7 / 10)
 						quad_fresh[pg] = false, active_pc = 0xffff;
@@ -1668,6 +1743,30 @@ void thread_main()
 		if (!frame_complete && !menu_open && !ui_changed) { Sleep(1); continue; }
 
 		flush_cpu(); // also covers a menu redraw without a new frame fence
+		if(original_mirror && frame_complete && int(completed_frame)==mirror_frame && !mirror_captured)
+		{
+			gl.PixelStorei(0x0D05 /*PACK_ALIGNMENT*/,1);
+			std::vector<uint8_t> pixels(size_t(fw)*fh*2);
+			gl.ActiveTexture(TEXTURE0+6);
+			for(int pg=0;pg<2;++pg)for(int plane=0;plane<4;++plane)
+			{
+				uint const textures[4]={pageTex[pg],maskTex[pg],originalTex[pg],originalMask[pg]};
+				bool const mask=plane&1;
+				gl.BindTexture(0x0DE1,textures[plane]);
+				gl.GetTexImage(0x0DE1,0,RED_INTEGER,mask?0x1401:0x1403,pixels.data());
+				if(gl.GetError())fatalerror("Original mirror readback GL error\n");
+				char name[128];snprintf(name,sizeof(name),"vunit-mirror-%u-page%d-plane%d.bin",completed_frame,pg,plane);
+				FILE *fp=fopen(name,"wb");size_t const bytes=size_t(fw)*fh*(mask?1:2);
+				if(!fp)fatalerror("Cannot open original mirror evidence\n");
+				bool const written=fwrite(pixels.data(),1,bytes,fp)==bytes;
+				if(fclose(fp) || !written)fatalerror("Cannot write original mirror evidence\n");
+			}
+			FILE *fp=fopen("vunit-mirror.json","w");
+			if(!fp)fatalerror("Cannot open mirror receipt\n");
+			int const written=fprintf(fp,"{\"frame\":%u,\"width\":%d,\"height\":%d,\"visible_page\":%d,\"ordinary_quads\":%llu,\"auxiliary_quads\":%llu,\"cpu_blits\":%llu,\"original_resets\":%llu}\n",completed_frame,fw,fh,visible,(unsigned long long)mirror_ordinary,(unsigned long long)mirror_auxiliary,(unsigned long long)mirror_cpu_blits,(unsigned long long)mirror_resets);
+			if(fclose(fp) || written<0)fatalerror("Cannot write mirror receipt\n");
+			mirror_captured=true;
+		}
 		// ---- present ----
 		int const cw = rc.right, ch = rc.bottom;
 		gl.Viewport(0, 0, cw, ch);
