@@ -7,6 +7,7 @@
 **************************************************************************/
 #include "emu.h"
 #include "../../mame/midway/cruisn/exotica_journal_policy.h"
+#include "../../mame/midway/cruisn/diagnostic_count.h"
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
 #include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
@@ -1759,7 +1760,7 @@ void thread_main()
 						cruisn::zeus_model::Quad actual,replacement;
 						static_assert(sizeof(actual)==sizeof(q),"endpoint original quad ABI");
 						std::memcpy(&actual,&q,sizeof(q));
-						if(!endpoint_order.consume(actual,replacement) || ++endpoint_pairs>endpoint_pair_limit) {
+						if(!endpoint_order.consume(actual,replacement) || !cruisn::diagnostic_count::add(endpoint_pairs,1,journal_policy,endpoint_pair_limit)) {
 							private_failed=true;s_stopz.store(true);zlogf("endpoint actual original mismatch/order");break;
 						}
 						// Finish earlier commands. Never blend both versions into the
