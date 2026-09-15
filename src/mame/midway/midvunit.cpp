@@ -221,6 +221,14 @@ void midvunit_base_state::usa_host_start()
 		else if(!strcmp(far,"240000"))m_host_far=240000;
 		else fatalerror("USA host far requires 80000/160000/240000\n");
 	}
+	if(const char *coverage=std::getenv("MIDV_USA_HOST_FAR_COVERAGE"))
+	{
+		if(strcmp(coverage,"0") && strcmp(coverage,"1"))fatalerror("Invalid USA host far coverage\n");
+		m_host_far_coverage=!strcmp(coverage,"1");
+	}
+	if(m_host_far_coverage && (m_host_far!=240000 || m_host_mode!=2 || !m_host_future ||
+		!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0")))
+		fatalerror("USA far coverage requires 3x future draw and physical FFB0\n");
 	if(const char *layer=std::getenv("MIDV_USA_HOST_LAYER"))
 	{
 		if(strlen(layer)!=1 || *layer<'0' || *layer>'3')fatalerror("Invalid USA host layer\n");
@@ -234,6 +242,13 @@ void midvunit_base_state::usa_host_start()
 	}
 	m_host_scene_log=fopen("usa-host-scenes.csv","w");
 	if(trace)m_host_quad_log=fopen("usa-host-quads.csv","w");
+	if(trace && m_host_far_coverage)
+	{
+		m_host_clip_log=fopen("usa-far-coverage.bin","wb");
+		if(!m_host_clip_log)fatalerror("Cannot create USA far coverage evidence\n");
+		setvbuf(m_host_clip_log,nullptr,_IOFBF,65536);
+		if(fwrite("VFP1",1,4,m_host_clip_log)!=4)fatalerror("Cannot write USA far coverage header\n");
+	}
 	if(!m_host_scene_log || (trace && !m_host_quad_log))fatalerror("Cannot create USA host evidence\n");
 	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);
 	fprintf(m_host_scene_log,"frame,time,page,mode,host_far,pending,unsupported,near,far,projection,decoded,quads,quads_hash,guard_us,prepare_us,pack_us,log_us,submit_us,microseconds,future_enabled,future_start,future_loading,future_number,future_sections,future_definitions,future_special,future_unbound,future_deferred,future_ready,future_uploads,future_partial,future_new_sections\n");
@@ -270,12 +285,16 @@ void midvunit_base_state::usa_host_start()
 				fatalerror("USA future scene/material/upload guard failed\n");
 			if(previous_track!=m_usa_future_cache.track)m_usa_model_cache.clear();
 			cruisn::usa_host::Scene scene;
-			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_future?&m_usa_model_cache:nullptr))fatalerror("USA host scene/model guard failed\n");
+			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_future?&m_usa_model_cache:nullptr,m_host_far_coverage))fatalerror("USA host scene/model guard failed\n");
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;
-			for(const auto &o:scene.objects)for(const auto &q:o.quads)
-			{quads.push_back(q);hash=cruisn::world_host::quad_hash(hash,q);}
+			std::vector<std::array<uint32_t,4>> depths;
+			for(const auto &o:scene.objects)for(size_t i=0;i<o.quads.size();++i)
+			{
+				if(m_host_far_coverage){if(o.depths.size()!=o.quads.size())fatalerror("Missing USA far depths\n");depths.push_back(o.depths[i]);}
+				quads.push_back(o.quads[i]);hash=cruisn::world_host::quad_hash(hash,o.quads[i]);
+			}
 			const auto packed=std::chrono::steady_clock::now();
 			const double time=machine().time().as_double();
 			if(m_host_quad_log)for(const auto &o:scene.objects)for(const auto &q:o.quads)
@@ -285,7 +304,7 @@ void midvunit_base_state::usa_host_start()
 				fputc('\n',m_host_quad_log);
 			}
 			const auto logged=std::chrono::steady_clock::now();
-			if(m_host_mode==2)world_host_submit(quads);
+			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr);
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("USA host inspection changed guest cycles\n");
 			const auto submitted=std::chrono::steady_clock::now();
 			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};

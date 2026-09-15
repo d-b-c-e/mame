@@ -1318,6 +1318,15 @@ void thread_main()
 		if(!far_log || fwrite("VFG1",1,4,far_log)!=4)fatalerror("Cannot create far GPU receipts\n");
 		setvbuf(far_log,nullptr,_IOFBF,65536);
 	}
+	if(std::getenv("MIDV_USA_HOST_FAR_COVERAGE") && !strcmp(std::getenv("MIDV_USA_HOST_FAR_COVERAGE"),"1") &&
+		std::getenv("MIDV_USA_HOST_QUADS") && !strcmp(std::getenv("MIDV_USA_HOST_QUADS"),"1"))
+	{
+		if(far_log)fatalerror("Conflicting far coverage evidence profiles\n");
+		far_log=fopen("usa-far-gpu.bin","wb");
+		if(!far_log)fatalerror("Cannot create USA far GPU receipts\n");
+		setvbuf(far_log,nullptr,_IOFBF,65536);
+		if(fwrite("VFG1",1,4,far_log)!=4)fatalerror("Cannot write USA far GPU header\n");
+	}
 	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
 	int snap_n = 0;
 	cruisn::CaptureWriter snapshot_writer;
