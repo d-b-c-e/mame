@@ -694,6 +694,7 @@ struct GL
 	void (WINAPI *DrawBuffers)(int, const unsigned *);
 	void (WINAPI *ClearBufferuiv)(unsigned, int, const uint *);
 	void (WINAPI *GetTexImage)(unsigned, int, unsigned, unsigned, void *) = nullptr;
+	void (WINAPI *ClearBufferfv)(unsigned, int, const float *) = nullptr;
 
 	template <typename T> void load1(T &fn, const char *name)
 	{
@@ -1132,6 +1133,9 @@ void thread_main()
 	int const mirror_frame = std::getenv("MIDV_GL_MIRROR_FRAME") ? atoi(std::getenv("MIDV_GL_MIRROR_FRAME")) : 0;
 	bool const fade_metadata = std::getenv("MIDV_WORLD_HOST_FADE_METADATA") &&
 		!strcmp(std::getenv("MIDV_WORLD_HOST_FADE_METADATA"),"1");
+	bool const distance_fade = std::getenv("MIDV_WORLD_HOST_DISTANCE_FADE") &&
+		!strcmp(std::getenv("MIDV_WORLD_HOST_DISTANCE_FADE"),"1");
+	if(distance_fade && !fade_metadata)fatalerror("Distance fade requires qualified host metadata\n");
 	if(fade_metadata && !original_mirror)fatalerror("Fade metadata requires original mirror\n");
 	if (original_mirror)
 	{
@@ -1143,8 +1147,13 @@ void thread_main()
 		gl.load1(gl.GetTexImage,"glGetTexImage");
 		if(!gl.GetTexImage)fatalerror("Original mirror texture readback unavailable\n");
 	}
-	uint prog = link(gl, MVGL_VS, original_mirror ? MVGL_MIRROR_FS : MVGL_FS);
-	uint pal = link(gl, MVGL_PAL_VS, MVGL_PAL_FS);
+	if(distance_fade)
+	{
+		gl.load1(gl.ClearBufferfv,"glClearBufferfv");
+		if(!gl.ClearBufferfv)fatalerror("Distance fade opacity clearing unavailable\n");
+	}
+	uint prog = link(gl, MVGL_VS, distance_fade ? MVGL_FADE_FS : original_mirror ? MVGL_MIRROR_FS : MVGL_FS);
+	uint pal = link(gl, MVGL_PAL_VS, distance_fade ? MVGL_FADE_PAL_FS : MVGL_PAL_FS);
 	uint cpu_copy = link(gl, MVGL_PAL_VS, original_mirror ? MVGL_MIRROR_CPU_FS : MVGL_CPU_FS);
 	if (!prog || !pal || !cpu_copy) return;
 
@@ -1159,6 +1168,7 @@ void thread_main()
 		gl.TexParameteri(0x0DE1, 0x2803, 0x812F);
 		unsigned fmt = RED_INTEGER;
 		unsigned type = (ifmt == R8UI) ? 0x1401 : (ifmt == R16UI) ? 0x1403 : 0x1405;
+		if(ifmt==0x822E /*R32F*/){fmt=0x1903 /*RED*/;type=0x1406 /*FLOAT*/;}
 		gl.TexImage2D(0x0DE1, 0, int(ifmt), w, h, 0, fmt, type, nullptr);
 		return t;
 	};
@@ -1172,13 +1182,16 @@ void thread_main()
 	// would show the stale page) from axis-bounded neighbours
 	uint maskTex[2] = { make_tex(fw, fh, R8UI), make_tex(fw, fh, R8UI) };
 	uint originalTex[2]{}, originalMask[2]{}, originalFbo[2]{};
+	uint alphaTex[2]{};
+	float const opaque[4]={1,1,1,1};
+	if(distance_fade)for(auto &texture:alphaTex)texture=make_tex(fw,fh,0x822E /*R32F*/);
 	if(original_mirror)
 	{
 		gl.GenFramebuffers(2,originalFbo);
 		for(int i=0;i<2;++i){originalTex[i]=make_tex(fw,fh,R16UI);originalMask[i]=make_tex(fw,fh,R8UI);}
 	}
-	unsigned const mirror_bufs[5]={COLOR_ATTACHMENT0,COLOR_ATTACHMENT0+1,0,COLOR_ATTACHMENT0+3,COLOR_ATTACHMENT0+4};
-	unsigned const extended_bufs[2]={COLOR_ATTACHMENT0,COLOR_ATTACHMENT0+1};
+	unsigned const mirror_bufs[5]={COLOR_ATTACHMENT0,COLOR_ATTACHMENT0+1,distance_fade?COLOR_ATTACHMENT0+2:0,COLOR_ATTACHMENT0+3,COLOR_ATTACHMENT0+4};
+	unsigned const extended_bufs[3]={COLOR_ATTACHMENT0,COLOR_ATTACHMENT0+1,COLOR_ATTACHMENT0+2};
 	uint fbo[2];
 	gl.GenFramebuffers(2, fbo);
 	for (int i = 0; i < 2; i++)
@@ -1190,6 +1203,7 @@ void thread_main()
 		gl.DrawBuffers(2, bufs);
 		if(original_mirror)
 		{
+			if(distance_fade)gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0+2,0x0DE1,alphaTex[i],0);
 			gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0+3,0x0DE1,originalTex[i],0);
 			gl.FramebufferTexture2D(FRAMEBUFFER,COLOR_ATTACHMENT0+4,0x0DE1,originalMask[i],0);
 			gl.DrawBuffers(5,mirror_bufs);
@@ -1198,6 +1212,7 @@ void thread_main()
 		if (gl.CheckFramebufferStatus(FRAMEBUFFER) != FRAMEBUFFER_COMPLETE)
 			logf("fbo %d incomplete", i);
 		gl.Clear(0x4000);
+		if(distance_fade)gl.ClearBufferfv(0x1800 /*COLOR*/,2,opaque);
 		if(original_mirror)
 		{
 			gl.BindFramebuffer(FRAMEBUFFER,originalFbo[i]);
@@ -1211,6 +1226,8 @@ void thread_main()
 
 	// geometry VAO: two streamed VBOs, attributes by name
 	uint vao, vbo_f, vbo_u, vbo_far, vao_empty;
+	uint vbo_opacity=0,vbo_depths=0;
+	if(distance_fade){gl.GenBuffers(1,&vbo_opacity);gl.GenBuffers(1,&vbo_depths);}
 	gl.GenVertexArrays(1, &vao);
 	gl.GenVertexArrays(1, &vao_empty);
 	gl.GenBuffers(1, &vbo_f);
@@ -1253,6 +1270,11 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(prog, "texMask"), (8 << 20) - 1);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uDbgQuadId"), 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipW"), WIDE);
+	if(distance_fade)
+	{
+		gl.Uniform1f(gl.GetUniformLocation(prog,"fadePlane"),240000.f);
+		gl.Uniform1f(gl.GetUniformLocation(prog,"fadeWidth"),20000.f);
+	}
 	// Legacy margin suppression/column stretching destroyed valid skies in
 	// recorded World/Off Road races. Retain it only as an explicit experiment.
 	bool const align_joins = S > 1 && std::getenv("MIDV_GL_TJUNCTIONS")
@@ -1266,6 +1288,12 @@ void thread_main()
 	gl.UseProgram(pal);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "palTex"), 2);
+	if(distance_fade)
+	{
+		gl.Uniform1i(gl.GetUniformLocation(pal,"originalIdxTex"),4);
+		gl.Uniform1i(gl.GetUniformLocation(pal,"originalMaskTex"),5);
+		gl.Uniform1i(gl.GetUniformLocation(pal,"fadeAlphaTex"),6);
+	}
 	int const uCrop = gl.GetUniformLocation(pal, "uCrop");
 	// CRT pass: MIDV_GL_CRT=1 enables at boot, F9 toggles live. The raw
 	// (uCrt=0) shader path is byte-identical to the pre-CRT palette pass.
@@ -1333,6 +1361,8 @@ void thread_main()
 
 	// ---- stream state ----
 	std::vector<QuadMsg> run;
+	std::vector<float> run_opacity;
+	std::vector<std::array<float,4>> run_depths;
 	uint16_t run_pc = 0xffff, active_pc = 0xffff;
 	int scene_axis[2] = {}, cpu_written[2] = {};
 	static uint16_t shadow[2][MAXH * 512];
@@ -1445,6 +1475,14 @@ void thread_main()
 		scene_axis[pg] += axis;
 		crop2d[pg] = (scene_axis[pg] * 10 >= quad_count[pg] * 7);
 		gl.UseProgram(prog);
+		if(distance_fade)
+		{
+			if(run_opacity.size()!=run.size() || run_depths.size()!=run.size())fatalerror("Distance fade batch ownership mismatch\n");
+			gl.BindBuffer(0x90D2,vbo_opacity);gl.BufferData(0x90D2,run_opacity.size()*sizeof(float),run_opacity.data(),STREAM_DRAW);
+			gl.BindBufferBase(0x90D2,4,vbo_opacity);
+			gl.BindBuffer(0x90D2,vbo_depths);gl.BufferData(0x90D2,run_depths.size()*sizeof(run_depths[0]),run_depths.data(),STREAM_DRAW);
+			gl.BindBufferBase(0x90D2,5,vbo_depths);
+		}
 		gl.Uniform1i(gl.GetUniformLocation(prog,"uFarCoverage"),run_far?1:0);
 		if(run_far)
 		{
@@ -1458,7 +1496,7 @@ void thread_main()
 		gl.BindBuffer(ARRAY_BUFFER, vbo_u);
 		gl.BufferData(ARRAY_BUFFER, udata.size() * 4, udata.data(), STREAM_DRAW);
 		gl.BindFramebuffer(FRAMEBUFFER, fbo[pg]);
-		if(original_mirror)gl.DrawBuffers(2,extended_bufs); // host resets cannot clear original history
+		if(original_mirror)gl.DrawBuffers(distance_fade?3:2,extended_bufs); // host resets cannot clear original history
 		gl.Viewport(0, 0, fw, fh);
 		if (new_scene)
 		{
@@ -1482,12 +1520,16 @@ void thread_main()
 			int const os = 2 * S;
 			gl.Scissor(0, 0, MARGIN * S + os, fh);
 			gl.Clear(0x4000);
+			if(distance_fade)gl.ClearBufferfv(0x1800,2,opaque);
 			gl.Scissor(fw - MARGIN * S - os, 0, MARGIN * S + os, fh);
 			gl.Clear(0x4000);
+			if(distance_fade)gl.ClearBufferfv(0x1800,2,opaque);
 			gl.Scissor(0, 0, fw, os);
 			gl.Clear(0x4000);
+			if(distance_fade)gl.ClearBufferfv(0x1800,2,opaque);
 			gl.Scissor(0, fh - os, fw, os);
 			gl.Clear(0x4000);
+			if(distance_fade)gl.ClearBufferfv(0x1800,2,opaque);
 			gl.Disable(0x0C11);
 		}
 		if(new_original_scene)
@@ -1506,7 +1548,7 @@ void thread_main()
 		if(original_mirror)
 		{
 			gl.BindFramebuffer(FRAMEBUFFER,fbo[pg]);
-			gl.DrawBuffers(auxiliary?2:5,auxiliary?extended_bufs:mirror_bufs);
+			gl.DrawBuffers(auxiliary?(distance_fade?3:2):5,auxiliary?extended_bufs:mirror_bufs);
 		}
 		gl.ActiveTexture(TEXTURE0);
 		gl.BindTexture(0x0DE1, texram);
@@ -1515,6 +1557,7 @@ void thread_main()
 		quad_fresh[pg] = true;
 		if (new_scene) ++n_scenes;
 		run.clear();
+		run_opacity.clear();run_depths.clear();
 		run_far=false;
 	};
 
@@ -1684,14 +1727,16 @@ void thread_main()
 			{
 				if(len!=(type==1?40:type==7?60:64))fatalerror("Invalid V-Unit quad payload length\n");
 				QuadMsg q{};
+				std::array<float,4> fade_depths{{1,1,1,1}};
+				float selector=1;
 				bool far_packet=type==7;
 				memcpy(&q, staging.data(),type==1?40:60);
 				if(type==7){std::array<double,4> depths;if(!cruisn::vunit_far::decode(q.coverage,depths))fatalerror("Invalid far quad metadata\n");}
 				if(type==8)
 				{
 					cruisn::vunit_fade::Packet packet;memcpy(&packet,staging.data(),sizeof(packet));
-					std::array<float,4> depths;
-					if(!fade_metadata || !cruisn::vunit_fade::decode(packet,depths,far_packet))fatalerror("Invalid host fade metadata\n");
+					if(!fade_metadata || !cruisn::vunit_fade::decode(packet,fade_depths,far_packet))fatalerror("Invalid host fade metadata\n");
+					selector=packet.policy?1.f:-1.f;
 					++fade_packets;fade_roads+=packet.policy;
 					if(int(q.frame)==mirror_frame)
 					{
@@ -1705,6 +1750,7 @@ void thread_main()
 					(!run.empty() && ((q.pad ^ run.back().pad) & 2)))) complete_run();
 				run_pc = q.pc;
 				run.push_back(q);
+				if(distance_fade){run_opacity.push_back(selector);run_depths.push_back(fade_depths);}
 				run_far|=far_packet;
 				++n_quads;
 				break;
@@ -1789,6 +1835,20 @@ void thread_main()
 				bool const written=fwrite(pixels.data(),1,bytes,fp)==bytes;
 				if(fclose(fp) || !written)fatalerror("Cannot write original mirror evidence\n");
 			}
+			if(distance_fade)
+			{
+				pixels.resize(size_t(fw)*fh*sizeof(float));
+				for(int pg=0;pg<2;++pg)
+				{
+					gl.BindTexture(0x0DE1,alphaTex[pg]);
+					gl.GetTexImage(0x0DE1,0,0x1903 /*RED*/,0x1406 /*FLOAT*/,pixels.data());
+					if(gl.GetError())fatalerror("Distance fade opacity readback failed\n");
+					char name[128];snprintf(name,sizeof(name),"vunit-mirror-%u-page%d-alpha.bin",completed_frame,pg);
+					FILE *fp=fopen(name,"wb");if(!fp)fatalerror("Cannot open distance fade opacity evidence\n");
+					bool const written=fwrite(pixels.data(),1,pixels.size(),fp)==pixels.size();
+					if(fclose(fp) || !written)fatalerror("Cannot write distance fade opacity evidence\n");
+				}
+			}
 			FILE *fp=fopen("vunit-mirror.json","w");
 			if(!fp)fatalerror("Cannot open mirror receipt\n");
 			int const written=fprintf(fp,"{\"frame\":%u,\"width\":%d,\"height\":%d,\"visible_page\":%d,\"ordinary_quads\":%llu,\"auxiliary_quads\":%llu,\"cpu_blits\":%llu,\"original_resets\":%llu}\n",completed_frame,fw,fh,visible,(unsigned long long)mirror_ordinary,(unsigned long long)mirror_auxiliary,(unsigned long long)mirror_cpu_blits,(unsigned long long)mirror_resets);
@@ -1808,6 +1868,7 @@ void thread_main()
 		gl.UseProgram(pal);
 		gl.Uniform1i(uCrop, !wide3d ? MARGIN * S : 0);
 		gl.Uniform1i(uHostLayers, host_layers[visible] ? 1 : 0);
+		if(distance_fade)gl.Uniform1i(gl.GetUniformLocation(pal,"uDistanceFade"),wide3d && host_layers[visible]?1:0);
 		// fill radius: live 3D scenes get the full crack fill; 2D screens
 		// (menus, track select) get a tight 1-px pass only - their bitmap
 		// tiles leave hairline unwritten seams (offroadc track select's
@@ -1822,6 +1883,12 @@ void thread_main()
 		gl.BindTexture(0x0DE1, pageTex[visible]);
 		gl.ActiveTexture(TEXTURE0 + 2);
 		gl.BindTexture(0x0DE1, paltex);
+		if(distance_fade)
+		{
+			gl.ActiveTexture(TEXTURE0+4);gl.BindTexture(0x0DE1,originalTex[visible]);
+			gl.ActiveTexture(TEXTURE0+5);gl.BindTexture(0x0DE1,originalMask[visible]);
+			gl.ActiveTexture(TEXTURE0+6);gl.BindTexture(0x0DE1,alphaTex[visible]);
+		}
 		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
 		gl.BindVertexArray(vao_empty);
 		gl.DrawArrays(0x0004, 0, 3);
