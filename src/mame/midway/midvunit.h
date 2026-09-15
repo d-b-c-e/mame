@@ -109,6 +109,9 @@ protected:
 	void world_host_start();
 	void usa_host_start();
 	void offroad_host_start();
+	void host_failure_start();
+	void host_prepare_failed(uint64_t frame, uint64_t cycles, uint32_t stage, const char *reason);
+	bool host_injected_failure(uint64_t frame, uint64_t cycles);
 	void world_host_exit();
 	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
 		const std::vector<std::array<uint32_t,4>> *depths=nullptr, const std::vector<uint32_t> *policies=nullptr,
@@ -192,6 +195,9 @@ protected:
 	bool m_host_fade_metadata = false;
 	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr, *m_host_clip_log = nullptr;
 	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff, m_host_far = 80000;
+	bool m_host_failure_original = false;
+	uint64_t m_host_failed_frame = 0;
+	uint32_t m_host_inject_frame = 0;
 	double m_host_previous_scene_log_us = 0;
 	bool m_host_future = false, m_host_roads = false, m_host_full_roads = false, m_host_far_coverage = false;
 	uint32_t m_host_revision = 24;

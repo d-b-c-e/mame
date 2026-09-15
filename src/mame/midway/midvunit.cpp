@@ -87,6 +87,47 @@ void midvunit_base_state::machine_start()
 	world_host_start();
 	usa_host_start();
 	offroad_host_start();
+	host_failure_start();
+}
+
+// Only read-only preparation failures BEFORE world_host_submit can use this
+// policy. Revision/read-span/cycle, transport and device failures remain fatal.
+// Once abandoned, do not retry or reuse partially prepared host caches during
+// this launch. Ordinary guest simulation and renderer submission continue.
+void midvunit_base_state::host_failure_start()
+{
+	const char *policy=std::getenv("MIDV_HOST_FAILURE_POLICY");
+	const char *inject=std::getenv("MIDV_HOST_FAILURE_FRAME");
+	if(!policy && !inject)return;
+	if(!policy || (strcmp(policy,"0") && strcmp(policy,"1")))fatalerror("Invalid host preparation failure policy\n");
+	const char *ffb=std::getenv("MIDV_FFB");
+	if(m_host_mode!=2 || !ffb || strcmp(ffb,"0"))fatalerror("Host failure trial requires scenery draw and physical FFB0\n");
+	m_host_failure_original=!strcmp(policy,"1");
+	if(inject)
+	{
+		char *end=nullptr;errno=0;
+		if(!*inject || *inject=='-')fatalerror("Invalid host injected failure frame\n");
+		const unsigned long frame=strtoul(inject,&end,10);
+		if(errno || *end || frame<m_host_first || frame>m_host_last)fatalerror("Host injected failure outside scene interval\n");
+		m_host_inject_frame=uint32_t(frame);
+	}
+	osd_printf_info("VUNIT_HOST_FAILURE_POLICY original=%u inject=%u\n",unsigned(m_host_failure_original),m_host_inject_frame);
+}
+
+void midvunit_base_state::host_prepare_failed(uint64_t frame,uint64_t cycles,uint32_t stage,const char *reason)
+{
+	if(m_maincpu->total_cycles()!=cycles)fatalerror("Rejected host preparation changed guest cycles\n");
+	if(!frame || !stage || stage>4 || m_host_failed_frame)fatalerror("Invalid host preparation failure transition\n");
+	osd_printf_info("VUNIT_HOST_PREP_FAILURE frame=%llu stage=%u fallback=%u\n",(unsigned long long)frame,stage,unsigned(m_host_failure_original));
+	if(!m_host_failure_original)fatalerror("%s\n",reason);
+	m_host_failed_frame=frame;
+}
+
+bool midvunit_base_state::host_injected_failure(uint64_t frame,uint64_t cycles)
+{
+	if(!m_host_inject_frame || frame<m_host_inject_frame)return false;
+	host_prepare_failed(frame,cycles,4,"Injected host preparation failure");
+	return true;
 }
 
 // Off Road ordinary scenery uses its own model codec, transforms, section
@@ -161,7 +202,7 @@ void midvunit_base_state::offroad_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x1bf9)return;
 			const uint64_t frame=m_screen->frame_number();
-			if(frame<m_host_first || frame>m_host_last)return;
+			if(frame<m_host_first || frame>m_host_last || m_host_failed_frame)return;
 			const auto cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			auto &space=m_maincpu->space(AS_PROGRAM);
@@ -175,8 +216,9 @@ void midvunit_base_state::offroad_host_start()
 				!cruisn::offroad_future::code_matches(read))fatalerror("Off Road host revision/stock-code guard failed\n");
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::offroad_host::Scene scene;
+			if(host_injected_failure(frame,cycles))return;
 			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,false,m_offroad_host_recover_partial))
-				fatalerror("Off Road host scene/model/material guard failed at frame %llu\n",(unsigned long long)frame);
+			{host_prepare_failed(frame,cycles,3,"Off Road host scene/model/material guard failed");return;}
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;
@@ -281,7 +323,7 @@ void midvunit_base_state::usa_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x81)return;
 			const uint64_t frame=m_screen->frame_number();
-			if(frame<m_host_first || frame>m_host_last)return;
+			if(frame<m_host_first || frame>m_host_last || m_host_failed_frame)return;
 			const auto cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			if(!cruisn::usa_host::code_matches(m_ram_base,m_ram_base.bytes()/4))
@@ -300,10 +342,12 @@ void midvunit_base_state::usa_host_start()
 			std::vector<cruisn::usa_host::Descriptor> future;
 			const auto previous_track=m_usa_future_cache.track;
 			if(m_host_future && !cruisn::usa_future::collect(read,m_usa_future_cache,future,future_stats))
-				fatalerror("USA future scene/material/upload guard failed\n");
+			{host_prepare_failed(frame,cycles,1,"USA future scene/material/upload guard failed");return;}
 			if(previous_track!=m_usa_future_cache.track)m_usa_model_cache.clear();
 			cruisn::usa_host::Scene scene;
-			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_future?&m_usa_model_cache:nullptr,m_host_far_coverage))fatalerror("USA host scene/model guard failed\n");
+			if(host_injected_failure(frame,cycles))return;
+			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_future?&m_usa_model_cache:nullptr,m_host_far_coverage))
+			{host_prepare_failed(frame,cycles,3,"USA host scene/model guard failed");return;}
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;
@@ -451,7 +495,7 @@ void midvunit_base_state::world_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6a)return;
 			uint64_t frame=m_screen->frame_number();
-			if(frame<m_host_first || frame>m_host_last)return;
+			if(frame<m_host_first || frame>m_host_last || m_host_failed_frame)return;
 			const auto guest_cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,m_host_revision) ||
@@ -481,16 +525,19 @@ void midvunit_base_state::world_host_start()
 			cruisn::world_future::Stats future_stats;
 			if(m_host_future)
 			{
-				if(!cruisn::world_future::code_matches(read,m_host_revision) ||
-					!cruisn::world_future::collect(read,m_host_future_cache,future,future_stats,64,m_host_roads,m_host_revision))
-					fatalerror("World future section code/pointer/frontier guard failed\n");
+				if(!cruisn::world_future::code_matches(read,m_host_revision))fatalerror("World future section code guard failed\n");
+				if(!cruisn::world_future::collect(read,m_host_future_cache,future,future_stats,64,m_host_roads,m_host_revision))
+				{host_prepare_failed(frame,guest_cycles,1,"World future section pointer/frontier guard failed");return;}
 			}
+			if(active_roads && !cruisn::world_active_roads::code_matches(read,m_host_revision))
+				fatalerror("World active road code guard failed\n");
 			if(active_roads && !cruisn::world_active_roads::collect(read,future,m_host_revision))
-				fatalerror("World active road list/code/membership guard failed\n");
+			{host_prepare_failed(frame,guest_cycles,2,"World active road list/membership guard failed");return;}
 			const auto future_prepared=std::chrono::steady_clock::now();
 			// Main RAM is read directly: no tap recursion or guest speedup handler.
+			if(host_injected_failure(frame,guest_cycles))return;
 			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision,m_host_full_roads,m_host_far_coverage))
-				fatalerror("World host scenery pointer/model/projection guard failed\n");
+			{host_prepare_failed(frame,guest_cycles,3,"World host scenery pointer/model/projection guard failed");return;}
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			std::vector<std::array<uint32_t,4>> depths;
