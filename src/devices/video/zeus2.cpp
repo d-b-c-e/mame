@@ -7,6 +7,7 @@
 **************************************************************************/
 #include "emu.h"
 #include "../../mame/midway/cruisn/exotica_journal_policy.h"
+#include "../../mame/midway/cruisn/exotica_runtime.h"
 #include "../../mame/midway/cruisn/diagnostic_count.h"
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
@@ -45,12 +46,15 @@ namespace mzgl {
 void start(); void stop();
 struct DepthMirrorSettings {
 	bool enabled=false,wide=false;
+	cruisn::exotica_runtime::Policy policy=cruisn::exotica_runtime::Policy::capture;
 	uint32_t first=0,last=0,stream_frame=0;
 	std::set<uint32_t> snapshots;
 };
 DepthMirrorSettings depth_mirror_settings()
 {
 	DepthMirrorSettings settings;
+	if(!cruisn::exotica_runtime::select(std::getenv("MIDZ_RUNTIME"),[](const char *key){return std::getenv(key);},settings.policy))
+		fatalerror("Zeus runtime policy rejected\n");
 	const char *mode=std::getenv("MIDZ_DEPTH_MIRROR");
 	if(!mode)return settings;
 	if(strcmp(mode,"1") && strcmp(mode,"2"))fatalerror("Invalid Zeus depth mirror mode\n");
@@ -752,6 +756,8 @@ void thread_main()
 	int const CWW = CW + 2 * MARGIN;
 	int const fw = CWW * S, fh = CH * S;
 	auto depth_mirror=depth_mirror_settings();
+	const bool continuous=cruisn::exotica_runtime::continuous(depth_mirror.policy);
+	if(continuous)fprintf(stderr,"MIDZ_RUNTIME gpu=continuous end=none completion=quiescence\n");
 
 	HWND parent = nullptr;
 	for (int i = 0; i < 100 && !parent; i++) { Sleep(100); parent = find_mame_window(); }
@@ -1018,7 +1024,7 @@ void thread_main()
 	uint32_t private_frame=0;
 	cruisn::DiagnosticJournal private_log;
 	bool private_failed=false;
-	const auto material_frame_policy=envi("MIDZ_BOOTSTRAP",nullptr,0)==3?
+	const auto material_frame_policy=continuous?cruisn::zeus_host::FramePolicy::continuous:envi("MIDZ_BOOTSTRAP",nullptr,0)==3?
 		cruisn::zeus_host::FramePolicy::guest_ready:cruisn::zeus_host::FramePolicy::capture;
 	auto private_materials=[&](const std::vector<uint8_t> &wire,bool late=false,bool retained=false)->bool {
 		using namespace cruisn::zeus_host;
@@ -1562,7 +1568,7 @@ void thread_main()
 	};
 	uint32_t mirror_previous=0;
 	auto mirror_frame=[&](uint32_t frame) {
-		if(!mirror_fbo || frame<depth_mirror.first || frame>depth_mirror.last)return true;
+		if(!mirror_fbo || frame<depth_mirror.first || cruisn::exotica_runtime::after(depth_mirror.policy,frame,depth_mirror.last))return true;
 		if(mirror_frames && frame<=mirror_previous)return false;
 		mirror_previous=frame;++mirror_frames;
 		uint64_t colors=0,depths=0;double snapshot_us=0;
@@ -2140,6 +2146,7 @@ void thread_main()
 	}
 
 	const bool shutdown_render_failed=private_failed || mirror_failed || stream_failed || s_drops_quad.load() || s_drops_state.load();
+	if(continuous)fprintf(stderr,"MIDZ_RUNTIME_GPU_RESULT mirror_frame=%u\n",mirror_previous);
 	bool shutdown_writer_failed=false;
 	if(endpoint_log) {
 		const bool good=!endpoint_log.error();const int closed=endpoint_log.close();
@@ -2150,7 +2157,7 @@ void thread_main()
 		const auto stats=mirror_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;
 		const int closed=mirror_log.close();
 		if(stats.failed || stats.rejected || stats.submitted!=stats.written || stats.written!=4*mirror_samples ||
-			!depth_mirror.snapshots.empty() || mirror_previous!=depth_mirror.last || closed)mirror_failed=true;
+			!depth_mirror.snapshots.empty() || (!continuous && mirror_previous!=depth_mirror.last) || closed)mirror_failed=true;
 		fprintf(stderr,"MIDZ_DEPTH_MIRROR_RESULT complete=%u frames=%llu batches=%llu vertices=%llu clears=%llu snapshots=%llu remaining=%u\n",
 			unsigned(!mirror_failed),(unsigned long long)mirror_frames,(unsigned long long)mirror_batches,
 			(unsigned long long)mirror_vertices,(unsigned long long)mirror_clears,(unsigned long long)mirror_samples,unsigned(depth_mirror.snapshots.size()));
@@ -2408,6 +2415,8 @@ void zeus2_device::midz_screen_hook(bool completed)
 			s_wave_hi = 0;
 		}
 		if (completed) {
+            if(std::getenv("MIDZ_RUNTIME") && !cruisn::exotica_runtime::representable(screen().frame_number()))
+                fatalerror("Zeus runtime frame overflow\n");
             mzgl::FrameTick tick{m_zeusbase[0x38], uint32_t(screen().frame_number()), machine().time().as_double()};
             mzgl::ring_push2(6, &tick, sizeof(tick), nullptr, 0);
         }
