@@ -110,7 +110,8 @@ protected:
 	void usa_host_start();
 	void offroad_host_start();
 	void world_host_exit();
-	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads);
+	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
+		const std::vector<std::array<uint32_t,4>> *depths=nullptr);
 	void usa_distance_start();
 	void usa_distance_tick();
 	void usa_distance_exit();
@@ -186,10 +187,10 @@ protected:
 	uint64_t m_distance_far_tests = 0, m_distance_extra_tests = 0, m_distance_reads = 0, m_distance_pending = 0;
 	FILE *m_distance_log = nullptr;
 	memory_passthrough_handler m_host_scene_tap;
-	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr;
+	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr, *m_host_clip_log = nullptr;
 	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff, m_host_far = 80000;
 	double m_host_previous_scene_log_us = 0;
-	bool m_host_future = false, m_host_roads = false, m_host_full_roads = false;
+	bool m_host_future = false, m_host_roads = false, m_host_full_roads = false, m_host_far_coverage = false;
 	uint32_t m_host_revision = 24;
 	uint16_t m_host_layer = 0;
 	cruisn::world_future::Cache m_host_future_cache;

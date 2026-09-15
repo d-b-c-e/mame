@@ -345,6 +345,14 @@ void midvunit_base_state::world_host_start()
 		else if(!strcmp(far,"240000"))m_host_far=240000;
 		else fatalerror("MIDV_WORLD_HOST_FAR requires 80000/160000/240000\n");
 	}
+	if(const char *coverage=std::getenv("MIDV_WORLD_HOST_FAR_COVERAGE"))
+	{
+		if(strcmp(coverage,"0") && strcmp(coverage,"1"))fatalerror("MIDV_WORLD_HOST_FAR_COVERAGE requires 0/1\n");
+		m_host_far_coverage=!strcmp(coverage,"1");
+	}
+	if(m_host_far_coverage && (m_host_far!=240000 || m_host_mode!=2 || !m_host_future ||
+		!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0")))
+		fatalerror("World far coverage requires 3x future draw and physical FFB0\n");
 	for(auto pair:{std::make_pair("MIDV_WORLD_HOST_FIRST",&m_host_first),std::make_pair("MIDV_WORLD_HOST_LAST",&m_host_last)})
 		if(const char *text=std::getenv(pair.first))
 		{
@@ -361,6 +369,12 @@ void midvunit_base_state::world_host_start()
 	}
 	m_host_scene_log=fopen("world-host-scenes.csv","w");
 	if(quad_trace)m_host_quad_log=fopen("world-host-quads.csv","w");
+	if(quad_trace && m_host_far_coverage)
+	{
+		m_host_clip_log=fopen("world-far-coverage.bin","wb");
+		if(!m_host_clip_log || fwrite("VFP1",1,4,m_host_clip_log)!=4)fatalerror("Cannot create far coverage evidence\n");
+		setvbuf(m_host_clip_log,nullptr,_IOFBF,65536);
+	}
 	if(!m_host_scene_log || (quad_trace && !m_host_quad_log))fatalerror("Cannot create host scenery evidence\n");
 	setvbuf(m_host_scene_log,nullptr,_IOFBF,65536);
 	if(m_host_quad_log)
@@ -413,15 +427,19 @@ void midvunit_base_state::world_host_start()
 			}
 			const auto future_prepared=std::chrono::steady_clock::now();
 			// Main RAM is read directly: no tap recursion or guest speedup handler.
-			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision,m_host_full_roads))
+			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision,m_host_full_roads,m_host_far_coverage))
 				fatalerror("World host scenery pointer/model/projection guard failed\n");
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
+			std::vector<std::array<uint32_t,4>> depths;
 			size_t count=0;for(const auto &o:scene.objects)count+=o.quads.size();
 			quads.reserve(count);
+			if(m_host_far_coverage)depths.reserve(count);
 			uint64_t hash=cruisn::world_host::hash_seed;
-			for(const auto &o:scene.objects)for(const auto &q:o.quads)
+			for(const auto &o:scene.objects)for(size_t qi=0;qi<o.quads.size();++qi)
 			{
+				const auto &q=o.quads[qi];
+				if(m_host_far_coverage){if(o.depths.size()!=o.quads.size())fatalerror("Missing World far depths\n");depths.push_back(o.depths[qi]);}
 				quads.push_back(q);
 				hash=cruisn::world_host::quad_hash(hash,q);
 			}
@@ -433,7 +451,7 @@ void midvunit_base_state::world_host_start()
 				fputc('\n',m_host_quad_log);
 			}
 			const auto logged=std::chrono::steady_clock::now();
-			if(m_host_mode==2)world_host_submit(quads);
+			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr);
 			if(m_maincpu->total_cycles()!=guest_cycles)
 				fatalerror("World host inspection changed emulated CPU cycles\n");
 			const auto submitted=std::chrono::steady_clock::now();
@@ -457,6 +475,7 @@ void midvunit_base_state::world_host_exit()
 {
 	if(m_host_scene_log){fclose(m_host_scene_log);m_host_scene_log=nullptr;}
 	if(m_host_quad_log){fclose(m_host_quad_log);m_host_quad_log=nullptr;}
+	if(m_host_clip_log){fclose(m_host_clip_log);m_host_clip_log=nullptr;}
 }
 
 // Developer-only global projection/residency experiment. The matching checked

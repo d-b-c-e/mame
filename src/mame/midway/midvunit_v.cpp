@@ -17,6 +17,7 @@
 #include "cruisn/tjunctions.h"
 #include "cruisn/retained_texture.h"
 #include "cruisn/cpu_upload_spans.h"
+#include "cruisn/vunit_far_coverage.h"
 
 #include "williamssound.h"
 
@@ -100,6 +101,8 @@ FILE *quadlog_open()
 //   4 TEXTURE u32 frame, u8 bytes[]
 //   5 VRAM    u32 frame, u32 offset, u32 count, u16 data[count]
 //   6 FRAME   u32 frame (end of visible screen update)
+//   7 FAR_QUAD original QUAD payload + u32 far + four C31 camera depths.
+//     Private World coverage only; ordinary game DMA remains type1 unchanged.
 #ifdef _WIN32
 
 // Interlocked operations preserve the cross-process ring layout and publish payloads
@@ -674,6 +677,7 @@ struct GL
 	int (WINAPI *GetAttribLocation)(uint, const char *);
 	void (WINAPI *GenBuffers)(int, uint *);
 	void (WINAPI *BindBuffer)(unsigned, uint);
+	void (WINAPI *BindBufferBase)(unsigned, uint, uint);
 	void (WINAPI *BufferData)(unsigned, glsizeiptr, const void *, unsigned);
 	void (WINAPI *BufferSubData)(unsigned, glsizeiptr, glsizeiptr, const void *);
 	void (WINAPI *GenVertexArrays)(int, uint *);
@@ -725,6 +729,7 @@ struct GL
 		L(BlendFunc, "glBlendFunc")
 		L(GetAttribLocation, "glGetAttribLocation") L(GenBuffers, "glGenBuffers")
 		L(BindBuffer, "glBindBuffer") L(BufferData, "glBufferData")
+		L(BindBufferBase, "glBindBufferBase")
 		L(BufferSubData, "glBufferSubData") L(GenVertexArrays, "glGenVertexArrays")
 		L(BindVertexArray, "glBindVertexArray")
 		L(EnableVertexAttribArray, "glEnableVertexAttribArray")
@@ -743,7 +748,8 @@ struct GL
 };
 
 // ---- CPU-side quad -> vertex building (scalar port of the verified path) ----
-struct QuadMsg { uint32_t frame; uint16_t pc, pad; uint16_t dma[16]; };
+using QuadMsg=cruisn::vunit_far::Packet;
+static_assert(offsetof(QuadMsg,coverage)==40 && sizeof(QuadMsg)==60,"V-Unit quad wire layouts");
 
 static void make_inclusive(float *vx, float *vy)
 {
@@ -822,12 +828,14 @@ static void dilate_rect(float *vx, float *vy, const int16_t *ix, const int16_t *
 }
 
 static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
-	std::vector<float> &fdata, std::vector<uint32_t> &udata, bool align_joins)
+	std::vector<float> &fdata, std::vector<uint32_t> &udata, bool align_joins,
+	std::vector<cruisn::vunit_far::Mask> *far_masks=nullptr,FILE *far_log=nullptr)
 {
 	cruisn::JoinResult joined;
 	if (align_joins) joined = cruisn::align_tjunctions(quads.size(), [&](size_t q) { return quads[q].dma; });
 	fdata.resize(quads.size() * 6 * 22);
 	udata.resize(quads.size() * 6 * 4);
+	if(far_masks)far_masks->assign(quads.size(),{});
 	for (size_t q = 0; q < quads.size(); q++)
 	{
 		const uint16_t *dma = quads[q].dma;
@@ -905,6 +913,16 @@ static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			int16_t const iy[4] = { int16_t(dma[3]), int16_t(dma[5]),
 				int16_t(dma[7]), int16_t(dma[9]) };
 			dilate_rect(vx, vy, ix, iy, us, vs);
+		}
+		if(quads[q].coverage.far)
+		{
+			std::array<double,4> depths;std::array<cruisn::vunit_far::Point,4> points;
+			for(unsigned i=0;i<4;++i)points[i]={{vx[i],vy[i]}};
+			if(!far_masks || !cruisn::vunit_far::decode(quads[q].coverage,depths) ||
+				!cruisn::vunit_far::coverage(points,depths,quads[q].coverage.far,(*far_masks)[q]))
+				fatalerror("Invalid private far coverage geometry\n");
+			if(far_log && (fwrite(&quads[q],1,sizeof(QuadMsg),far_log)!=sizeof(QuadMsg) ||
+				fwrite((*far_masks)[q].data(),1,64,far_log)!=64))fatalerror("Far GPU receipt write failed\n");
 		}
 		float x0 = vx[0], x1 = vx[0], y0 = vy[0], y1 = vy[0];
 		for (int i = 1; i < 4; i++)
@@ -1150,11 +1168,12 @@ void thread_main()
 	gl.BindFramebuffer(FRAMEBUFFER, 0);
 
 	// geometry VAO: two streamed VBOs, attributes by name
-	uint vao, vbo_f, vbo_u, vao_empty;
+	uint vao, vbo_f, vbo_u, vbo_far, vao_empty;
 	gl.GenVertexArrays(1, &vao);
 	gl.GenVertexArrays(1, &vao_empty);
 	gl.GenBuffers(1, &vbo_f);
 	gl.GenBuffers(1, &vbo_u);
+	gl.GenBuffers(1, &vbo_far);
 	gl.BindVertexArray(vao);
 	gl.BindBuffer(ARRAY_BUFFER, vbo_f);
 	const char *fattr[] = { "in_corner", "in_v0", "in_v1", "in_v2", "in_v3", "in_uv01", "in_uv23", "in_uvBounds" };
@@ -1289,6 +1308,16 @@ void thread_main()
 	static uint32_t pal_copy[32768];
 	std::vector<float> fdata;
 	std::vector<uint32_t> udata;
+	std::vector<cruisn::vunit_far::Mask> far_masks;
+	bool run_far=false;
+	FILE *far_log=nullptr;
+	if(std::getenv("MIDV_WORLD_HOST_FAR_COVERAGE") && !strcmp(std::getenv("MIDV_WORLD_HOST_FAR_COVERAGE"),"1") &&
+		(!std::getenv("MIDV_WORLD_HOST_QUADS") || strcmp(std::getenv("MIDV_WORLD_HOST_QUADS"),"0")))
+	{
+		far_log=fopen("world-far-gpu.bin","wb");
+		if(!far_log || fwrite("VFG1",1,4,far_log)!=4)fatalerror("Cannot create far GPU receipts\n");
+		setvbuf(far_log,nullptr,_IOFBF,65536);
+	}
 	uint64_t presents = 0, n_quads = 0, n_scenes = 0, n_pal = 0, n_tex = 0, n_vram = 0;
 	int snap_n = 0;
 	cruisn::CaptureWriter snapshot_writer;
@@ -1321,7 +1350,7 @@ void thread_main()
 		int const pg = (run_pc & 4) ? 1 : 0;
 		bool const new_scene = active_pc != run_pc;
 		if (new_scene) { quad_count[pg] = 0; scene_axis[pg] = 0; host_layers[pg] = false; active_pc = run_pc; }
-		n_aligned += build_vertices(run, float(MARGIN), fdata, udata, align_joins);
+		n_aligned += build_vertices(run, float(MARGIN), fdata, udata, align_joins,run_far?&far_masks:nullptr,far_log);
 		cpu_written[pg] = 0;
 		// 2D screens (menus, high scores) are drawn almost entirely from
 		// axis-aligned rectangles; 3D scenes almost never are. Quad-count
@@ -1345,6 +1374,13 @@ void thread_main()
 		scene_axis[pg] += axis;
 		crop2d[pg] = (scene_axis[pg] * 10 >= quad_count[pg] * 7);
 		gl.UseProgram(prog);
+		gl.Uniform1i(gl.GetUniformLocation(prog,"uFarCoverage"),run_far?1:0);
+		if(run_far)
+		{
+			gl.BindBuffer(0x90D2 /*SHADER_STORAGE_BUFFER*/,vbo_far);
+			gl.BufferData(0x90D2,far_masks.size()*64,far_masks.data(),STREAM_DRAW);
+			gl.BindBufferBase(0x90D2,3,vbo_far);
+		}
 		gl.BindVertexArray(vao);
 		gl.BindBuffer(ARRAY_BUFFER, vbo_f);
 		gl.BufferData(ARRAY_BUFFER, fdata.size() * 4, fdata.data(), STREAM_DRAW);
@@ -1389,6 +1425,7 @@ void thread_main()
 		quad_fresh[pg] = true;
 		if (new_scene) ++n_scenes;
 		run.clear();
+		run_far=false;
 	};
 
 	// CPU-shadow data is valid only where a CPU write actually occurred. Keep
@@ -1543,7 +1580,7 @@ void thread_main()
 			uint32_t const type = hdr[0], len = hdr[1];
 			if (len > staging.size()) staging.resize(len);
 			ring_read(r + 8, staging.data(), len);
-			if (type >= 1 && type <= 6 && len >= 4)
+			if (type >= 1 && type <= 7 && len >= 4)
 				memcpy(&last_received_frame, staging.data(), 4);
 			r += (8 + len + 7) & ~7u;
 			ring_store(lv.rpos, r);
@@ -1551,13 +1588,17 @@ void thread_main()
 			switch (type)
 			{
 			case 1:
+			case 7:
 			{
-				QuadMsg q;
-				memcpy(&q, staging.data(), sizeof(q));
+				if(len!=(type==1?40:60))fatalerror("Invalid V-Unit quad payload length\n");
+				QuadMsg q{};
+				memcpy(&q, staging.data(),len);
+				if(type==7){std::array<double,4> depths;if(!cruisn::vunit_far::decode(q.coverage,depths))fatalerror("Invalid far quad metadata\n");}
 				if (run_pc != 0xffff && (q.pc != run_pc ||
 					(!run.empty() && ((q.pad ^ run.back().pad) & 2)))) complete_run();
 				run_pc = q.pc;
 				run.push_back(q);
+				run_far|=type==7;
 				++n_quads;
 				break;
 			}
@@ -1783,6 +1824,7 @@ void thread_main()
 			std::fprintf(stderr, "MIDV screenshot writer failed: captures incomplete\n");
 	}
 	if (snapshot_index && fclose(snapshot_index)) std::fprintf(stderr, "MIDV screenshot writer failed: index close\n");
+	if(far_log && fclose(far_log))fatalerror("Far GPU receipt close failed\n");
 
 	// persist live-toggle state (F9 / Esc-menu CRT) for the launcher: the
 	// collection shell reads this back so its SETTINGS row and the next
@@ -3154,16 +3196,29 @@ void midvunit_base_state::observe_numeric_hud()
 
 }
 
-void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_t,16>> &quads)
+void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
+	const std::vector<std::array<uint32_t,4>> *depths)
 {
 	if(!live().enabled)fatalerror("World host scenery drawing requires the live GL renderer\n");
 	if(quads.empty())return;
+	if(depths && (!m_host_far_coverage || depths->size()!=quads.size()))fatalerror("Host far depths mismatch\n");
 	const uint32_t frame=uint32_t(m_screen->frame_number());
 	live().last_frame=frame;
 	live().sync_state(frame,m_paletteram.target(),uint32_t(m_paletteram.bytes()),
 		m_textureram.target(),uint32_t(m_textureram.bytes()));
 	struct {uint32_t frame;uint16_t pc,pad;} h={frame,m_page_control,m_host_layer};
-	for(const auto &q:quads)live().write_msg(1,&h,8,q.data(),32);
+	for(size_t i=0;i<quads.size();++i)
+	{
+		bool crossing=false;
+		if(depths)for(auto word:(*depths)[i])crossing|=cruisn::scenery::Float::load(word).fix()>=int32_t(m_host_far);
+		if(!crossing){live().write_msg(1,&h,8,quads[i].data(),32);continue;}
+		cruisn::vunit_far::Packet q{};q.frame=frame;q.pc=m_page_control;q.pad=m_host_layer;
+		std::copy(quads[i].begin(),quads[i].end(),q.dma);q.coverage.far=m_host_far;q.coverage.words=(*depths)[i];
+		std::array<double,4> decoded;
+		if(!cruisn::vunit_far::decode(q.coverage,decoded))fatalerror("Invalid emitted far quad depths\n");
+		if(m_host_clip_log && fwrite(&q,1,sizeof(q),m_host_clip_log)!=sizeof(q))fatalerror("Far producer receipt write failed\n");
+		live().write_msg(7,&q,sizeof(q));
+	}
 }
 
 void midvunit_renderer::process_dma_queue()
