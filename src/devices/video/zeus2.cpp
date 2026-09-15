@@ -6,6 +6,7 @@
 
 **************************************************************************/
 #include "emu.h"
+#include "../../mame/midway/cruisn/diagnostic_journal.h"
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
 #include "../../mame/midway/cruisn/zeus_palette_lifetime.h"
@@ -852,7 +853,7 @@ void thread_main()
 	gl.BindFramebuffer(FRAMEBUFFER, 0);
 
 	uint mirror_prog=0,mirror_color=0,mirror_depth=0,mirror_fbo=0;
-	FILE *mirror_log=nullptr;
+	cruisn::DiagnosticJournal mirror_log;
 	cruisn::CaptureWriter mirror_writer;
 	uint64_t mirror_batches=0,mirror_vertices=0,mirror_clears=0,mirror_frames=0,mirror_samples=0;
 	bool mirror_failed=false;
@@ -880,9 +881,9 @@ void thread_main()
 		gl.Uniform1f(gl.GetUniformLocation(mirror_prog,"uMargin"),float(MARGIN));
 		gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"waveram"),0);
 		gl.Uniform1i(gl.GetUniformLocation(mirror_prog,"palTex"),1);
-		mirror_log=fopen("zeus-depth-mirror.csv","w");if(!mirror_log) {zlogf("depth mirror log failed");return;}
-		setvbuf(mirror_log,nullptr,_IOFBF,65536);
-		fprintf(mirror_log,"frame,width,height,batches,vertices,clears,snapshot,color_differences,depth_differences,mirror_us,snapshot_us\n");
+		mirror_log.open("zeus-depth-mirror.csv","w",cruisn::DiagnosticJournal::Policy::capture);if(!mirror_log) {zlogf("depth mirror log failed");return;}
+		mirror_log.buffer(nullptr,_IOFBF,65536);
+		mirror_log.print("frame,width,height,batches,vertices,clears,snapshot,color_differences,depth_differences,mirror_us,snapshot_us\n");
 	}
 
 	const bool future_present=envi("MIDZ_HOST_FUTURE_PRESENT",nullptr,0)==1;
@@ -1003,12 +1004,12 @@ void thread_main()
 	uint64_t private_waiting_scene=0;
 	const bool compose=envi("MIDZ_HOST_COMPOSE",nullptr,0)==1;
 	uint margin_depth_tex=0,margin_fbo=0;
-	FILE *margin_log=nullptr;
+	cruisn::DiagnosticJournal margin_log;
 	// Owned raw diagnostic bytes use the same bounded FIFO writer as BMPs;
 	// no device state or GL calls can reach this background worker.
 	cruisn::CaptureWriter margin_writer;
 	uint32_t private_frame=0;
-	FILE *private_log=nullptr;
+	cruisn::DiagnosticJournal private_log;
 	bool private_failed=false;
 	auto private_materials=[&](const std::vector<uint8_t> &wire,bool late=false,bool retained=false)->bool {
 		using namespace cruisn::zeus_host;
@@ -1028,10 +1029,10 @@ void thread_main()
 		if(retained ? !accept_retained(packet,*private_image) : !accept(packet,*private_image))return false;
 		const auto decoded=std::chrono::steady_clock::now();
 		if(!private_log) {
-			private_log=fopen("exotica-host-materials-gpu.csv","w");
+			private_log.open("exotica-host-materials-gpu.csv","w",cruisn::DiagnosticJournal::Policy::capture);
 			if(!private_log)return false;
-			setvbuf(private_log,nullptr,_IOFBF,65536);
-			fprintf(private_log,"scene,frame,generation,pages,palettes,bytes,hash,decode_us,upload_us,snapshot_us\n");
+			private_log.buffer(nullptr,_IOFBF,65536);
+			private_log.print("scene,frame,generation,pages,palettes,bytes,hash,decode_us,upload_us,snapshot_us\n");
 		}
 		if(gl.GetError()) {zlogf("private materials: preexisting OpenGL error");return false;}
 		std::vector<uint8_t> original_wave_before,original_palette_before;
@@ -1089,7 +1090,7 @@ void thread_main()
 		gl.ActiveTexture(TEXTURE0);
 		const auto finished=std::chrono::steady_clock::now();
 		auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
-		if(fprintf(private_log,"%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f\n",
+		if(private_log.print("%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f\n",
 			(unsigned long long)packet.scene,packet.frame,(unsigned long long)packet.wave.generation,
 			unsigned(packet.wave.pages.size()),unsigned(packet.rows.size()),unsigned(wire.size()),
 			(unsigned long long)packet.wave.result_hash,us(start,decoded),us(decoded,uploaded),us(uploaded,finished))<0)return false;
@@ -1201,13 +1202,13 @@ void thread_main()
 	cruisn::zeus_endpoint_pair::Pair endpoint_pair;
 	uint64_t endpoint_pairs=0;
 	const uint64_t endpoint_pair_limit=envi("MIDZ_ENDPOINT_MARKED",nullptr,0)==1?1000000:131072;
-	FILE *endpoint_log=nullptr;
+	cruisn::DiagnosticJournal endpoint_log;
 	if(envi("MIDZ_MODEL_ENDPOINT",nullptr,0)==2) {
 		if(!mirror_fbo || !depth_mirror.wide) {zlogf("endpoint replacement requires private wide target");return;}
-		endpoint_log=fopen("exotica-endpoint-gpu.csv","w");
+		endpoint_log.open("exotica-endpoint-gpu.csv","w",cruisn::DiagnosticJournal::Policy::capture);
 		if(!endpoint_log){zlogf("cannot create endpoint GPU receipt");return;}
-		setvbuf(endpoint_log,nullptr,_IOFBF,65536);
-		fprintf(endpoint_log,"frame,model,index,count\n");
+		endpoint_log.buffer(nullptr,_IOFBF,65536);
+		endpoint_log.print("frame,model,index,count\n");
 	}
 	auto add_quad = [&](const midz_quad_rec &r)
 	{
@@ -1403,20 +1404,20 @@ void thread_main()
 		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0DE1,waveTex);
 		gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0DE1,palTex);gl.ActiveTexture(TEXTURE0);
 		if(!margin_log) {
-			margin_log=fopen("exotica-active-gpu.csv","w");if(!margin_log)return false;
-			setvbuf(margin_log,nullptr,_IOFBF,65536);
-			fprintf(margin_log,"scene,frame,mode,quads,vertices,width,height,page,margin,snapshot,host_us\n");
+			margin_log.open("exotica-active-gpu.csv","w",cruisn::DiagnosticJournal::Policy::capture);if(!margin_log)return false;
+			margin_log.buffer(nullptr,_IOFBF,65536);
+			margin_log.print("scene,frame,mode,quads,vertices,width,height,page,margin,snapshot,host_us\n");
 		}
 		const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
-		if(fprintf(margin_log,"%llu,%u,%u,%u,%u,%d,%d,%u,%u,%u,%.3f\n",(unsigned long long)packet.materials.scene,
+		if(margin_log.print("%llu,%u,%u,%u,%u,%d,%d,%u,%u,%u,%.3f\n",(unsigned long long)packet.materials.scene,
 			packet.materials.frame,mode,unsigned(packet.quads.size()),unsigned(vertices),fw,fh,packet.page,packet.margin,unsigned(packet.materials.snapshot),elapsed)<0)return false;
 		++margin_packets;margin_quads+=packet.quads.size();return true;
 	};
 
 	cruisn::CaptureWriter future_writer;
-	FILE *future_log=nullptr;
+	cruisn::DiagnosticJournal future_log;
 	uint64_t future_packets=0,future_quads=0,future_snapshots=0;
-	cruisn::CaptureWriter waiting_writer;FILE *waiting_log=nullptr;
+	cruisn::CaptureWriter waiting_writer;cruisn::DiagnosticJournal waiting_log;
 	uint64_t waiting_packets=0,waiting_quads=0,waiting_snapshots=0;
 	uint32_t future_page=0,future_multiplier=0;
 	auto private_future=[&](const std::vector<uint8_t> &wire,bool waiting=false)->bool {
@@ -1500,11 +1501,11 @@ void thread_main()
 		gl.ActiveTexture(TEXTURE0);gl.BindTexture(0x0de1,waveTex);gl.ActiveTexture(TEXTURE0+1);gl.BindTexture(0x0de1,palTex);gl.ActiveTexture(TEXTURE0);
 		if(gl.GetError())return false;
 		if(!log) {
-			log=fopen((std::string(prefix)+"gpu.csv").c_str(),"w");if(!log)return false;setvbuf(log,nullptr,_IOFBF,65536);
-			fprintf(log,"scene,frame,mode,multiplier,page,quads,vertices,bytes,hash,snapshot,host_us\n");
+			log.open((std::string(prefix)+"gpu.csv").c_str(),"w",cruisn::DiagnosticJournal::Policy::capture);if(!log)return false;log.buffer(nullptr,_IOFBF,65536);
+			log.print("scene,frame,mode,multiplier,page,quads,vertices,bytes,hash,snapshot,host_us\n");
 		}
 		const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
-		if(fprintf(log,"%llu,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%u,%.3f\n",(unsigned long long)packet.materials.scene,
+		if(log.print("%llu,%u,%u,%u,%u,%u,%llu,%llu,%016llx,%u,%.3f\n",(unsigned long long)packet.materials.scene,
 			packet.materials.frame,unsigned(mode),packet.multiplier,packet.page,unsigned(packet.quads.size()),(unsigned long long)vertices,
 			(unsigned long long)wire.size(),(unsigned long long)hash,unsigned(packet.materials.snapshot),elapsed)<0)return false;
 		++packets;quads+=packet.quads.size();
@@ -1593,7 +1594,7 @@ void thread_main()
 			snapshot_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-began).count();
 			++mirror_samples;
 		}
-		if(fprintf(mirror_log,"%u,%d,%d,%llu,%llu,%llu,%u,%llu,%llu,%.3f,%.3f\n",frame,fw,fh,
+		if(mirror_log.print("%u,%d,%d,%llu,%llu,%llu,%u,%llu,%llu,%.3f,%.3f\n",frame,fw,fh,
 			(unsigned long long)mirror_batches,(unsigned long long)mirror_vertices,(unsigned long long)mirror_clears,unsigned(snapshot),
 			(unsigned long long)colors,(unsigned long long)depths,mirror_total_us,snapshot_us)<0)return false;
 		// Wide mode reports differences from compatibility, not a pixel-depth
@@ -1760,7 +1761,7 @@ void thread_main()
 						flush();add_quad(q);flush(1);
 						midz_quad_rec changed;std::memcpy(&changed,&replacement,sizeof(changed));
 						add_quad(changed);flush(2);
-						if(!endpoint_log || fprintf(endpoint_log,"%u,%u,%u,%u\n",endpoint_pair.frame,endpoint_pair.model,
+						if(!endpoint_log || endpoint_log.print("%u,%u,%u,%u\n",endpoint_pair.frame,endpoint_pair.model,
 							endpoint_pair.index,endpoint_pair.count)<0) {
 							private_failed=true;s_stopz.store(true);zlogf("endpoint GPU journal failure");break;
 						}
@@ -2130,13 +2131,13 @@ void thread_main()
 	}
 
 	if(endpoint_log) {
-		const bool good=!ferror(endpoint_log);const int closed=fclose(endpoint_log);
+		const bool good=!endpoint_log.error();const int closed=endpoint_log.close();
 		fprintf(stderr,"MIDZ_ENDPOINT_GPU_RESULT complete=%u pairs=%llu\n",
 			unsigned(!private_failed && good && !closed && endpoint_order.complete()),(unsigned long long)endpoint_pairs);
 	}
 	if(mirror_log) {
 		const auto stats=mirror_writer.finish();
-		const int closed=fclose(mirror_log);
+		const int closed=mirror_log.close();
 		if(stats.failed || stats.rejected || stats.submitted!=stats.written || stats.written!=4*mirror_samples ||
 			!depth_mirror.snapshots.empty() || mirror_previous!=depth_mirror.last || closed)mirror_failed=true;
 		fprintf(stderr,"MIDZ_DEPTH_MIRROR_RESULT complete=%u frames=%llu batches=%llu vertices=%llu clears=%llu snapshots=%llu remaining=%u\n",
@@ -2148,7 +2149,7 @@ void thread_main()
 			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
 	}
 	if(envi("MIDZ_HOST_FUTURE",nullptr,0)) {
-		const auto stats=future_writer.finish();const int closed=future_log?fclose(future_log):-1;
+		const auto stats=future_writer.finish();const int closed=future_log?future_log.close():-1;
 		const bool complete=!private_failed && future_packets && future_packets+(envi("MIDZ_HOST_HANDOVER",nullptr,0)==2?waiting_packets:0)+(compose?margin_packets:0)==private_packets && !closed &&
 			stats.submitted==4*future_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
 		fprintf(stderr,"MIDZ_HOST_FUTURE_GPU_RESULT complete=%u scenes=%llu quads=%llu snapshots=%llu written=%llu failed=%llu rejected=%llu\n",
@@ -2156,7 +2157,7 @@ void thread_main()
 			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
 	}
 	if(envi("MIDZ_HOST_HANDOVER",nullptr,0)==2) {
-		const auto stats=waiting_writer.finish();const int closed=waiting_log?fclose(waiting_log):-1;
+		const auto stats=waiting_writer.finish();const int closed=waiting_log?waiting_log.close():-1;
 		const bool complete=!private_failed && waiting_packets && waiting_packets==future_packets && private_late_scene==private_scene &&
 			(!compose || (private_waiting_scene==private_scene && margin_packets==future_packets)) && !closed &&
 			stats.submitted==4*waiting_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
@@ -2181,14 +2182,14 @@ void thread_main()
 			(unsigned long long)stats.submitted,(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected,
 			(unsigned long long)stats.peak_bytes,(unsigned long long)stats.write_total_us,(unsigned long long)stats.write_max_us,(unsigned long long)stats.drain_us,
 			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
-		if(fclose(margin_log))private_failed=true;
+		if(margin_log.close())private_failed=true;
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_GPU_RESULT complete=%u scenes=%llu quads=%llu\n",
 			unsigned(!private_failed),(unsigned long long)margin_packets,(unsigned long long)margin_quads);
 	}
 	if(margin_fbo)gl.DeleteFramebuffers(1,&margin_fbo);
 	if(margin_depth_tex)gl.DeleteTextures(1,&margin_depth_tex);
 	if(private_log) {
-		if(fclose(private_log))private_failed=true;
+		if(private_log.close())private_failed=true;
 		fprintf(stderr,"MIDZ_HOST_MATERIALS_GPU_RESULT complete=%u received=%llu snapshots=%llu hash=%016llx\n",
 			unsigned(!private_failed),(unsigned long long)private_packets,(unsigned long long)private_snapshots,
 			(unsigned long long)private_image->image_hash());
