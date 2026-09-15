@@ -23,6 +23,7 @@
 **************************************************************************/
 
 #include "emu.h"
+#include "cruisn/checked_journal_close.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/hud_drivetrain.h"
 
@@ -588,10 +589,13 @@ void midvunit_base_state::world_host_start()
 
 void midvunit_base_state::world_host_exit()
 {
-	if(m_host_fade_log){FILE *fp=m_host_fade_log;m_host_fade_log=nullptr;if(fclose(fp))fatalerror("Fade producer close failed\n");}
-	if(m_host_scene_log){fclose(m_host_scene_log);m_host_scene_log=nullptr;}
-	if(m_host_quad_log){fclose(m_host_quad_log);m_host_quad_log=nullptr;}
-	if(m_host_clip_log){fclose(m_host_clip_log);m_host_clip_log=nullptr;}
+	const bool fade=cruisn::close_journal(m_host_fade_log);
+	const bool scene=cruisn::close_journal(m_host_scene_log);
+	const bool quads=cruisn::close_journal(m_host_quad_log);
+	const bool clip=cruisn::close_journal(m_host_clip_log);
+	if(!fade || !scene || !quads || !clip)
+		fatalerror("V-Unit host journal write/close failed: fade=%u scene=%u quads=%u clip=%u\n",
+			unsigned(fade),unsigned(scene),unsigned(quads),unsigned(clip));
 }
 
 // Developer-only global projection/residency experiment. The matching checked
