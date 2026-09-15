@@ -1140,10 +1140,16 @@ void thread_main()
 	if (original_mirror)
 	{
 		if (!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0") || mirror_frame<1 || mirror_frame>1000000 ||
-			(std::getenv("MIDV_GL_BATCH_VRAM") && strcmp(std::getenv("MIDV_GL_BATCH_VRAM"),"1")) ||
-			(std::getenv("MIDV_WORLD_HOST_SCENERY") && !strcmp(std::getenv("MIDV_WORLD_HOST_SCENERY"),"2") &&
-			 (!std::getenv("MIDV_WORLD_HOST_LAYER") || strcmp(std::getenv("MIDV_WORLD_HOST_LAYER"),"3"))))
+			(std::getenv("MIDV_GL_BATCH_VRAM") && strcmp(std::getenv("MIDV_GL_BATCH_VRAM"),"1")))
 			fatalerror("Original mirror requires FFB0, bounded frame, batched CPU writes and split/tagged host draws\n");
+		for(const char *game:{"WORLD","USA","OFFROAD"})
+		{
+			const std::string prefix=std::string("MIDV_")+game+"_HOST_";
+			const char *mode=std::getenv((prefix+"SCENERY").c_str());
+			const char *layer=std::getenv((prefix+"LAYER").c_str());
+			if(mode && !strcmp(mode,"2") && (!layer || strcmp(layer,"3")))
+				fatalerror("Original mirror requires split/tagged %s host draws\n",game);
+		}
 		gl.load1(gl.GetTexImage,"glGetTexImage");
 		if(!gl.GetTexImage)fatalerror("Original mirror texture readback unavailable\n");
 	}
