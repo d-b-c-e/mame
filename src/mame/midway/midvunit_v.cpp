@@ -945,7 +945,7 @@ static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			f[14] = us[2]; f[15] = vs[2]; f[16] = us[3]; f[17] = vs[3];
 			for (int i = 0; i < 4; i++) f[18 + i] = bounds[i];
 			uint32_t *u = &udata[(q * 6 + k) * 4];
-			u[0] = pixdata; u[1] = mode; u[2] = dither | ((quads[q].pad & 1) ? 8u : 0u); u[3] = uint32_t(dma[14]) * 256;
+			u[0] = pixdata; u[1] = mode; u[2] = dither | ((quads[q].pad & 1) ? 8u : 0u) | ((quads[q].pad & 4) ? 16u : 0u); u[3] = uint32_t(dma[14]) * 256;
 		}
 	}
 	return joined.aligned;
@@ -1444,7 +1444,7 @@ void thread_main()
 		bool const auxiliary = original_mirror && (run.front().pad & 2);
 		if(original_mirror)
 		{
-			for(auto const &q:run)if(q.pad!=(auxiliary?3:0))fatalerror("Original mirror unqualified layer ownership\n");
+			for(auto const &q:run)if(auxiliary?(q.pad!=3 && q.pad!=7):q.pad!=0)fatalerror("Original mirror unqualified layer ownership\n");
 			if(auxiliary)mirror_auxiliary+=run.size();
 			else {mirror_ordinary+=run.size();original_cpu_written[pg]=0;}
 		}
@@ -1731,6 +1731,10 @@ void thread_main()
 				float selector=1;
 				bool far_packet=type==7;
 				memcpy(&q, staging.data(),type==1?40:60);
+				if(q.pad & 4) {
+					const char *permission=std::getenv("MIDV_WORLD_HOST_ACTIVE_ROADS");
+					if(q.pad!=7 || !permission || std::strcmp(permission,"1"))fatalerror("Unqualified active road margin packet\n");
+				}
 				if(type==7){std::array<double,4> depths;if(!cruisn::vunit_far::decode(q.coverage,depths))fatalerror("Invalid far quad metadata\n");}
 				if(type==8)
 				{
@@ -3407,12 +3411,15 @@ void midvunit_base_state::observe_numeric_hud()
 }
 
 void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
-	const std::vector<std::array<uint32_t,4>> *depths, const std::vector<uint32_t> *policies)
+	const std::vector<std::array<uint32_t,4>> *depths, const std::vector<uint32_t> *policies,
+	const std::vector<uint8_t> *margins)
 {
 	if(!live().enabled)fatalerror("World host scenery drawing requires the live GL renderer\n");
 	if(quads.empty())return;
 	if(depths && (!m_host_far_coverage || depths->size()!=quads.size()))fatalerror("Host far depths mismatch\n");
 	if(policies && (!m_host_fade_metadata || !depths || policies->size()!=quads.size()))fatalerror("Host fade policies mismatch\n");
+	if(margins && (m_host_layer!=3 || margins->size()!=quads.size() ||
+		std::any_of(margins->begin(),margins->end(),[](uint8_t v){return v>1;})))fatalerror("Host margin permissions mismatch\n");
 	const uint32_t frame=uint32_t(m_screen->frame_number());
 	live().last_frame=frame;
 	live().sync_state(frame,m_paletteram.target(),uint32_t(m_paletteram.bytes()),
@@ -3422,10 +3429,11 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 	int const fade_frame=capture_text?atoi(capture_text):0;
 	for(size_t i=0;i<quads.size();++i)
 	{
+		h.pad=m_host_layer | ((margins && (*margins)[i])?4:0);
 		if(policies)
 		{
 			cruisn::vunit_fade::Packet packet;
-			packet.quad.frame=frame;packet.quad.pc=m_page_control;packet.quad.pad=m_host_layer;
+			packet.quad.frame=frame;packet.quad.pc=m_page_control;packet.quad.pad=h.pad;
 			std::copy(quads[i].begin(),quads[i].end(),packet.quad.dma);
 			packet.quad.coverage.far_limit=m_host_far;packet.quad.coverage.words=(*depths)[i];packet.policy=(*policies)[i];
 			std::array<float,4> decoded;bool crossing;
@@ -3438,7 +3446,7 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 		bool crossing=false;
 		if(depths)for(auto word:(*depths)[i])crossing|=cruisn::scenery::Float::load(word).fix()>=int32_t(m_host_far);
 		if(!crossing){live().write_msg(1,&h,8,quads[i].data(),32);continue;}
-		cruisn::vunit_far::Packet q{};q.frame=frame;q.pc=m_page_control;q.pad=m_host_layer;
+		cruisn::vunit_far::Packet q{};q.frame=frame;q.pc=m_page_control;q.pad=h.pad;
 		std::copy(quads[i].begin(),quads[i].end(),q.dma);q.coverage.far_limit=m_host_far;q.coverage.words=(*depths)[i];
 		std::array<double,4> decoded;
 		if(!cruisn::vunit_far::decode(q.coverage,decoded))fatalerror("Invalid emitted far quad depths\n");

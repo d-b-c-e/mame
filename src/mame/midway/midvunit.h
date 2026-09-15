@@ -111,7 +111,8 @@ protected:
 	void offroad_host_start();
 	void world_host_exit();
 	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
-		const std::vector<std::array<uint32_t,4>> *depths=nullptr, const std::vector<uint32_t> *policies=nullptr);
+		const std::vector<std::array<uint32_t,4>> *depths=nullptr, const std::vector<uint32_t> *policies=nullptr,
+		const std::vector<uint8_t> *margins=nullptr);
 	void usa_distance_start();
 	void usa_distance_tick();
 	void usa_distance_exit();

@@ -495,14 +495,17 @@ void midvunit_base_state::world_host_start()
 			std::vector<std::array<uint16_t,16>> quads;
 			std::vector<std::array<uint32_t,4>> depths;
 			std::vector<uint32_t> policies;
+			std::vector<uint8_t> margins;
 			size_t count=0;for(const auto &o:scene.objects)count+=o.quads.size();
 			quads.reserve(count);
 			if(m_host_far_coverage)depths.reserve(count);
 			uint64_t hash=cruisn::world_host::hash_seed;
 			if(m_host_fade_metadata)policies.reserve(count);
+			if(active_roads)margins.reserve(count);
 			for(const auto &o:scene.objects)for(size_t qi=0;qi<o.quads.size();++qi)
 			{
 				const auto &q=o.quads[qi];
+				if(active_roads)margins.push_back(o.margin_only?1:0);
 				if(m_host_fade_metadata)policies.push_back(o.protected_road?1:0);
 				if(m_host_far_coverage){if(o.depths.size()!=o.quads.size())fatalerror("Missing World far depths\n");depths.push_back(o.depths[qi]);}
 				quads.push_back(q);
@@ -516,7 +519,7 @@ void midvunit_base_state::world_host_start()
 				fputc('\n',m_host_quad_log);
 			}
 			const auto logged=std::chrono::steady_clock::now();
-			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr,m_host_fade_metadata?&policies:nullptr);
+			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr,m_host_fade_metadata?&policies:nullptr,active_roads?&margins:nullptr);
 			if(m_maincpu->total_cycles()!=guest_cycles)
 				fatalerror("World host inspection changed emulated CPU cycles\n");
 			const auto submitted=std::chrono::steady_clock::now();
