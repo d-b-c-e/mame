@@ -1018,6 +1018,8 @@ void thread_main()
 	uint32_t private_frame=0;
 	cruisn::DiagnosticJournal private_log;
 	bool private_failed=false;
+	const auto material_frame_policy=envi("MIDZ_BOOTSTRAP",nullptr,0)==3?
+		cruisn::zeus_host::FramePolicy::guest_ready:cruisn::zeus_host::FramePolicy::capture;
 	auto private_materials=[&](const std::vector<uint8_t> &wire,bool late=false,bool retained=false)->bool {
 		using namespace cruisn::zeus_host;
 		const auto start=std::chrono::steady_clock::now();
@@ -1025,7 +1027,7 @@ void thread_main()
 		const char *ffb=std::getenv("MIDV_FFB");
 		if(!enabled || strcmp(enabled,"1") || !ffb || strcmp(ffb,"0"))return false;
 		Packet packet;
-		if(!decode(wire.data(),wire.size(),packet) || packet.frame<private_frame)return false;
+		if(!decode(wire.data(),wire.size(),packet,material_frame_policy) || packet.frame<private_frame)return false;
 		if(late) {
 			if(packet.scene!=private_scene || packet.frame!=private_frame || packet.scene<=private_late_scene)return false;
 			if(compose && (retained ? private_waiting_scene>=packet.scene : private_waiting_scene!=packet.scene))return false;
@@ -1033,7 +1035,7 @@ void thread_main()
 			((envi("MIDZ_HOST_ACTIVE",nullptr,0) || envi("MIDZ_HOST_HANDOVER",nullptr,0)==2) && private_late_scene!=private_scene))return false;
 		if(compose && !late && private_waiting_scene!=private_scene)return false;
 		if(!private_image)private_image=std::make_unique<WaveImage>();
-		if(retained ? !accept_retained(packet,*private_image) : !accept(packet,*private_image))return false;
+		if(retained ? !accept_retained(packet,*private_image,material_frame_policy) : !accept(packet,*private_image))return false;
 		const auto decoded=std::chrono::steady_clock::now();
 		if(!private_log) {
 			private_log.open("exotica-host-materials-gpu.csv","w",journal_policy);
@@ -1302,7 +1304,7 @@ void thread_main()
 		const auto started=std::chrono::steady_clock::now();
 		const int mode=envi("MIDZ_HOST_ACTIVE",nullptr,0);
 		cruisn::zeus_margin::Packet packet;
-		if((mode!=1 && mode!=2) || !cruisn::zeus_margin::decode(wire.data(),wire.size(),packet) ||
+		if((mode!=1 && mode!=2) || !cruisn::zeus_margin::decode(wire.data(),wire.size(),packet,material_frame_policy) ||
 			packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
 		if(compose && (!mirror_fbo || !depth_mirror.wide || mode!=2))return false;
 		cruisn::CapturePacingScope pacing(capture_paced && packet.materials.snapshot ? &s_capture_pacing : nullptr);
@@ -1310,7 +1312,7 @@ void thread_main()
 		const uint target_fbo=compose?mirror_fbo:fbo,draw_prog=compose?mirror_prog:prog;
 		const unsigned depth_type=compose?0x1406:0x1405;
 		std::vector<uint8_t> material;
-		if(!cruisn::zeus_host::encode(packet.materials,material) || !private_materials(material,true))return false;
+		if(!cruisn::zeus_host::encode(packet.materials,material,material_frame_policy) || !private_materials(material,true))return false;
 		// Finish all original queued polygons before copying their depth. The
 		// producer sent this record only after the exact original FIFO target.
 		flush();
@@ -1436,7 +1438,7 @@ void thread_main()
 		auto &snapshots=waiting?waiting_snapshots:future_snapshots;
 		cruisn::zeus_wide::Packet packet;
 		if(!mirror_fbo || !depth_mirror.wide || (mode!=1 && mode!=2) ||
-			!cruisn::zeus_wide::decode(wire.data(),wire.size(),packet) || packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
+			!cruisn::zeus_wide::decode(wire.data(),wire.size(),packet,material_frame_policy) || packet.draw!=(mode==2) || packet.margin!=unsigned(MARGIN))return false;
 		if(waiting && (!future_packets || packet.page!=future_page || packet.multiplier!=future_multiplier))return false;
 		// Paced diagnostics include texture readback/copy/validation, not just
 		// queue admission. The producer retains its independent10s hard limit.
@@ -1444,7 +1446,7 @@ void thread_main()
 		// The ring dispatcher has finished buffered sky copies. Commit them to
 		// both original/private targets before any future geometry is inserted.
 		flush();std::vector<uint8_t> material;
-		if(!cruisn::zeus_host::encode(packet.materials,material) || !private_materials(material,waiting,waiting))return false;
+		if(!cruisn::zeus_host::encode(packet.materials,material,material_frame_policy) || !private_materials(material,waiting,waiting))return false;
 		auto read_texture=[&](uint texture,unsigned format,unsigned type) {
 			std::vector<uint8_t> bytes(size_t(fw)*fh*4);
 			gl.ActiveTexture(TEXTURE0+7);gl.BindTexture(0x0de1,texture);gl.PixelStorei(0x0d05,1);

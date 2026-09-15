@@ -243,6 +243,9 @@ private:
 	void bootstrap_exit();
 	void bootstrap_scene(uint32_t address,uint32_t value,uint32_t mask);
 	bool m_bootstrap_scenes=false,m_bootstrap_scene_started=false;
+	cruisn::zeus_host::FramePolicy material_frame_policy() const {
+		return m_bootstrap_scenes && m_bootstrap_scene_started?cruisn::zeus_host::FramePolicy::guest_ready:cruisn::zeus_host::FramePolicy::capture;
+	}
 	bool m_bootstrap_ready=false,m_bootstrap_pending=false,m_bootstrap_lifetimes=false;
 	uint32_t m_bootstrap_base=0,m_bootstrap_frame=0,m_bootstrap_ready_frame=0;
 	double m_bootstrap_time=0;
@@ -1508,7 +1511,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		packet.rows=std::move(palettes.rows);
 		const auto material_staged=std::chrono::steady_clock::now();
 		auto &wire=material_wire;
-		if(!cruisn::zeus_host::encode(packet,wire))fatalerror("Exotica private material packet rejected\n");
+		if(!cruisn::zeus_host::encode(packet,wire,material_frame_policy()))fatalerror("Exotica private material packet rejected\n");
 		const auto material_encoded=std::chrono::steady_clock::now();
 		if(m_scene_future_mode) {
 			cruisn::zeus_wide::Packet future;
@@ -1524,7 +1527,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 				}
 			}
 			std::vector<uint8_t> encoded;
-			if(!cruisn::zeus_wide::encode(future,encoded) || !m_zeus->midz_host_future(encoded.data(),encoded.size()))
+			if(!cruisn::zeus_wide::encode(future,encoded,material_frame_policy()) || !m_zeus->midz_host_future(encoded.data(),encoded.size()))
 				fatalerror("Exotica future owned queue rejected\n");
 			if(packet.snapshot) {
 				const auto name="exotica-future-"+std::to_string(p.frame)+".xwd";
@@ -1701,15 +1704,15 @@ void crusnexo_state::scene_waiting_ready()
 		if(!m_scene_material_image || !m_handover_generation || m_scene_material_image->generation()!=m_handover_generation ||
 			packet.materials.scene!=m_handover_scene || packet.materials.frame!=m_handover_frame ||
 			packet.page!=m_zeus->m_renderRegs[4] || packet.quads.size()!=filtered.quads.size() ||
-			!cruisn::zeus_host::retain(packet.materials,*m_scene_material_image))
+			!cruisn::zeus_host::retain(packet.materials,*m_scene_material_image,material_frame_policy()))
 			fatalerror("Exotica waiting retained image/frame/page ownership\n");
 		const auto staged=std::chrono::steady_clock::now();std::vector<uint8_t> encoded,material;
-		if(!cruisn::zeus_wide::encode(packet,encoded) || !cruisn::zeus_host::encode(packet.materials,material))
+		if(!cruisn::zeus_wide::encode(packet,encoded,material_frame_policy()) || !cruisn::zeus_host::encode(packet.materials,material,material_frame_policy()))
 			fatalerror("Exotica waiting retained packet encoding\n");
 		const auto encoded_at=std::chrono::steady_clock::now();
 		if(!m_zeus->midz_host_waiting(encoded.data(),encoded.size()))fatalerror("Exotica waiting owned queue rejected\n");
 		const auto queued=std::chrono::steady_clock::now();
-		if(!cruisn::zeus_host::accept_retained(packet.materials,*m_scene_material_image))fatalerror("Exotica waiting producer commit rejected\n");
+		if(!cruisn::zeus_host::accept_retained(packet.materials,*m_scene_material_image,material_frame_policy()))fatalerror("Exotica waiting producer commit rejected\n");
 		if(!owners.empty()) {
 			const uint64_t realm=owners[0][0];
 			for(const auto &owner:owners)if(owner[0]!=realm)fatalerror("Endpoint waiting admission realm\n");
@@ -2043,7 +2046,7 @@ void crusnexo_state::scene_active_ready()
 		++m_scene_material_verified;
 	}
 	const auto staged_at=std::chrono::steady_clock::now();std::vector<uint8_t> wire,material_wire;
-	if(!cruisn::zeus_margin::encode(packet,wire) || !cruisn::zeus_host::encode(material,material_wire))fatalerror("Exotica active owned packet rejected\n");
+	if(!cruisn::zeus_margin::encode(packet,wire,material_frame_policy()) || !cruisn::zeus_host::encode(material,material_wire,material_frame_policy()))fatalerror("Exotica active owned packet rejected\n");
 	const auto encoded=std::chrono::steady_clock::now();
 	if(!m_zeus->midz_host_margin(wire.data(),wire.size()))fatalerror("Exotica active owned queue rejected\n");
 	const auto queued=std::chrono::steady_clock::now();
