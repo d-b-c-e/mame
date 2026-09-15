@@ -29,6 +29,7 @@ The Grid         v1.2   10/18/2000
 #include "emu.h"
 #include "cruisn/exotica_journal_policy.h"
 #include "cruisn/diagnostic_count.h"
+#include "cruisn/exotica_bootstrap.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/hud_drivetrain.h"
 #include "cruisn/exotica_visibility.h"
@@ -190,6 +191,7 @@ protected:
 
 		save_item(NAME(m_keypad_select));
 		save_item(NAME(m_crusnexo_leds_select));
+		bootstrap_start();
 		visibility_start();
 		scene_observer_start();
 		lifetime_start();
@@ -237,6 +239,12 @@ private:
 	uint64_t m_endpoint_commits=0,m_endpoint_consumed=0,m_endpoint_untracked=0;
 	uint64_t m_endpoint_prepared=0,m_endpoint_rejected=0,m_endpoint_saved=0,m_endpoint_bytes=0;
 
+	void bootstrap_start();
+	void bootstrap_exit();
+	bool m_bootstrap_ready=false,m_bootstrap_pending=false;
+	uint32_t m_bootstrap_base=0,m_bootstrap_frame=0,m_bootstrap_ready_frame=0;
+	double m_bootstrap_time=0;
+	memory_passthrough_handler m_bootstrap_count_tap,m_bootstrap_tail_tap;
 	void lifetime_start();
 	bool lifetime_scope();
 	void lifetime_exit();
@@ -473,19 +481,67 @@ void crusnexo_state::lifetime_emit(char event,uint32_t slot,uint64_t generation,
 		key.section,key.source,reason,flags)<0)fatalerror("Exotica lifetime write failed\n");
 }
 
+// Observe the first completed pool rebuild independently of the finite lifetime
+// window. Boot RAM loading may touch the same addresses; require actual guest
+// instructions, code signatures and every rebuilt link. No renderer activation.
+void crusnexo_state::bootstrap_start()
+{
+	const char *mode=std::getenv("MIDZ_BOOTSTRAP");if(!mode)return;
+	const char *ffb=std::getenv("MIDV_FFB");
+	if(strcmp(mode,"1") || !ffb || strcmp(ffb,"0") || m_ram_base.bytes()!=0x100000)
+		fatalerror("Exotica bootstrap observation requires mode1 and FFB0\n");
+	m_bootstrap_count_tap=m_maincpu->space(AS_PROGRAM).install_write_tap(0x10a9,0x10a9,"exotica_bootstrap_count",
+		[this](offs_t,uint32_t &data,uint32_t mask) {
+			if(machine().side_effects_disabled() || m_bootstrap_ready || m_maincpu->state_int(TMS320C3X_PC)!=0xbbc9)return;
+			auto read=[this](uint32_t at){return uint32_t(m_ram_base[at]);};
+			// A pre-load PC alias is not evidence that the guest is ready.
+			if(!cruisn::exotica_bootstrap::code_matches(read))return;
+			if(m_bootstrap_pending || !cruisn::exotica_bootstrap::begin(read,data,mask,0xbbc9,m_bootstrap_base))
+				fatalerror("Exotica bootstrap pool begin rejected\n");
+			m_bootstrap_pending=true;m_bootstrap_frame=uint32_t(m_screen->frame_number());m_bootstrap_time=machine().time().as_double();
+			m_bootstrap_tail_tap=m_maincpu->space(AS_PROGRAM).install_write_tap(m_bootstrap_base+1200*31,m_bootstrap_base+1200*31,"exotica_bootstrap_tail",
+				[this](offs_t address,uint32_t &value,uint32_t bits) {
+					if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0xbbd5)return;
+					auto read=[this](uint32_t at){return uint32_t(m_ram_base[at]);};
+					const auto now=machine().time().as_double();const uint32_t frame=uint32_t(m_screen->frame_number());
+					const uint32_t ar0=uint32_t(m_maincpu->state_int(TMS320C3X_AR0));
+					if(!m_bootstrap_pending || m_bootstrap_ready || frame<m_bootstrap_frame || frame>m_bootstrap_frame+1 ||
+						now<m_bootstrap_time || now-m_bootstrap_time>=.001 ||
+						!cruisn::exotica_bootstrap::complete(read,m_bootstrap_base,uint32_t(address),value,bits,0xbbd5,ar0))
+						fatalerror("Exotica bootstrap pool completion rejected\n");
+					size_t count=0;const auto *code=cruisn::exotica_bootstrap::signatures(count);
+					std::vector<uint32_t> proof={0x31534258,1,m_bootstrap_frame,frame,m_bootstrap_base,uint32_t(count),1201,
+						0xbbc9,0xbbd5,uint32_t(address),ar0,value,bits,read(0x10a8),read(0x10a9),0};
+					for(size_t i=0;i<count;++i){proof.push_back(code[i].first);proof.push_back(read(code[i].first));}
+					for(uint32_t i=0;i<1200;++i)proof.push_back(read(m_bootstrap_base+i*31));
+					proof.push_back(value); // incoming sentinel write has not committed yet
+					FILE *file=fopen("exotica-bootstrap.bin","wb");if(!file)fatalerror("Exotica bootstrap proof create\n");
+					const bool written=fwrite(proof.data(),sizeof(proof[0]),proof.size(),file)==proof.size();
+					if(fclose(file) || !written)fatalerror("Exotica bootstrap proof write\n");
+					m_bootstrap_ready=true;m_bootstrap_pending=false;m_bootstrap_ready_frame=frame;
+					fprintf(stderr,"MIDZ_BOOTSTRAP_READY begin=%u frame=%u base=%u links=1201\n",m_bootstrap_frame,frame,m_bootstrap_base);
+					m_bootstrap_count_tap.remove();m_bootstrap_tail_tap.remove();
+				});
+		});
+	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::bootstrap_exit,this));
+	fprintf(stderr,"MIDZ_BOOTSTRAP=1\n");
+}
+
+void crusnexo_state::bootstrap_exit()
+{
+	m_bootstrap_count_tap.remove();m_bootstrap_tail_tap.remove();
+	fprintf(stderr,"MIDZ_BOOTSTRAP_RESULT complete=%u frame=%u\n",unsigned(m_bootstrap_ready && !m_bootstrap_pending),m_bootstrap_ready_frame);
+}
+
 bool crusnexo_state::lifetime_scope()
 {
 	if(machine().side_effects_disabled())return false;
 	const auto frame=m_screen->frame_number();
 	if(frame<m_lifetime_first || frame>m_lifetime_last)return false;
 	if(!m_lifetime_started) {
-		const std::pair<uint32_t,uint32_t> signatures[]={
-			{0xbbf6,0x152010a8},{0xbbf9,0x152010a9},{0xbc64,0x152a10a8},{0xbc67,0x152010a9},
-			{0xbbc7,0x086004b0},{0xbbc8,0x152010a9},{0xbbcc,0x1549c000},{0xbbce,0x0269001f},
-			{0xbbd4,0x1540c000},{0xbbcb,0x087b04af},{0xbbcf,0x6400bbd2},{0xbbd0,0x1549c000},
-			{0xbbd1,0x08080009},{0xbbd2,0x0269001f},{0xb859,0x082267c4},{0xb8cb,0x0840041d},
-			{0x696f,0x152d046e},{0x6963,0x0820b47d}};
-		for(const auto &s:signatures)if(m_ram_base[s.first]!=s.second)fatalerror("Exotica lifetime code signature %x\n",s.first);
+		size_t count=0;const auto *signatures=cruisn::exotica_bootstrap::signatures(count);
+		for(size_t i=0;i<count;++i)if(m_ram_base[signatures[i].first]!=signatures[i].second)
+			fatalerror("Exotica lifetime code signature %x\n",signatures[i].first);
 		cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
 		if(!m_lifetimes.start(layout,true))fatalerror("Exotica lifetime initialization\n");
 		m_lifetime_initial_head=m_ram_base[0x10a8];m_lifetime_initial_count=m_ram_base[0x10a9];
