@@ -198,6 +198,7 @@ protected:
 	cruisn::usa_host::ModelCache m_usa_model_cache;
 	cruisn::offroad_host::Cache m_offroad_host_cache;
 	uint32_t m_offroad_host_multiplier = 1;
+	bool m_offroad_host_clip_admission = false;
 	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
 	uint32_t m_usa_far = 0, m_usa_max_index = 0;
 	bool m_usa_residency = false;
