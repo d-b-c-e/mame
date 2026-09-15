@@ -196,6 +196,11 @@ protected:
 		scene_observer_start();
 		lifetime_start();
 		endpoint_start();
+		if(const char *observe=std::getenv("MIDZ_SHUTDOWN_OBSERVE")) {
+			if(strcmp(observe,"1") || !m_bootstrap_scenes)fatalerror("Exotica shutdown observation requires verified scene startup\n");
+			machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::shutdown_observe,this));
+			fprintf(stderr,"MIDZ_SHUTDOWN_OBSERVE=1\n");
+		}
 	}
 
 	virtual void machine_reset() override
@@ -239,6 +244,7 @@ private:
 	uint64_t m_endpoint_commits=0,m_endpoint_consumed=0,m_endpoint_untracked=0;
 	uint64_t m_endpoint_prepared=0,m_endpoint_rejected=0,m_endpoint_saved=0,m_endpoint_bytes=0;
 
+	void shutdown_observe();
 	void bootstrap_start();
 	void bootstrap_exit();
 	void bootstrap_scene(uint32_t address,uint32_t value,uint32_t mask);
@@ -489,6 +495,17 @@ void crusnexo_state::lifetime_emit(char event,uint32_t slot,uint64_t generation,
 // Observe the first completed pool rebuild independently of the finite lifetime
 // window. Boot RAM loading may touch the same addresses; require actual guest
 // instructions, code signatures and every rebuilt link. No renderer activation.
+// Capture the actual pre-teardown ownership state. An interrupted scene is not
+// a completed capture, and this observer neither drains nor discards work.
+void crusnexo_state::shutdown_observe()
+{
+	fprintf(stderr,"MIDZ_SHUTDOWN_CPU frame=%llu scene_open=%u loading=%u pool_pending=%u source_pending=%u models_pending=%u endpoints_pending=%u fence_pending=%u waiting_pending=%u compose_pending=%u prepared=%llu matched=%llu requested=%llu completed=%llu\n",
+		(unsigned long long)m_screen->frame_number(),unsigned(m_scene_open),unsigned(m_scene_loading!=0),unsigned(m_lifetime_pending.kind!=0),
+		unsigned(m_lifetime_owner_slot!=0),unsigned(m_scene_pending.size()),unsigned(m_endpoint_pending.size()),unsigned(m_scene_fence.pending()),
+		unsigned(m_handover_pending.pending()),unsigned(m_compose_scene!=0),(unsigned long long)m_scene_prepared,(unsigned long long)m_scene_matched,
+		(unsigned long long)m_scene_fence_requests,(unsigned long long)m_scene_fence_completed);
+}
+
 void crusnexo_state::bootstrap_start()
 {
 	const char *mode=std::getenv("MIDZ_BOOTSTRAP");if(!mode)return;

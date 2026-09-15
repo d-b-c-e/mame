@@ -2139,13 +2139,15 @@ void thread_main()
 			Sleep(4);   // ~4 ms pace: plenty of presents, no busy spin
 	}
 
+	const bool shutdown_render_failed=private_failed || mirror_failed || stream_failed || s_drops_quad.load() || s_drops_state.load();
+	bool shutdown_writer_failed=false;
 	if(endpoint_log) {
 		const bool good=!endpoint_log.error();const int closed=endpoint_log.close();
 		fprintf(stderr,"MIDZ_ENDPOINT_GPU_RESULT complete=%u pairs=%llu\n",
 			unsigned(!private_failed && good && !closed && endpoint_order.complete()),(unsigned long long)endpoint_pairs);
 	}
 	if(mirror_log) {
-		const auto stats=mirror_writer.finish();
+		const auto stats=mirror_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;
 		const int closed=mirror_log.close();
 		if(stats.failed || stats.rejected || stats.submitted!=stats.written || stats.written!=4*mirror_samples ||
 			!depth_mirror.snapshots.empty() || mirror_previous!=depth_mirror.last || closed)mirror_failed=true;
@@ -2158,7 +2160,7 @@ void thread_main()
 			(unsigned long long)stats.waits,(unsigned long long)stats.wait_us);
 	}
 	if(envi("MIDZ_HOST_FUTURE",nullptr,0)) {
-		const auto stats=future_writer.finish();const int closed=future_log?future_log.close():-1;
+		const auto stats=future_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;const int closed=future_log?future_log.close():-1;
 		const bool complete=!private_failed && future_packets && future_packets+(envi("MIDZ_HOST_HANDOVER",nullptr,0)==2?waiting_packets:0)+(compose?margin_packets:0)==private_packets && !closed &&
 			stats.submitted==4*future_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
 		fprintf(stderr,"MIDZ_HOST_FUTURE_GPU_RESULT complete=%u scenes=%llu quads=%llu snapshots=%llu written=%llu failed=%llu rejected=%llu\n",
@@ -2166,7 +2168,7 @@ void thread_main()
 			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
 	}
 	if(envi("MIDZ_HOST_HANDOVER",nullptr,0)==2) {
-		const auto stats=waiting_writer.finish();const int closed=waiting_log?waiting_log.close():-1;
+		const auto stats=waiting_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;const int closed=waiting_log?waiting_log.close():-1;
 		const bool complete=!private_failed && waiting_packets && waiting_packets==future_packets && private_late_scene==private_scene &&
 			(!compose || (private_waiting_scene==private_scene && margin_packets==future_packets)) && !closed &&
 			stats.submitted==4*waiting_snapshots && stats.written==stats.submitted && !stats.failed && !stats.rejected;
@@ -2175,7 +2177,7 @@ void thread_main()
 			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
 	}
 	if(depth_mirror.stream_frame) {
-		const auto stats=stream_writer.finish();
+		const auto stats=stream_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;
 		const bool complete=stream_complete && !stream_failed && !stream_active && stats.submitted==3 && stats.written==3 && !stats.failed && !stats.rejected;
 		fprintf(stderr,"MIDZ_DEPTH_STREAM_RESULT complete=%u frame=%u commands=%llu bytes=%llu written=%llu failed=%llu rejected=%llu\n",
 			unsigned(complete),depth_mirror.stream_frame,(unsigned long long)stream_count,(unsigned long long)stream_bytes,
@@ -2185,7 +2187,7 @@ void thread_main()
 	if(mirror_color)gl.DeleteTextures(1,&mirror_color);
 	if(mirror_depth)gl.DeleteTextures(1,&mirror_depth);
 	if(margin_log) {
-		const auto stats=margin_writer.finish();
+		const auto stats=margin_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;
 		if(stats.failed || stats.rejected || stats.submitted!=stats.written)private_failed=true;
 		fprintf(stderr,"MIDZ_HOST_ACTIVE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu waits=%llu wait_us=%llu\n",
 			(unsigned long long)stats.submitted,(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected,
@@ -2206,6 +2208,12 @@ void thread_main()
 	if(private_wave_tex)gl.DeleteTextures(1,&private_wave_tex);
 	if(private_palette_tex)gl.DeleteTextures(1,&private_palette_tex);
 	const auto capture_stats = snapshot_writer.finish();
+	if(envi("MIDZ_SHUTDOWN_OBSERVE",nullptr,0)==1) {
+		fprintf(stderr,"MIDZ_SHUTDOWN_GPU frame=%u endpoint_pending=%u material_pending=%u failed=%u writer_failed=%u\n",
+			completed_frame,unsigned(!endpoint_order.complete()),unsigned(private_scene!=private_late_scene || (compose && private_scene!=private_waiting_scene)),
+			unsigned(shutdown_render_failed || private_failed),
+			unsigned(shutdown_writer_failed || capture_stats.failed || capture_stats.rejected || capture_stats.submitted!=capture_stats.written));
+	}
 	if (snapdir) {
 		std::fprintf(stderr, "MIDZ_CAPTURE_WRITER submitted=%llu written=%llu failed=%llu rejected=%llu peak_bytes=%llu write_total_us=%llu write_max_us=%llu drain_us=%llu paced=%u waits=%llu wait_us=%llu\n",
 			(unsigned long long)capture_stats.submitted, (unsigned long long)capture_stats.written,
@@ -2288,6 +2296,9 @@ void stop()
 	s_stopz.store(true);
 	if (s_thread.joinable())
 		s_thread.join();
+	if(envi("MIDZ_SHUTDOWN_OBSERVE",nullptr,0)==1)
+		fprintf(stderr,"MIDZ_SHUTDOWN_JOIN written=%llu read=%llu joined=1\n",
+			(unsigned long long)s_rw.load(),(unsigned long long)s_rr.load());
 	s_on.store(false);
 }
 
