@@ -914,12 +914,12 @@ static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 				int16_t(dma[7]), int16_t(dma[9]) };
 			dilate_rect(vx, vy, ix, iy, us, vs);
 		}
-		if(quads[q].coverage.far)
+		if(quads[q].coverage.far_limit)
 		{
 			std::array<double,4> depths;std::array<cruisn::vunit_far::Point,4> points;
 			for(unsigned i=0;i<4;++i)points[i]={{vx[i],vy[i]}};
 			if(!far_masks || !cruisn::vunit_far::decode(quads[q].coverage,depths) ||
-				!cruisn::vunit_far::coverage(points,depths,quads[q].coverage.far,(*far_masks)[q]))
+				!cruisn::vunit_far::coverage(points,depths,quads[q].coverage.far_limit,(*far_masks)[q]))
 				fatalerror("Invalid private far coverage geometry\n");
 			if(far_log && (fwrite(&quads[q],1,sizeof(QuadMsg),far_log)!=sizeof(QuadMsg) ||
 				fwrite((*far_masks)[q].data(),1,64,far_log)!=64))fatalerror("Far GPU receipt write failed\n");
@@ -3213,7 +3213,7 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 		if(depths)for(auto word:(*depths)[i])crossing|=cruisn::scenery::Float::load(word).fix()>=int32_t(m_host_far);
 		if(!crossing){live().write_msg(1,&h,8,quads[i].data(),32);continue;}
 		cruisn::vunit_far::Packet q{};q.frame=frame;q.pc=m_page_control;q.pad=m_host_layer;
-		std::copy(quads[i].begin(),quads[i].end(),q.dma);q.coverage.far=m_host_far;q.coverage.words=(*depths)[i];
+		std::copy(quads[i].begin(),quads[i].end(),q.dma);q.coverage.far_limit=m_host_far;q.coverage.words=(*depths)[i];
 		std::array<double,4> decoded;
 		if(!cruisn::vunit_far::decode(q.coverage,decoded))fatalerror("Invalid emitted far quad depths\n");
 		if(m_host_clip_log && fwrite(&q,1,sizeof(q),m_host_clip_log)!=sizeof(q))fatalerror("Far producer receipt write failed\n");
