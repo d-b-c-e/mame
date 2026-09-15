@@ -2296,7 +2296,8 @@ void stop()
 	s_stopz.store(true);
 	if (s_thread.joinable())
 		s_thread.join();
-	if(envi("MIDZ_SHUTDOWN_OBSERVE",nullptr,0)==1)
+	const char *shutdown_observe=std::getenv("MIDZ_SHUTDOWN_OBSERVE");
+	if(shutdown_observe && !strcmp(shutdown_observe,"1"))
 		fprintf(stderr,"MIDZ_SHUTDOWN_JOIN written=%llu read=%llu joined=1\n",
 			(unsigned long long)s_rw.load(),(unsigned long long)s_rr.load());
 	s_on.store(false);
