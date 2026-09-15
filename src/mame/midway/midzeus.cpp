@@ -738,7 +738,9 @@ void crusnexo_state::endpoint_start()
 		m_endpoint_early_log.print("scene,frame,records,packets,slot,epoch,generation,realm,section,source,first_sequence,first_frame,last_sequence,last_frame\n");
 	}
 	m_endpoint_log.open("exotica-endpoint-models.csv","w",m_journal_policy);
-	m_endpoint_inputs.open("exotica-endpoint-inputs.txt","w",m_journal_policy);
+	// Selected snapshots and first-rejection operands are bounded failure
+	// evidence, not a per-event journal. Keep them even when routine logs are quiet.
+	m_endpoint_inputs.open("exotica-endpoint-inputs.txt","w",cruisn::DiagnosticJournal::Policy::capture);
 	if(!m_endpoint_log || !m_endpoint_inputs)fatalerror("Cannot create endpoint observer files\n");
 	m_endpoint_log.buffer(nullptr,_IOFBF,65536);m_endpoint_inputs.buffer(nullptr,_IOFBF,65536);
 	m_endpoint_log.print("id,commit_frame,commit_time,device_frame,device_time,epoch,generation,slot,realm,section,source,end,opcode,base,flags,packed,status,quads,changed,snapshot\n");
