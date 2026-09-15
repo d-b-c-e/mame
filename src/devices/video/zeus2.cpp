@@ -4291,7 +4291,9 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	extra.tex_src = m_state->zeus_texbase;
 	int texmode = texdata & 0xffff;
 	extra.texwidth = 0x20 << ((texmode >> 2) & 3);
-	extra.solidcolor = m_state->m_zeusbase[0x00] & 0x7fff;
+	// Zeus2 takes solid fill from render R06, not the Zeus1 host color register.
+	// Upstream mamedev/mame#16122; keep the host model decoder synchronized.
+	extra.solidcolor = m_state->m_renderRegs[0x06] & 0x7fff;
 	// Flat solid-color fill: texmode bits 10-11 both set (same as Zeus 1)
 	extra.solid_enable = ((texmode & 0x0c00) == 0x0c00);
 	extra.transcolor = (texmode & 0x180) ? 0 : 0x100;
