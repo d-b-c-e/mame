@@ -607,6 +607,18 @@ static void telem_init(const char *spec, const char *game)
 }
 
 namespace mvgl {
+static std::thread s_owned_thread;
+static bool s_runtime_ready=false;
+static uint64_t s_runtime_pending=0, s_runtime_errors=0;
+static uint32_t s_runtime_completed=0;
+static bool continuous_runtime()
+{
+	cruisn::vunit_runtime::Policy policy;
+	if(!cruisn::vunit_runtime::select(std::getenv("MIDV_HOST_RUNTIME"),
+		[](const char *key){return std::getenv(key);},policy))fatalerror("Invalid V-Unit graphics runtime policy\n");
+	return cruisn::vunit_runtime::continuous(policy);
+}
+
 
 // teardown handshake: machine exit flags the GL thread down and waits for
 // its acknowledgement (see midvunit_base_state::mvgl_exit)
@@ -656,7 +668,10 @@ struct GL
 	void (WINAPI *Disable)(unsigned);
 	void (WINAPI *Scissor)(int, int, int, int);
 	void (WINAPI *ReadPixels)(int, int, int, int, unsigned, unsigned, void *);
-	unsigned (WINAPI *GetError)();
+	unsigned (WINAPI *GetErrorRaw)();
+	void (WINAPI *Finish)();
+	uint64_t errors=0;
+	unsigned GetError(){const unsigned error=GetErrorRaw();if(error)++errors;return error;}
 	// modern (via wglGetProcAddress)
 	uint (WINAPI *CreateShader)(unsigned);
 	void (WINAPI *ShaderSource)(uint, int, const char *const *, const int *);
@@ -720,7 +735,7 @@ struct GL
 		L(TexParameteri, "glTexParameteri") L(TexImage2D, "glTexImage2D")
 		L(TexSubImage2D, "glTexSubImage2D") L(PixelStorei, "glPixelStorei")
 		L(DrawArrays, "glDrawArrays") L(Enable, "glEnable")
-		L(Disable, "glDisable") L(Scissor, "glScissor") L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
+		L(Disable, "glDisable") L(Scissor, "glScissor") L(ReadPixels, "glReadPixels") L(GetErrorRaw, "glGetError") L(Finish, "glFinish")
 		L(CreateShader, "glCreateShader") L(ShaderSource, "glShaderSource")
 		L(CompileShader, "glCompileShader") L(GetShaderiv, "glGetShaderiv")
 		L(GetShaderInfoLog, "glGetShaderInfoLog") L(CreateProgram, "glCreateProgram")
@@ -1025,6 +1040,8 @@ static uint link(GL &gl, const char *vs, const char *fs)
 
 void thread_main()
 {
+	const bool runtime=continuous_runtime();
+	if(runtime)osd_printf_info("VUNIT_RUNTIME gpu=owned\n");
 	// every exit path must acknowledge shutdown or mvgl_exit stalls 1 s
 	struct DoneGuard { ~DoneGuard() { s_done.store(true); } } done_guard;
 	midv_live &lv = live();
@@ -1615,7 +1632,7 @@ void thread_main()
 		});
 	};
 
-	while (IsWindow(parent) && !s_stop.load())
+	while (IsWindow(parent) && (!s_stop.load() || (runtime && ring_load(lv.rpos)<ring_load(lv.wpos))))
 	{
 		if (InterlockedCompareExchange((volatile LONG *)(lv.base + 32), 0, 0))
 		{
@@ -2025,6 +2042,14 @@ void thread_main()
 		SwapBuffers(dc);
 		if(frame_complete)s_presented_frame.store(completed_frame);
 	}
+	if(runtime)
+	{
+		// Finish an already consumed partial batch without inventing a guest
+		// frame/presentation. The producer is stopped before this drain.
+		complete_run();flush_cpu();gl.Finish();gl.GetError();
+		s_runtime_pending=run.size();s_runtime_errors=gl.errors;
+		s_runtime_completed=completed_frame;s_runtime_ready=true;
+	}
 	const auto capture_stats = snapshot_writer.finish();
 	if(fade_metadata)
 	{
@@ -2079,7 +2104,10 @@ midv_live &live()
 	static bool gl_spawned = [&]() -> bool
 	{
 		if (s.enabled && std::getenv("MIDV_GL"))
-			std::thread(mvgl::thread_main).detach();
+			{
+				if(mvgl::continuous_runtime())mvgl::s_owned_thread=std::thread(mvgl::thread_main);
+				else std::thread(mvgl::thread_main).detach();
+			}
 		return true;
 	}();
 	(void)gl_spawned;
@@ -3129,6 +3157,22 @@ void midvunit_base_state::mvgl_exit()
 					unsigned(mvgl::s_presented_frame.load()>=target));
 			}
 		}
+	if(mvgl::continuous_runtime())
+	{
+		if(!mvgl::s_owned_thread.joinable())fatalerror("V-Unit runtime graphics worker did not start\n");
+		auto &lv=live();lv.flush_span();
+		mvgl::s_menu_pause.store(0);mvgl::s_stop.store(true);
+		const auto began=GetTickCount64();
+		while(!mvgl::s_done.load() && GetTickCount64()-began<10000)Sleep(5);
+		if(!mvgl::s_done.load())fatalerror("V-Unit runtime graphics shutdown timeout\n");
+		mvgl::s_owned_thread.join();
+		osd_printf_info("VUNIT_RUNTIME_GPU joined=1 ready=%u written=%llu read=%llu dropped=%llu failed=%u pending_quads=%llu gl_errors=%llu completed=%u presented=%u\n",
+			unsigned(mvgl::s_runtime_ready),(unsigned long long)ring_load(lv.wpos),(unsigned long long)ring_load(lv.rpos),
+			(unsigned long long)ring_load(lv.dropped),unsigned(InterlockedCompareExchange((volatile LONG *)(lv.base+32),0,0)!=0),
+			(unsigned long long)mvgl::s_runtime_pending,(unsigned long long)mvgl::s_runtime_errors,
+			mvgl::s_runtime_completed,mvgl::s_presented_frame.load());
+		return;
+	}
 	// POC: a detached GL thread that outlives the machine races teardown
 	// (msvcrt!memcpy AVs logged at roughly every second exit). Flag it down
 	// and acknowledge teardown. Diagnostic screenshots get a bounded longer

@@ -12,6 +12,7 @@
 
 #include "midwayic.h"
 #include "cruisn/world_future_sections.h"
+#include "cruisn/vunit_runtime.h"
 #include "cruisn/usa_future_sections.h"
 #include "cruisn/offroad_host_scenery.h"
 
@@ -111,6 +112,9 @@ protected:
 	void offroad_host_start();
 	void host_failure_start();
 	void host_bootstrap_start();
+	void host_runtime_start();
+	bool host_scene_allowed(uint64_t frame);
+	void host_scene_record(uint64_t frame,size_t quads);
 	void host_bootstrap_ready(uint64_t frame);
 	void host_prepare_failed(uint64_t frame, uint64_t cycles, uint32_t stage, const char *reason);
 	bool host_injected_failure(uint64_t frame, uint64_t cycles);
@@ -198,6 +202,8 @@ protected:
 	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr, *m_host_clip_log = nullptr;
 	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff, m_host_far = 80000;
 	bool m_host_bootstrap = false;
+	cruisn::vunit_runtime::Policy m_host_runtime = cruisn::vunit_runtime::Policy::capture;
+	uint64_t m_host_runtime_frame = 0, m_host_runtime_scenes = 0, m_host_runtime_quads = 0;
 	uint64_t m_host_bootstrap_frame = 0;
 	bool m_host_failure_original = false;
 	uint64_t m_host_failed_frame = 0;

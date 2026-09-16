@@ -89,8 +89,34 @@ void midvunit_base_state::machine_start()
 	world_host_start();
 	usa_host_start();
 	offroad_host_start();
-	host_failure_start();
 	host_bootstrap_start();
+	host_runtime_start();
+	host_failure_start();
+}
+
+void midvunit_base_state::host_runtime_start()
+{
+	if(!cruisn::vunit_runtime::select(std::getenv("MIDV_HOST_RUNTIME"),
+		[](const char *key){return std::getenv(key);},m_host_runtime))
+		fatalerror("Invalid V-Unit continuous runtime policy\n");
+	if(cruisn::vunit_runtime::continuous(m_host_runtime))
+	{
+		if(!m_host_bootstrap || m_host_mode!=2)fatalerror("V-Unit runtime requires verified scenery bootstrap\n");
+		osd_printf_info("VUNIT_RUNTIME cpu=continuous end=none\n");
+	}
+}
+
+bool midvunit_base_state::host_scene_allowed(uint64_t frame)
+{
+	if(cruisn::vunit_runtime::continuous(m_host_runtime) && !cruisn::vunit_runtime::representable(frame))
+		fatalerror("V-Unit runtime frame exceeds packet representation\n");
+	return !m_host_failed_frame && cruisn::vunit_runtime::within(m_host_runtime,frame,m_host_first,m_host_last,m_host_bootstrap);
+}
+
+void midvunit_base_state::host_scene_record(uint64_t frame,size_t quads)
+{
+	if(!cruisn::vunit_runtime::continuous(m_host_runtime))return;
+	m_host_runtime_frame=frame;++m_host_runtime_scenes;m_host_runtime_quads+=quads;
 }
 
 // Candidate-only startup policy. Every scene still runs the complete code,
@@ -112,7 +138,7 @@ void midvunit_base_state::host_bootstrap_start()
 void midvunit_base_state::host_bootstrap_ready(uint64_t frame)
 {
 	if(!m_host_bootstrap || m_host_bootstrap_frame)return;
-	if(!frame || frame>m_host_last || m_ram_base.bytes()!=0x80000)
+	if(!frame || cruisn::vunit_runtime::after(m_host_runtime,frame,m_host_last) || m_ram_base.bytes()!=0x80000)
 		fatalerror("V-Unit bootstrap invalid scene frame/RAM span\n");
 	// Explicit little-endian bytes match the independent saved-scene codec.
 	// Ordinary RAM reads bypass guest cycle handlers. Fast RAM reads suppress taps.
@@ -155,7 +181,8 @@ void midvunit_base_state::host_failure_start()
 		char *end=nullptr;errno=0;
 		if(!*inject || *inject=='-')fatalerror("Invalid host injected failure frame\n");
 		const unsigned long frame=strtoul(inject,&end,10);
-		if(errno || *end || frame<m_host_first || frame>m_host_last)fatalerror("Host injected failure outside scene interval\n");
+		if(errno || *end || (!m_host_bootstrap && frame<m_host_first) ||
+			!cruisn::vunit_runtime::representable(frame) || cruisn::vunit_runtime::after(m_host_runtime,frame,m_host_last))fatalerror("Host injected failure outside scene interval\n");
 		m_host_inject_frame=uint32_t(frame);
 	}
 	osd_printf_info("VUNIT_HOST_FAILURE_POLICY original=%u inject=%u\n",unsigned(m_host_failure_original),m_host_inject_frame);
@@ -249,7 +276,7 @@ void midvunit_base_state::offroad_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x1bf9)return;
 			const uint64_t frame=m_screen->frame_number();
-			if((!m_host_bootstrap && frame<m_host_first) || frame>m_host_last || m_host_failed_frame)return;
+			if(!host_scene_allowed(frame))return;
 			const auto cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			auto &space=m_maincpu->space(AS_PROGRAM);
@@ -283,6 +310,7 @@ void midvunit_base_state::offroad_host_start()
 			const auto logged=std::chrono::steady_clock::now();
 			if(m_host_mode==2)world_host_submit(quads);
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("Off Road host inspection changed guest cycles\n");
+			host_scene_record(frame,quads.size());
 			const auto submitted=std::chrono::steady_clock::now();
 			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
 			const unsigned definitions=m_host_future && !scene.pretrack && !scene.deferred ? unsigned(m_offroad_host_cache.future.value.sources.size())+scene.partial_recovered:0;
@@ -371,7 +399,7 @@ void midvunit_base_state::usa_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x81)return;
 			const uint64_t frame=m_screen->frame_number();
-			if((!m_host_bootstrap && frame<m_host_first) || frame>m_host_last || m_host_failed_frame)return;
+			if(!host_scene_allowed(frame))return;
 			const auto cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			if(!cruisn::usa_host::code_matches(m_ram_base,m_ram_base.bytes()/4))
@@ -417,6 +445,7 @@ void midvunit_base_state::usa_host_start()
 			const auto logged=std::chrono::steady_clock::now();
 			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr);
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("USA host inspection changed guest cycles\n");
+			host_scene_record(frame,quads.size());
 			const auto submitted=std::chrono::steady_clock::now();
 			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
 			fprintf(m_host_scene_log,"%llu,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
@@ -544,7 +573,7 @@ void midvunit_base_state::world_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6a)return;
 			uint64_t frame=m_screen->frame_number();
-			if((!m_host_bootstrap && frame<m_host_first) || frame>m_host_last || m_host_failed_frame)return;
+			if(!host_scene_allowed(frame))return;
 			const auto guest_cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,m_host_revision) ||
@@ -619,6 +648,7 @@ void midvunit_base_state::world_host_start()
 			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr,m_host_fade_metadata?&policies:nullptr,active_roads?&margins:nullptr);
 			if(m_maincpu->total_cycles()!=guest_cycles)
 				fatalerror("World host inspection changed emulated CPU cycles\n");
+			host_scene_record(frame,quads.size());
 			const auto submitted=std::chrono::steady_clock::now();
 			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
 			// The current scene row cannot include the duration of writing itself.
@@ -638,6 +668,10 @@ void midvunit_base_state::world_host_start()
 
 void midvunit_base_state::world_host_exit()
 {
+	if(cruisn::vunit_runtime::continuous(m_host_runtime))
+		osd_printf_info("VUNIT_RUNTIME_CPU frame=%llu scenes=%llu quads=%llu failed=%llu\n",
+			(unsigned long long)m_host_runtime_frame,(unsigned long long)m_host_runtime_scenes,
+			(unsigned long long)m_host_runtime_quads,(unsigned long long)m_host_failed_frame);
 	const bool fade=cruisn::close_journal(m_host_fade_log);
 	const bool scene=cruisn::close_journal(m_host_scene_log);
 	const bool quads=cruisn::close_journal(m_host_quad_log);
