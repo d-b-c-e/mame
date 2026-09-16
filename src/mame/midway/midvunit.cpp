@@ -99,9 +99,11 @@ void midvunit_base_state::host_bootstrap_start()
 	const char *mode=std::getenv("MIDV_HOST_BOOTSTRAP");
 	if(!mode)return;
 	const char *gl=std::getenv("MIDV_GL"), *ffb=std::getenv("MIDV_FFB");
-	if(strcmp(mode,"1") || strcmp(machine().system().name,"crusnusa") ||
+	const char *rom=machine().system().name;
+	const bool supported=!strcmp(rom,"crusnusa") || !strcmp(rom,"crusnwld24") || !strcmp(rom,"crusnwld") || !strcmp(rom,"offroadc");
+	if(strcmp(mode,"1") || !supported ||
 		m_host_mode!=2 || !m_host_future || m_host_layer!=3 || !gl || strcmp(gl,"1") || !ffb || strcmp(ffb,"0"))
-		fatalerror("V-Unit bootstrap requires USA future draw, both layers, live GL and physical FFB0\n");
+		fatalerror("V-Unit bootstrap requires supported future draw, both layers, live GL and physical FFB0\n");
 	m_host_bootstrap=true;
 	osd_printf_info("VUNIT_BOOTSTRAP scenes=1 first=actual last=%u\n",m_host_last);
 }
@@ -129,7 +131,10 @@ void midvunit_base_state::host_bootstrap_ready(uint64_t frame)
 		if(!written || !closed)fatalerror("Cannot write/close V-Unit bootstrap operands\n");
 	}
 	m_host_bootstrap_frame=frame;
-	osd_printf_info("VUNIT_BOOTSTRAP_READY frame=%llu pc=81 address=40\n",(unsigned long long)frame);
+	const uint32_t address=m_host_revision?cruisn::world_host::layout(m_host_revision)->scene:
+		!strcmp(machine().system().name,"crusnusa")?0x40:0x111f4;
+	osd_printf_info("VUNIT_BOOTSTRAP_READY frame=%llu pc=%x address=%x\n",(unsigned long long)frame,
+		unsigned(m_maincpu->state_int(TMS320C3X_PC)),address);
 }
 
 // Only read-only preparation failures BEFORE world_host_submit can use this
@@ -244,7 +249,7 @@ void midvunit_base_state::offroad_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x1bf9)return;
 			const uint64_t frame=m_screen->frame_number();
-			if(frame<m_host_first || frame>m_host_last || m_host_failed_frame)return;
+			if((!m_host_bootstrap && frame<m_host_first) || frame>m_host_last || m_host_failed_frame)return;
 			const auto cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			auto &space=m_maincpu->space(AS_PROGRAM);
@@ -261,6 +266,7 @@ void midvunit_base_state::offroad_host_start()
 			if(host_injected_failure(frame,cycles))return;
 			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,false,m_offroad_host_recover_partial))
 			{host_prepare_failed(frame,cycles,3,"Off Road host scene/model/material guard failed");return;}
+			host_bootstrap_ready(frame);
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;
@@ -538,13 +544,13 @@ void midvunit_base_state::world_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x6a)return;
 			uint64_t frame=m_screen->frame_number();
-			if(frame<m_host_first || frame>m_host_last || m_host_failed_frame)return;
+			if((!m_host_bootstrap && frame<m_host_first) || frame>m_host_last || m_host_failed_frame)return;
 			const auto guest_cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			if(!cruisn::world_distance::code_matches(m_ram_base,m_ram_base.bytes()/4,80000,m_host_revision) ||
-				!cruisn::world_host::scene_matches([&](uint32_t p){return m_ram_base[p];},m_host_revision))
+				!cruisn::world_host::scene_matches([&](uint32_t p){return m_ram_base[p];},m_host_revision,m_host_bootstrap))
 				fatalerror("World host scenery exact-revision/stock-distance guard failed\n");
-			if(cruisn::world_host::track_reset([&](uint32_t p){return m_ram_base[p];},m_host_revision))
+			if(cruisn::world_host::track_reset([&](uint32_t p){return m_ram_base[p];},m_host_revision,m_host_bootstrap))
 			{
 				m_host_future_cache.clear();
 				return;
@@ -581,6 +587,7 @@ void midvunit_base_state::world_host_start()
 			if(host_injected_failure(frame,guest_cycles))return;
 			if(!cruisn::world_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_roads,m_host_revision,m_host_full_roads,m_host_far_coverage))
 			{host_prepare_failed(frame,guest_cycles,3,"World host scenery pointer/model/projection guard failed");return;}
+			host_bootstrap_ready(frame);
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			std::vector<std::array<uint32_t,4>> depths;
@@ -1123,7 +1130,7 @@ void midvplus_state::machine_start()
 }
 
 
-// ── POC code patcher (env-gated, ROM files untouched) ───────────────────
+// â”€â”€ POC code patcher (env-gated, ROM files untouched) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // The whole TMS320C31 program is copied maindata ROM -> program RAM at each
 // reset; we overlay word patches on that RAM copy, so nothing on disk is
 // modified (GPL/legal bright line intact). MIDV_PATCH=<file>, one patch per
