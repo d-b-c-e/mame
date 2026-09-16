@@ -8,6 +8,7 @@
 #include "emu.h"
 #include "../../mame/midway/cruisn/exotica_journal_policy.h"
 #include "../../mame/midway/cruisn/exotica_runtime.h"
+#include "../../mame/midway/cruisn/exotica_reset.h"
 #include "../../mame/midway/cruisn/diagnostic_count.h"
 #include "zeus2.h"
 #include "../../mame/midway/cruisn/zeus_render_policy.h"
@@ -454,6 +455,7 @@ struct GL
 	void (WINAPI *ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
 	void (WINAPI *BlendFunc)(unsigned, unsigned);
 	uint (WINAPI *CreateShader)(unsigned);
+	void (WINAPI *DeleteProgram)(uint);
 	void (WINAPI *ShaderSource)(uint, int, const char *const *, const int *);
 	void (WINAPI *CompileShader)(uint);
 	void (WINAPI *GetShaderiv)(uint, unsigned, int *);
@@ -518,7 +520,7 @@ struct GL
 		L(ReadPixels, "glReadPixels") L(GetError, "glGetError")
 		L(DepthFunc, "glDepthFunc") L(DepthMask, "glDepthMask")
 		L(ColorMask, "glColorMask") L(BlendFunc, "glBlendFunc")
-		L(CreateShader, "glCreateShader") L(ShaderSource, "glShaderSource")
+		L(CreateShader, "glCreateShader") L(DeleteProgram, "glDeleteProgram") L(ShaderSource, "glShaderSource")
 		L(CompileShader, "glCompileShader") L(GetShaderiv, "glGetShaderiv")
 		L(GetShaderInfoLog, "glGetShaderInfoLog") L(CreateProgram, "glCreateProgram")
 		L(AttachShader, "glAttachShader") L(LinkProgram, "glLinkProgram")
@@ -1014,7 +1016,8 @@ void thread_main()
 	uint private_wave_tex=0,private_palette_tex=0;
 	uint64_t private_scene=0,private_packets=0,private_snapshots=0;
 	uint64_t private_late_scene=0,margin_packets=0,margin_quads=0;
-	uint64_t private_waiting_scene=0;
+	uint64_t private_waiting_scene=0,reset_count=0;
+	uint reset_seed_program=0;
 	const bool compose=envi("MIDZ_HOST_COMPOSE",nullptr,0)==1;
 	uint margin_depth_tex=0,margin_fbo=0;
 	cruisn::DiagnosticJournal margin_log;
@@ -1746,7 +1749,7 @@ void thread_main()
 			// Finish before changing palettes/uploads/pages or presenting. Stored
 			// tiles retain the current material only within this uninterrupted span.
 			if (sky_enabled && hdr[0]!=1 && hdr[0]!=7 && hdr[0]!=11 && !sky_quads.empty()) finish_sky();
-			if(retire_frame && hdr[0]>=7 && hdr[0]<=12) {
+			if(retire_frame && hdr[0]>=7 && hdr[0]<=13) {
 				private_failed=true;s_stopz.store(true);zlogf("auxiliary submission after private retirement");break;
 			}
 			if(endpoint_order.pending() && hdr[0]!=1) {
@@ -1899,7 +1902,40 @@ void thread_main()
 					zlogf("private material validation/upload failed after %llu packets",(unsigned long long)private_packets);
 				}
 				break;
-			case 12:
+            case 13:
+            {
+                cruisn::exotica_reset::Request request;
+                if(!continuous || !future_present || !compose ||
+                    !cruisn::exotica_reset::decode(rec.data(),rec.size(),request) ||
+                    !cruisn::exotica_reset::gpu_matches(request,reset_count,completed_frame,private_scene,
+                        private_late_scene,private_waiting_scene,private_image?private_image->generation():0,
+                        private_image?private_image->image_hash():0,endpoint_order.complete())) {
+                    private_failed=true;s_stopz.store(true);zlogf("private reset ownership rejected");break;
+                }
+                flush();
+                if(!reset_seed_program)reset_seed_program=zlink(gl,cruisn::exotica_reset::seed_vertex,cruisn::exotica_reset::seed_fragment);
+                if(!reset_seed_program || gl.GetError()) {
+                    private_failed=true;s_stopz.store(true);zlogf("private reset seed setup failed");break;
+                }
+                gl.BindFramebuffer(FRAMEBUFFER,mirror_fbo);gl.Viewport(0,0,fw,fh);
+                gl.Disable(GLSCISSOR_TEST);gl.Disable(GLBLEND);gl.Enable(GLDEPTH_TEST);
+                gl.DepthFunc(0x0207 /*ALWAYS*/);gl.DepthMask(true);gl.ColorMask(true,true,true,true);
+                gl.UseProgram(reset_seed_program);gl.BindVertexArray(vao_empty);
+                gl.ActiveTexture(TEXTURE0+6);gl.BindTexture(0x0de1,fbTex);
+                gl.ActiveTexture(TEXTURE0+7);gl.BindTexture(0x0de1,depthTex);
+                gl.Uniform1i(gl.GetUniformLocation(reset_seed_program,"original_color"),6);
+                gl.Uniform1i(gl.GetUniformLocation(reset_seed_program,"original_depth"),7);
+                gl.DrawArrays(0x0004 /*TRIANGLES*/,0,3);gl.ActiveTexture(TEXTURE0);
+                if(gl.GetError()) {
+                    private_failed=true;s_stopz.store(true);zlogf("private reset target seed failed");break;
+                }
+                ++reset_count;
+                fprintf(stderr,"MIDZ_RESET_GPU index=%llu frame=%u scene=%llu generation=%llu hash=%016llx\n",
+                    (unsigned long long)request.index,request.frame,(unsigned long long)request.scene,
+                    (unsigned long long)request.generation,(unsigned long long)request.hash);
+                break;
+            }
+            case 12:
 			{
 				std::array<uint32_t,4> request{};
 				if(rec.size()==sizeof(request))std::memcpy(request.data(),rec.data(),sizeof(request));
@@ -2191,7 +2227,10 @@ void thread_main()
 			(unsigned long long)stats.written,(unsigned long long)stats.failed,(unsigned long long)stats.rejected);
 	}
 	if(mirror_fbo)gl.DeleteFramebuffers(1,&mirror_fbo);
-	if(mirror_color)gl.DeleteTextures(1,&mirror_color);
+	if(reset_count)fprintf(stderr,"MIDZ_RESET_GPU_RESULT complete=%u count=%llu\n",
+        unsigned(!private_failed && !mirror_failed && endpoint_order.complete()),(unsigned long long)reset_count);
+    if(reset_seed_program)gl.DeleteProgram(reset_seed_program);
+    if(mirror_color)gl.DeleteTextures(1,&mirror_color);
 	if(mirror_depth)gl.DeleteTextures(1,&mirror_depth);
 	if(margin_log) {
 		const auto stats=margin_writer.finish();shutdown_writer_failed|=stats.failed || stats.rejected || stats.submitted!=stats.written;
@@ -2322,6 +2361,18 @@ bool zeus2_device::midz_host_future(const uint8_t *data, size_t size)
 		return mzgl::ring_push2(9,data,uint32_t(size),nullptr,0);
 #endif
 	return false;
+}
+
+bool zeus2_device::midz_host_reset(const void *data,size_t size)
+{
+#ifdef _WIN32
+    const char *runtime=std::getenv("MIDZ_RUNTIME"),*ffb=std::getenv("MIDV_FFB");
+    cruisn::exotica_reset::Request request;
+    if(midz_live && midz_fifo_empty() && runtime && !strcmp(runtime,"continuous") &&
+        ffb && !strcmp(ffb,"0") && cruisn::exotica_reset::decode(data,size,request))
+        return mzgl::ring_push2(13,data,uint32_t(size),nullptr,0);
+#endif
+    return false;
 }
 
 bool zeus2_device::midz_host_retire(uint32_t frame,uint64_t scene)

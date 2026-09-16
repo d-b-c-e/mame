@@ -31,6 +31,7 @@ The Grid         v1.2   10/18/2000
 #include "cruisn/diagnostic_count.h"
 #include "cruisn/exotica_bootstrap.h"
 #include "cruisn/exotica_runtime.h"
+#include "cruisn/exotica_reset.h"
 #include "cruisn/motor_signal.h"
 #include "cruisn/hud_drivetrain.h"
 #include "cruisn/exotica_visibility.h"
@@ -209,8 +210,11 @@ protected:
 
 	virtual void machine_reset() override
 	{
-		if(m_lifetime_started)fatalerror("Exotica lifetime diagnostic cannot cross machine reset\n");
-		if(m_scene_fence_requests)fatalerror("Exotica command-fence diagnostic cannot cross machine reset\n");
+		if(continuous() && renderer_frame())runtime_reset();
+        else {
+            if(m_lifetime_started)fatalerror("Exotica lifetime diagnostic cannot cross machine reset\n");
+            if(m_scene_fence_requests)fatalerror("Exotica command-fence diagnostic cannot cross machine reset\n");
+        }
 		midzeus2_state::machine_reset();
 		visibility_reset();
 	}
@@ -259,6 +263,10 @@ private:
 	}
 	void shutdown_observe();
 	void bootstrap_start();
+    void bootstrap_arm();
+    void runtime_reset();
+    uint64_t m_reset_count=0,m_reset_ready=0,m_reset_scenes=0;
+    uint32_t m_bootstrap_initial_ready=0;
 	void bootstrap_exit();
 	void bootstrap_scene(uint32_t address,uint32_t value,uint32_t mask);
 	bool m_bootstrap_scenes=false,m_bootstrap_scene_started=false;
@@ -540,7 +548,60 @@ void crusnexo_state::bootstrap_start()
 			{"MIDZ_MODEL_ENDPOINT","2"},{"MIDZ_ENDPOINT_EARLY","1"},{"MIDZ_ENDPOINT_MARKED","1"},{"MIDZ_DEPTH_FIRST","2"}};
 		for(const auto &kv:required) {const char *v=std::getenv(kv.first);if(!v || strcmp(v,kv.second))fatalerror("Exotica bootstrap scene setting %s\n",kv.first);}
 	}
-	m_bootstrap_count_tap=m_maincpu->space(AS_PROGRAM).install_write_tap(0x10a9,0x10a9,"exotica_bootstrap_count",
+	bootstrap_arm();
+    machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::bootstrap_exit,this));
+    fprintf(stderr,"MIDZ_BOOTSTRAP=%u\n",m_bootstrap_scenes?3:(m_bootstrap_lifetimes?2:1));
+}
+
+// Reset only at an independently checked quiescent boundary. Cumulative
+// counters and material generations survive; source identities do not.
+void crusnexo_state::runtime_reset()
+{
+    const uint32_t frame=renderer_frame();
+    const bool pending=m_scene_open || m_scene_armed || m_scene_busy || m_scene_loading ||
+        m_lifetime_pending.kind || m_lifetime_owner_slot || !m_scene_pending.empty() ||
+        !m_endpoint_pending.empty() || m_endpoint_owners.pending() || m_scene_fence.pending() ||
+        m_handover_pending.pending() || m_handover_generation || m_compose_scene || m_bootstrap_pending ||
+        !m_zeus->midz_fifo_empty() || m_endpoint_commits!=m_endpoint_consumed ||
+        m_handover_completed!=m_waiting_scenes;
+    if(!continuous() || !m_bootstrap_scenes || !m_bootstrap_scene_started || m_scene_failed_scene ||
+        m_reset_count!=m_reset_ready || m_reset_count!=m_reset_scenes ||
+        !cruisn::exotica_reset::quiescent(unsigned(pending),m_scene_prepared,m_scene_matched,
+            m_scene_fence_requests,m_scene_fence_completed,m_waiting_scenes,m_active_scenes,m_compose_completed) ||
+        m_reset_count==std::numeric_limits<uint64_t>::max())
+        fatalerror("Exotica reset requires quiescent continuous renderer\n");
+    const auto generation=m_scene_material_image->generation();
+    const cruisn::exotica_reset::Request request{frame,m_reset_count+1,m_scene_fence_scene,
+        generation,generation?m_scene_material_image->image_hash():0};
+    const auto wire=cruisn::exotica_reset::encode(request);
+    if(!cruisn::exotica_reset::valid(request) || !m_zeus->midz_host_reset(wire.data(),sizeof(wire)))
+        fatalerror("Exotica reset boundary queue rejected\n");
+    // A reset invalidates all prior guest allocations before RAM is reloaded.
+    if(m_lifetimes.epoch()) {
+        cruisn::scenery_lifetimes::Layout layout{0x1000,0x40000-31,4096};
+        if(!m_lifetimes.reset(layout) || !m_endpoint_owners.reset(m_lifetimes.epoch()) ||
+            !m_endpoint_admissions.reset(m_lifetimes.epoch()))
+            fatalerror("Exotica reset source epoch rejected\n");
+        lifetime_emit('M',0,0,0,{},frame,0);
+    }
+    ++m_reset_count;m_lifetime_owners.clear();m_lifetime_started=false;
+    m_lifetime_initial_head=0;m_lifetime_initial_count=0;m_lifetime_pool_base=0;
+    m_endpoint_active_slots.clear();m_compose_owners.clear();m_compose_sealed_owners.clear();
+    m_active_capture.clear();m_active_submitted.clear();m_active_sealed={};
+    m_active_seed_scene=0;m_active_sealed_scene=0;m_scene_fence_selected=false;
+    if(m_scene_source_cache)m_scene_source_cache->invalidate();
+    m_bootstrap_count_tap.remove();m_bootstrap_tail_tap.remove();
+    m_bootstrap_ready=false;m_bootstrap_pending=false;m_bootstrap_scene_started=false;
+    m_bootstrap_base=0;m_bootstrap_frame=0;m_bootstrap_ready_frame=0;m_bootstrap_time=0;
+    fprintf(stderr,"MIDZ_RESET_QUEUED index=%llu frame=%u scene=%llu generation=%llu hash=%016llx epoch=%llu\n",
+        (unsigned long long)request.index,frame,(unsigned long long)request.scene,
+        (unsigned long long)request.generation,(unsigned long long)request.hash,(unsigned long long)m_lifetimes.epoch());
+    bootstrap_arm();
+}
+
+void crusnexo_state::bootstrap_arm()
+{
+    m_bootstrap_count_tap=m_maincpu->space(AS_PROGRAM).install_write_tap(0x10a9,0x10a9,"exotica_bootstrap_count",
 		[this](offs_t,uint32_t &data,uint32_t mask) {
 			if(machine().side_effects_disabled() || m_bootstrap_ready || m_maincpu->state_int(TMS320C3X_PC)!=0xbbc9)return;
 			auto read=[this](uint32_t at){return uint32_t(m_ram_base[at]);};
@@ -565,29 +626,39 @@ void crusnexo_state::bootstrap_start()
 					for(size_t i=0;i<count;++i){proof.push_back(code[i].first);proof.push_back(read(code[i].first));}
 					for(uint32_t i=0;i<1200;++i)proof.push_back(read(m_bootstrap_base+i*31));
 					proof.push_back(value); // incoming sentinel write has not committed yet
-					FILE *file=fopen("exotica-bootstrap.bin","wb");if(!file)fatalerror("Exotica bootstrap proof create\n");
+					const auto proof_name=m_reset_count?"exotica-reset-"+std::to_string(m_reset_count)+"-bootstrap.bin":std::string("exotica-bootstrap.bin");
+                    FILE *file=fopen(proof_name.c_str(),"wb");if(!file)fatalerror("Exotica bootstrap proof create\n");
 					const bool written=fwrite(proof.data(),sizeof(proof[0]),proof.size(),file)==proof.size();
 					if(fclose(file) || !written)fatalerror("Exotica bootstrap proof write\n");
 					m_bootstrap_ready=true;m_bootstrap_pending=false;m_bootstrap_ready_frame=frame;
-					fprintf(stderr,"MIDZ_BOOTSTRAP_READY begin=%u frame=%u base=%u links=1201\n",m_bootstrap_frame,frame,m_bootstrap_base);
+					if(m_reset_count) {
+                        ++m_reset_ready;
+                        fprintf(stderr,"MIDZ_RESET_READY index=%llu begin=%u frame=%u base=%u links=1201\n",
+                            (unsigned long long)m_reset_count,m_bootstrap_frame,frame,m_bootstrap_base);
+                    } else {
+                        m_bootstrap_initial_ready=frame;
+                        fprintf(stderr,"MIDZ_BOOTSTRAP_READY begin=%u frame=%u base=%u links=1201\n",m_bootstrap_frame,frame,m_bootstrap_base);
+                    }
 					if(m_bootstrap_lifetimes) {
 						if(!m_lifetime_log || m_lifetime_started || m_lifetime_pending.kind || m_lifetime_owner_slot || (!continuous() && frame>m_lifetime_first))
 							fatalerror("Exotica bootstrap lifetime activation boundary\n");
 						m_lifetime_first=frame;
 						if(!lifetime_scope())fatalerror("Exotica bootstrap lifetime activation failed\n");
-						fprintf(stderr,"MIDZ_LIFETIME=1 first=%u last=%u\n",m_lifetime_first,m_lifetime_last);
-					}
+						if(!m_reset_count)fprintf(stderr,"MIDZ_LIFETIME=1 first=%u last=%u\n",m_lifetime_first,m_lifetime_last);
+                    }
 					m_bootstrap_count_tap.remove();m_bootstrap_tail_tap.remove();
 				});
 		});
-	machine().add_notifier(MACHINE_NOTIFY_EXIT,machine_notify_delegate(&crusnexo_state::bootstrap_exit,this));
-	fprintf(stderr,"MIDZ_BOOTSTRAP=%u\n",m_bootstrap_scenes?3:(m_bootstrap_lifetimes?2:1));
 }
 
 void crusnexo_state::bootstrap_exit()
 {
 	m_bootstrap_count_tap.remove();m_bootstrap_tail_tap.remove();
-	fprintf(stderr,"MIDZ_BOOTSTRAP_RESULT complete=%u frame=%u\n",unsigned(m_bootstrap_ready && !m_bootstrap_pending && (!m_bootstrap_scenes || m_bootstrap_scene_started)),m_bootstrap_ready_frame);
+	fprintf(stderr,"MIDZ_BOOTSTRAP_RESULT complete=%u frame=%u\n",unsigned(m_bootstrap_ready && !m_bootstrap_pending && (!m_bootstrap_scenes || m_bootstrap_scene_started)),m_bootstrap_initial_ready);
+    if(m_reset_count)fprintf(stderr,"MIDZ_RESET_RESULT complete=%u requested=%llu ready=%llu scenes=%llu\n",
+        unsigned(m_bootstrap_ready && !m_bootstrap_pending && m_bootstrap_scene_started &&
+            m_reset_count==m_reset_ready && m_reset_count==m_reset_scenes),
+        (unsigned long long)m_reset_count,(unsigned long long)m_reset_ready,(unsigned long long)m_reset_scenes);
 }
 
 void crusnexo_state::bootstrap_scene(uint32_t address,uint32_t value,uint32_t mask)
@@ -603,11 +674,17 @@ void crusnexo_state::bootstrap_scene(uint32_t address,uint32_t value,uint32_t ma
 		fatalerror("Exotica bootstrap scene boundary rejected\n");
 	const uint32_t proof[]={0x31534358,1,frame,m_bootstrap_ready_frame,0x67f6,address,value,mask,
 		0x67f5,m_ram_base[0x67f5],0x681f,m_ram_base[0x681f],0x6835,m_ram_base[0x6835],uint32_t(scene),uint32_t(scene>>32)};
-	FILE *file=fopen("exotica-bootstrap-scene.bin","wb");if(!file)fatalerror("Exotica bootstrap scene proof create\n");
+	const auto proof_name=m_reset_count?"exotica-reset-"+std::to_string(m_reset_count)+"-scene.bin":std::string("exotica-bootstrap-scene.bin");
+    FILE *file=fopen(proof_name.c_str(),"wb");if(!file)fatalerror("Exotica bootstrap scene proof create\n");
 	const bool written=fwrite(proof,1,sizeof(proof),file)==sizeof(proof);
 	if(fclose(file) || !written)fatalerror("Exotica bootstrap scene proof write\n");
 	m_scene_first=frame;m_endpoint_first=frame;m_endpoint_admit_from=frame;m_bootstrap_scene_started=true;
-	fprintf(stderr,"MIDZ_BOOTSTRAP_SCENE frame=%u scene=%llu\n",frame,(unsigned long long)scene);
+	if(m_reset_count) {
+        ++m_reset_scenes;
+        fprintf(stderr,"MIDZ_RESET_SCENE index=%llu frame=%u scene=%llu\n",(unsigned long long)m_reset_count,frame,(unsigned long long)scene);
+        return;
+    }
+    fprintf(stderr,"MIDZ_BOOTSTRAP_SCENE frame=%u scene=%llu\n",frame,(unsigned long long)scene);
 	fprintf(stderr,"MIDZ_HOST_SCENE=1 first=%u last=%u multiplier=%u snapshots=%u\n",m_scene_first,m_scene_last,m_scene_multiplier,unsigned(m_scene_snapshots.size()));
 	fprintf(stderr,"MIDZ_MODEL_ADMIT_FIRST=%u\n",m_endpoint_admit_from);
 	fprintf(stderr,"MIDZ_MODEL_ENDPOINT=%u first=%u last=%u snapshot=%u\n",m_endpoint_draw?2:1,m_endpoint_first,m_endpoint_last,m_endpoint_snapshot);
@@ -623,7 +700,8 @@ bool crusnexo_state::lifetime_scope()
 		for(size_t i=0;i<count;++i)if(m_ram_base[signatures[i].first]!=signatures[i].second)
 			fatalerror("Exotica lifetime code signature %x\n",signatures[i].first);
 		cruisn::scenery_lifetimes::Layout layout;layout.first=0x1000;layout.last=0x40000-31;layout.max_tracked=4096;
-		if(!m_lifetimes.start(layout,!m_bootstrap_lifetimes))fatalerror("Exotica lifetime initialization\n");
+		if(m_lifetimes.epoch() ? !m_reset_count : !m_lifetimes.start(layout,!m_bootstrap_lifetimes))
+            fatalerror("Exotica lifetime initialization\n");
 		if(m_bootstrap_lifetimes)m_lifetime_pool_base=m_bootstrap_base;
 		m_lifetime_initial_head=m_ram_base[0x10a8];m_lifetime_initial_count=m_ram_base[0x10a9];
 		if((m_lifetime_initial_head && !lifetime_slot(m_lifetime_initial_head)) || m_lifetime_initial_count>4096)
@@ -961,7 +1039,7 @@ void crusnexo_state::endpoint_commit(uint32_t end,uint32_t flags,const LifetimeO
 void crusnexo_state::endpoint_model(uint32_t base,uint32_t count,uint32_t yscale)
 {
 	const uint32_t frame=renderer_frame();
-	if(!m_endpoint_log || frame<m_endpoint_first || ((after_end(frame,m_endpoint_last) || m_scene_failed_scene) && m_endpoint_pending.empty()))return;
+	if(!m_endpoint_log || (m_bootstrap_scenes && !m_bootstrap_scene_started) || frame<m_endpoint_first || ((after_end(frame,m_endpoint_last) || m_scene_failed_scene) && m_endpoint_pending.empty()))return;
 	if(m_maincpu->state_int(TMS320C3X_PC)!=0xb686){++m_endpoint_untracked;return;}
 	const uint32_t end=uint32_t(m_maincpu->state_int(TMS320C3X_AR0));
 	if(!cruisn::exotica_commands::Owners::cursor(end))fatalerror("Endpoint consumer ring bounds\n");
