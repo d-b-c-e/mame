@@ -200,6 +200,7 @@ protected:
 	memory_passthrough_handler m_host_scene_tap;
 	FILE *m_host_fade_log = nullptr;
 	bool m_host_fade_metadata = false;
+	bool m_host_offroad_metadata = false;
 	cruisn::DiagnosticJournal m_host_scene_log;
 	cruisn::DiagnosticJournal::Policy m_host_journal_policy=cruisn::DiagnosticJournal::Policy::capture;
 	uint64_t m_host_geometry=cruisn::vunit_journals::seed;

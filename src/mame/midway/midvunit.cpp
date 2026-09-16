@@ -261,6 +261,22 @@ void midvunit_base_state::offroad_host_start()
 		if(strlen(layer)!=1 || *layer<'0' || *layer>'3')fatalerror("Invalid Off Road host layer\n");
 		m_host_layer=uint16_t(*layer-'0');
 	}
+	if(const char *metadata=std::getenv("MIDV_OFFROAD_HOST_FADE_METADATA"))
+	{
+		if(strcmp(metadata,"0") && strcmp(metadata,"1"))fatalerror("Invalid Off Road host metadata\n");
+		m_host_fade_metadata=!strcmp(metadata,"1");
+	}
+	if(m_host_fade_metadata)
+	{
+		if(m_host_mode!=2 || m_offroad_host_multiplier!=3 || !m_host_future || m_host_layer!=3 ||
+			m_offroad_host_clip_admission || !std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0") ||
+			!std::getenv("MIDV_GL_ORIGINAL_MIRROR") || strcmp(std::getenv("MIDV_GL_ORIGINAL_MIRROR"),"1"))
+			fatalerror("Off Road metadata requires3x stock sphere admission, mirror and FFB0\n");
+		m_host_offroad_metadata=true;
+		m_host_fade_log=fopen("vunit-fade-producer.bin","wb");
+		if(!m_host_fade_log || fwrite("VFD1",1,4,m_host_fade_log)!=4)fatalerror("Cannot create Off Road metadata evidence\n");
+		setvbuf(m_host_fade_log,nullptr,_IOFBF,65536);
+	}
 	bool trace=false;
 	if(const char *text=std::getenv("MIDV_OFFROAD_HOST_QUADS"))
 	{
@@ -298,14 +314,22 @@ void midvunit_base_state::offroad_host_start()
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::offroad_host::Scene scene;
 			if(host_injected_failure(frame,cycles))return;
-			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,false,m_offroad_host_recover_partial))
+			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,m_host_fade_metadata,m_offroad_host_recover_partial))
 			{host_prepare_failed(frame,cycles,3,"Off Road host scene/model/material guard failed");return;}
 			host_bootstrap_ready(frame);
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;
-			for(const auto &o:scene.objects)for(const auto &q:o.quads)
-			{quads.push_back(q);hash=cruisn::world_host::quad_hash(hash,q);}
+			std::vector<std::array<uint32_t,4>> depths;
+			for(const auto &o:scene.objects)
+			{
+				if(m_host_fade_metadata && o.depths.size()!=o.quads.size())fatalerror("Missing Off Road camera depths\n");
+				for(size_t i=0;i<o.quads.size();++i)
+				{
+					if(m_host_fade_metadata)depths.push_back(o.depths[i]);
+					quads.push_back(o.quads[i]);hash=cruisn::world_host::quad_hash(hash,o.quads[i]);
+				}
+			}
 			const auto packed=std::chrono::steady_clock::now();
 			const double time=machine().time().as_double();
 			if(m_host_quad_log)for(const auto &o:scene.objects)for(const auto &q:o.quads)
@@ -315,7 +339,9 @@ void midvunit_base_state::offroad_host_start()
 				fputc('\n',m_host_quad_log);
 			}
 			const auto logged=std::chrono::steady_clock::now();
-			if(m_host_mode==2)world_host_submit(quads);
+			std::vector<uint32_t> policies;
+			if(m_host_fade_metadata)policies.assign(quads.size(),0);
+			if(m_host_mode==2)world_host_submit(quads,m_host_fade_metadata?&depths:nullptr,m_host_fade_metadata?&policies:nullptr);
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("Off Road host inspection changed guest cycles\n");
 			host_scene_record(frame,quads.size(),hash);
 			const auto submitted=std::chrono::steady_clock::now();

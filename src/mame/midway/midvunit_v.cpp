@@ -1152,19 +1152,26 @@ void thread_main()
 		!strcmp(std::getenv("MIDV_WORLD_HOST_FADE_METADATA"),"1");
 	bool const usa_metadata = std::getenv("MIDV_USA_HOST_FADE_METADATA") &&
 		!strcmp(std::getenv("MIDV_USA_HOST_FADE_METADATA"),"1");
-	if(world_metadata && usa_metadata)fatalerror("Multiple host metadata profiles\n");
-	for(const auto &entry:{std::make_pair(world_metadata,"MIDV_WORLD_HOST_SCENERY"),std::make_pair(usa_metadata,"MIDV_USA_HOST_SCENERY")})
+	bool const offroad_metadata=std::getenv("MIDV_OFFROAD_HOST_FADE_METADATA") &&
+		!strcmp(std::getenv("MIDV_OFFROAD_HOST_FADE_METADATA"),"1");
+	if(unsigned(world_metadata)+unsigned(usa_metadata)+unsigned(offroad_metadata)>1)
+		fatalerror("Multiple host metadata profiles\n");
+	for(const auto &entry:{std::make_pair(world_metadata,"MIDV_WORLD_HOST_SCENERY"),std::make_pair(usa_metadata,"MIDV_USA_HOST_SCENERY"),std::make_pair(offroad_metadata,"MIDV_OFFROAD_HOST_SCENERY")})
 		if(entry.first && (!std::getenv(entry.second) || strcmp(std::getenv(entry.second),"2")))
 			fatalerror("Host metadata requires matching game drawing\n");
-	bool const fade_metadata=world_metadata || usa_metadata;
+	bool const fade_metadata=world_metadata || usa_metadata || offroad_metadata;
+	auto const metadata_profile=offroad_metadata?cruisn::vunit_fade::Profile::offroad:cruisn::vunit_fade::Profile::world_usa;
 	bool const distance_fade = std::getenv("MIDV_WORLD_HOST_DISTANCE_FADE") &&
 		!strcmp(std::getenv("MIDV_WORLD_HOST_DISTANCE_FADE"),"1");
 	// Measure the hypothetical envelope after ordinary occlusion without applying
 	// it to displayed colors. USA road/surface fade eligibility is still unproven.
-	bool const opacity_observer=std::getenv("MIDV_USA_HOST_OPACITY_OBSERVER") &&
+	bool const usa_observer=std::getenv("MIDV_USA_HOST_OPACITY_OBSERVER") &&
 		!strcmp(std::getenv("MIDV_USA_HOST_OPACITY_OBSERVER"),"1");
-	if(opacity_observer && !usa_metadata)fatalerror("USA opacity observer requires explicit depth metadata\n");
-	bool const fade_opacity=distance_fade || opacity_observer;
+	if(usa_observer && !usa_metadata)fatalerror("USA opacity observer requires explicit depth metadata\n");
+	bool const offroad_observer=std::getenv("MIDV_OFFROAD_HOST_OPACITY_OBSERVER") &&
+		!strcmp(std::getenv("MIDV_OFFROAD_HOST_OPACITY_OBSERVER"),"1");
+	if(offroad_observer && !offroad_metadata)fatalerror("Off Road opacity observer requires explicit depth metadata\n");
+	bool const fade_opacity=distance_fade || usa_observer || offroad_observer;
 	if(distance_fade && !world_metadata)fatalerror("Distance fade requires qualified host metadata\n");
 	if(fade_metadata && !original_mirror)fatalerror("Fade metadata requires original mirror\n");
 	if (original_mirror)
@@ -1308,8 +1315,8 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uClipW"), WIDE);
 	if(fade_opacity)
 	{
-		gl.Uniform1f(gl.GetUniformLocation(prog,"fadePlane"),240000.f);
-		gl.Uniform1f(gl.GetUniformLocation(prog,"fadeWidth"),20000.f);
+		gl.Uniform1f(gl.GetUniformLocation(prog,"fadePlane"),offroad_observer?141888.f:240000.f);
+		gl.Uniform1f(gl.GetUniformLocation(prog,"fadeWidth"),offroad_observer?11824.f:20000.f);
 	}
 	// Legacy margin suppression/column stretching destroyed valid skies in
 	// recorded World/Off Road races. Retain it only as an explicit experiment.
@@ -1775,7 +1782,7 @@ void thread_main()
 				if(type==8)
 				{
 					cruisn::vunit_fade::Packet packet;memcpy(&packet,staging.data(),sizeof(packet));
-					if(!fade_metadata || !cruisn::vunit_fade::decode(packet,fade_depths,far_packet))fatalerror("Invalid host fade metadata\n");
+					if(!fade_metadata || !cruisn::vunit_fade::decode(packet,fade_depths,far_packet,metadata_profile))fatalerror("Invalid host fade metadata\n");
 					selector=packet.policy?1.f:-1.f;
 					++fade_packets;fade_roads+=packet.policy;
 					if(int(q.frame)==mirror_frame)
@@ -3482,7 +3489,7 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 {
 	if(!live().enabled)fatalerror("World host scenery drawing requires the live GL renderer\n");
 	if(quads.empty())return;
-	if(depths && (!m_host_far_coverage || depths->size()!=quads.size()))fatalerror("Host far depths mismatch\n");
+	if(depths && ((!m_host_far_coverage && !m_host_offroad_metadata) || depths->size()!=quads.size()))fatalerror("Host far depths mismatch\n");
 	if(policies && (!m_host_fade_metadata || !depths || policies->size()!=quads.size()))fatalerror("Host fade policies mismatch\n");
 	if(margins && (m_host_layer!=3 || margins->size()!=quads.size() ||
 		std::any_of(margins->begin(),margins->end(),[](uint8_t v){return v>1;})))fatalerror("Host margin permissions mismatch\n");
@@ -3501,9 +3508,9 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 			cruisn::vunit_fade::Packet packet;
 			packet.quad.frame=frame;packet.quad.pc=m_page_control;packet.quad.pad=h.pad;
 			std::copy(quads[i].begin(),quads[i].end(),packet.quad.dma);
-			packet.quad.coverage.far_limit=m_host_far;packet.quad.coverage.words=(*depths)[i];packet.policy=(*policies)[i];
+			packet.quad.coverage.far_limit=m_host_offroad_metadata?191040:m_host_far;packet.quad.coverage.words=(*depths)[i];packet.policy=(*policies)[i];
 			std::array<float,4> decoded;bool crossing;
-			if(!cruisn::vunit_fade::decode(packet,decoded,crossing))fatalerror("Invalid emitted host fade metadata\n");
+			if(!cruisn::vunit_fade::decode(packet,decoded,crossing,m_host_offroad_metadata?cruisn::vunit_fade::Profile::offroad:cruisn::vunit_fade::Profile::world_usa))fatalerror("Invalid emitted host fade metadata\n");
 			if(crossing && m_host_clip_log && fwrite(&packet.quad,1,sizeof(packet.quad),m_host_clip_log)!=sizeof(packet.quad))fatalerror("Far producer receipt write failed\n");
 			if(int(frame)==fade_frame &&
 				fwrite(&packet,1,sizeof(packet),m_host_fade_log)!=sizeof(packet))fatalerror("Fade producer write failed\n");
