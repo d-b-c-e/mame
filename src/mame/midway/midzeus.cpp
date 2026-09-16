@@ -208,10 +208,21 @@ protected:
 		}
 	}
 
+	// Driver machine_reset runs after child devices, including Zeus FIFO clearing.
+	// Establish the ownership boundary while the actual pre-reset device state exists.
+	virtual void device_reset() override
+	{
+		if(continuous() && renderer_frame())
+		{
+			fprintf(stderr,"MIDZ_RESET_ENTRY frame=%u fifo_empty=%u\n",renderer_frame(),unsigned(m_zeus->midz_fifo_empty()));
+			runtime_reset();
+		}
+		midzeus2_state::device_reset();
+	}
+
 	virtual void machine_reset() override
 	{
-		if(continuous() && renderer_frame())runtime_reset();
-        else {
+        if(!(continuous() && renderer_frame())) {
             if(m_lifetime_started)fatalerror("Exotica lifetime diagnostic cannot cross machine reset\n");
             if(m_scene_fence_requests)fatalerror("Exotica command-fence diagnostic cannot cross machine reset\n");
         }
