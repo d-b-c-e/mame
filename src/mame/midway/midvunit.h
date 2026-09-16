@@ -13,6 +13,7 @@
 #include "midwayic.h"
 #include "cruisn/world_future_sections.h"
 #include "cruisn/vunit_runtime.h"
+#include "cruisn/vunit_journal_policy.h"
 #include "cruisn/usa_future_sections.h"
 #include "cruisn/offroad_host_scenery.h"
 
@@ -114,7 +115,7 @@ protected:
 	void host_bootstrap_start();
 	void host_runtime_start();
 	bool host_scene_allowed(uint64_t frame);
-	void host_scene_record(uint64_t frame,size_t quads);
+	void host_scene_record(uint64_t frame,size_t quads,uint64_t hash);
 	void host_bootstrap_ready(uint64_t frame);
 	void host_prepare_failed(uint64_t frame, uint64_t cycles, uint32_t stage, const char *reason);
 	bool host_injected_failure(uint64_t frame, uint64_t cycles);
@@ -199,7 +200,10 @@ protected:
 	memory_passthrough_handler m_host_scene_tap;
 	FILE *m_host_fade_log = nullptr;
 	bool m_host_fade_metadata = false;
-	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr, *m_host_clip_log = nullptr;
+	cruisn::DiagnosticJournal m_host_scene_log;
+	cruisn::DiagnosticJournal::Policy m_host_journal_policy=cruisn::DiagnosticJournal::Policy::capture;
+	uint64_t m_host_geometry=cruisn::vunit_journals::seed;
+	FILE *m_host_quad_log = nullptr, *m_host_clip_log = nullptr;
 	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff, m_host_far = 80000;
 	bool m_host_bootstrap = false;
 	cruisn::vunit_runtime::Policy m_host_runtime = cruisn::vunit_runtime::Policy::capture;

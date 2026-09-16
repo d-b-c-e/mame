@@ -2046,7 +2046,10 @@ void thread_main()
 	{
 		// Finish an already consumed partial batch without inventing a guest
 		// frame/presentation. The producer is stopped before this drain.
-		complete_run();flush_cpu();gl.Finish();gl.GetError();
+		// A failed persistent stream cannot safely draw its remaining partial batch.
+		if(!InterlockedCompareExchange((volatile LONG *)(lv.base+32),0,0))
+		{complete_run();flush_cpu();}
+		gl.Finish();gl.GetError();
 		s_runtime_pending=run.size();s_runtime_errors=gl.errors;
 		s_runtime_completed=completed_frame;s_runtime_ready=true;
 	}
