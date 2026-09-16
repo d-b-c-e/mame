@@ -1187,7 +1187,9 @@ void crusnexo_state::scene_observer_start()
 			!std::getenv("MIDV_FFB") || strcmp(std::getenv("MIDV_FFB"),"0"))
 			fatalerror("Exotica failure trial requires explicit policy, combined private draw and FFB0\n");
 		m_scene_failure_original=!strcmp(failure,"1");
-		if(inject)m_scene_inject_frame=number("MIDZ_HOST_FAILURE_FRAME",m_scene_first,m_scene_last,0);
+		if(inject)m_scene_inject_frame=number("MIDZ_HOST_FAILURE_FRAME",
+			cruisn::exotica_runtime::failure_first(m_bootstrap_scenes,m_scene_first),
+			cruisn::exotica_runtime::injection_last(m_runtime_policy,m_scene_last),0);
 		fprintf(stderr,"EXOTICA_HOST_FAILURE_POLICY original=%u inject=%u\n",unsigned(m_scene_failure_original),m_scene_inject_frame);
 	}
 	if(!m_scene_first || m_scene_last<m_scene_first || m_scene_last-m_scene_first>10000 ||
