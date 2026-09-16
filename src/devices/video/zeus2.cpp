@@ -1904,7 +1904,7 @@ void thread_main()
 				std::array<uint32_t,4> request{};
 				if(rec.size()==sizeof(request))std::memcpy(request.data(),rec.data(),sizeof(request));
 				if(!future_present || envi("MIDZ_HOST_FAILURE_POLICY",nullptr,0)!=1 ||
-					request[0]!=0x31545258 || request[1]<1 || request[1]>16000 || (!request[2] && !request[3])) {
+					request[0]!=0x31545258 || !cruisn::exotica_runtime::retirement_frame(depth_mirror.policy,request[1]) || (!request[2] && !request[3])) {
 					private_failed=true;s_stopz.store(true);zlogf("private retirement receipt rejected");break;
 				}
 				flush();retire_frame=request[1];retire_scene=uint64_t(request[2])|(uint64_t(request[3])<<32);
@@ -2328,8 +2328,11 @@ bool zeus2_device::midz_host_retire(uint32_t frame,uint64_t scene)
 {
 #ifdef _WIN32
 	const char *policy=std::getenv("MIDZ_HOST_FAILURE_POLICY"),*ffb=std::getenv("MIDV_FFB");
+	const char *runtime=std::getenv("MIDZ_RUNTIME");
+	const auto frame_policy=runtime && !strcmp(runtime,"continuous")?
+		cruisn::exotica_runtime::Policy::continuous:cruisn::exotica_runtime::Policy::capture;
 	if(midz_live && midz_fifo_empty() && policy && !strcmp(policy,"1") && ffb && !strcmp(ffb,"0") &&
-		frame>=1 && frame<=16000 && scene) {
+		cruisn::exotica_runtime::retirement_frame(frame_policy,frame) && scene) {
 		const std::array<uint32_t,4> request{{0x31545258,frame,uint32_t(scene),uint32_t(scene>>32)}};
 		return mzgl::ring_push2(12,request.data(),sizeof(request),nullptr,0);
 	}
