@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <cctype>
 #include "midvunit.h"
+#include "cruisn/vunit_bootstrap_profile.h"
 #include "cruisn/checked_patch.h"
 #include "cruisn/world_scenery.h"
 #include "cruisn/world_distance.h"
@@ -100,7 +101,7 @@ void midvunit_base_state::host_bootstrap_start()
 	if(!mode)return;
 	const char *gl=std::getenv("MIDV_GL"), *ffb=std::getenv("MIDV_FFB");
 	const char *rom=machine().system().name;
-	const bool supported=!strcmp(rom,"crusnusa") || !strcmp(rom,"crusnwld24") || !strcmp(rom,"crusnwld") || !strcmp(rom,"offroadc");
+	const bool supported=cruisn::vunit_bootstrap_profile(rom).address!=0;
 	if(strcmp(mode,"1") || !supported ||
 		m_host_mode!=2 || !m_host_future || m_host_layer!=3 || !gl || strcmp(gl,"1") || !ffb || strcmp(ffb,"0"))
 		fatalerror("V-Unit bootstrap requires supported future draw, both layers, live GL and physical FFB0\n");
@@ -131,8 +132,7 @@ void midvunit_base_state::host_bootstrap_ready(uint64_t frame)
 		if(!written || !closed)fatalerror("Cannot write/close V-Unit bootstrap operands\n");
 	}
 	m_host_bootstrap_frame=frame;
-	const uint32_t address=m_host_revision?cruisn::world_host::layout(m_host_revision)->scene:
-		!strcmp(machine().system().name,"crusnusa")?0x40:0x111f4;
+	const uint32_t address=cruisn::vunit_bootstrap_profile(machine().system().name).address;
 	osd_printf_info("VUNIT_BOOTSTRAP_READY frame=%llu pc=%x address=%x\n",(unsigned long long)frame,
 		unsigned(m_maincpu->state_int(TMS320C3X_PC)),address);
 }
@@ -1130,7 +1130,7 @@ void midvplus_state::machine_start()
 }
 
 
-// â”€â”€ POC code patcher (env-gated, ROM files untouched) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── POC code patcher (env-gated, ROM files untouched) ───────────────────
 // The whole TMS320C31 program is copied maindata ROM -> program RAM at each
 // reset; we overlay word patches on that RAM copy, so nothing on disk is
 // modified (GPL/legal bright line intact). MIDV_PATCH=<file>, one patch per
