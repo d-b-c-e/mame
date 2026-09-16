@@ -1264,6 +1264,13 @@ void midv_patches_tick(uint32_t *ram)
 
 void midvunit_base_state::machine_reset()
 {
+	// RAM and guest section ownership are about to be replaced. Do not rely
+	// on a later track callback observing an intermediate empty/rewound cursor.
+	// Keep runtime totals and any explicit failure retirement for this launch.
+	m_host_future_cache.clear();
+	m_usa_future_cache.clear();
+	m_usa_model_cache.clear();
+	m_offroad_host_cache.clear();
 	offroad_distance_reset();
 	m_scenery_tree = 0;
 	reset_display_assets();
