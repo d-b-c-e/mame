@@ -1148,11 +1148,18 @@ void thread_main()
 	bool const original_mirror = std::getenv("MIDV_GL_ORIGINAL_MIRROR") &&
 		!strcmp(std::getenv("MIDV_GL_ORIGINAL_MIRROR"), "1");
 	int const mirror_frame = std::getenv("MIDV_GL_MIRROR_FRAME") ? atoi(std::getenv("MIDV_GL_MIRROR_FRAME")) : 0;
-	bool const fade_metadata = std::getenv("MIDV_WORLD_HOST_FADE_METADATA") &&
+	bool const world_metadata = std::getenv("MIDV_WORLD_HOST_FADE_METADATA") &&
 		!strcmp(std::getenv("MIDV_WORLD_HOST_FADE_METADATA"),"1");
+	bool const usa_metadata = std::getenv("MIDV_USA_HOST_FADE_METADATA") &&
+		!strcmp(std::getenv("MIDV_USA_HOST_FADE_METADATA"),"1");
+	if(world_metadata && usa_metadata)fatalerror("Multiple host metadata profiles\n");
+	for(const auto &entry:{std::make_pair(world_metadata,"MIDV_WORLD_HOST_SCENERY"),std::make_pair(usa_metadata,"MIDV_USA_HOST_SCENERY")})
+		if(entry.first && (!std::getenv(entry.second) || strcmp(std::getenv(entry.second),"2")))
+			fatalerror("Host metadata requires matching game drawing\n");
+	bool const fade_metadata=world_metadata || usa_metadata;
 	bool const distance_fade = std::getenv("MIDV_WORLD_HOST_DISTANCE_FADE") &&
 		!strcmp(std::getenv("MIDV_WORLD_HOST_DISTANCE_FADE"),"1");
-	if(distance_fade && !fade_metadata)fatalerror("Distance fade requires qualified host metadata\n");
+	if(distance_fade && !world_metadata)fatalerror("Distance fade requires qualified host metadata\n");
 	if(fade_metadata && !original_mirror)fatalerror("Fade metadata requires original mirror\n");
 	if (original_mirror)
 	{

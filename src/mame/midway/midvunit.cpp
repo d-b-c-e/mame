@@ -377,6 +377,20 @@ void midvunit_base_state::usa_host_start()
 		if(strlen(layer)!=1 || *layer<'0' || *layer>'3')fatalerror("Invalid USA host layer\n");
 		m_host_layer=uint16_t(*layer-'0');
 	}
+	// Read-only metadata transport; USA surface/road opacity remains unclassified.
+	if(const char *metadata=std::getenv("MIDV_USA_HOST_FADE_METADATA"))
+	{
+		if(strcmp(metadata,"0") && strcmp(metadata,"1"))fatalerror("Invalid USA host fade metadata\n");
+		m_host_fade_metadata=!strcmp(metadata,"1");
+	}
+	if(m_host_fade_metadata)
+	{
+		if(!m_host_far_coverage || m_host_layer!=3 || !std::getenv("MIDV_GL_ORIGINAL_MIRROR") ||
+			strcmp(std::getenv("MIDV_GL_ORIGINAL_MIRROR"),"1"))fatalerror("USA metadata requires qualified3x mirror/coverage\n");
+		m_host_fade_log=fopen("vunit-fade-producer.bin","wb");
+		if(!m_host_fade_log || fwrite("VFD1",1,4,m_host_fade_log)!=4)fatalerror("Cannot create USA metadata evidence\n");
+		setvbuf(m_host_fade_log,nullptr,_IOFBF,65536);
+	}
 	bool trace=false;
 	if(const char *text=std::getenv("MIDV_USA_HOST_QUADS"))
 	{
@@ -450,7 +464,9 @@ void midvunit_base_state::usa_host_start()
 				fputc('\n',m_host_quad_log);
 			}
 			const auto logged=std::chrono::steady_clock::now();
-			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr);
+			std::vector<uint32_t> policies;
+			if(m_host_fade_metadata)policies.assign(quads.size(),0); // no authored-road classification inferred
+			if(m_host_mode==2)world_host_submit(quads,m_host_far_coverage?&depths:nullptr,m_host_fade_metadata?&policies:nullptr);
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("USA host inspection changed guest cycles\n");
 			host_scene_record(frame,quads.size(),hash);
 			const auto submitted=std::chrono::steady_clock::now();
