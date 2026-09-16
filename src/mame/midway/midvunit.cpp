@@ -89,6 +89,47 @@ void midvunit_base_state::machine_start()
 	usa_host_start();
 	offroad_host_start();
 	host_failure_start();
+	host_bootstrap_start();
+}
+
+// Candidate-only startup policy. Every scene still runs the complete code,
+// source and model checks; only the lower diagnostic frame bound is bypassed.
+void midvunit_base_state::host_bootstrap_start()
+{
+	const char *mode=std::getenv("MIDV_HOST_BOOTSTRAP");
+	if(!mode)return;
+	const char *gl=std::getenv("MIDV_GL"), *ffb=std::getenv("MIDV_FFB");
+	if(strcmp(mode,"1") || strcmp(machine().system().name,"crusnusa") ||
+		m_host_mode!=2 || !m_host_future || m_host_layer!=3 || !gl || strcmp(gl,"1") || !ffb || strcmp(ffb,"0"))
+		fatalerror("V-Unit bootstrap requires USA future draw, both layers, live GL and physical FFB0\n");
+	m_host_bootstrap=true;
+	osd_printf_info("VUNIT_BOOTSTRAP scenes=1 first=actual last=%u\n",m_host_last);
+}
+
+void midvunit_base_state::host_bootstrap_ready(uint64_t frame)
+{
+	if(!m_host_bootstrap || m_host_bootstrap_frame)return;
+	if(!frame || frame>m_host_last || m_ram_base.bytes()!=0x80000)
+		fatalerror("V-Unit bootstrap invalid scene frame/RAM span\n");
+	// Explicit little-endian bytes match the independent saved-scene codec.
+	// Ordinary RAM reads bypass guest cycle handlers. Fast RAM reads suppress taps.
+	auto disabled=machine().disable_side_effects();
+	for(bool fast:{false,true})
+	{
+		std::vector<uint8_t> bytes(fast?0x2000:0x80000);
+		for(size_t i=0;i<bytes.size()/4;++i)
+		{
+			uint32_t word=fast?m_maincpu->space(AS_PROGRAM).read_dword(0x809800+i):m_ram_base[i];
+			for(unsigned b=0;b<4;++b)bytes[4*i+b]=uint8_t(word>>(8*b));
+		}
+		FILE *file=fopen(fast?"vunit-bootstrap-fast.bin":"vunit-bootstrap-ram.bin","wb");
+		if(!file)fatalerror("Cannot create V-Unit bootstrap operands\n");
+		const bool written=fwrite(bytes.data(),1,bytes.size(),file)==bytes.size();
+		const bool closed=cruisn::close_journal(file);
+		if(!written || !closed)fatalerror("Cannot write/close V-Unit bootstrap operands\n");
+	}
+	m_host_bootstrap_frame=frame;
+	osd_printf_info("VUNIT_BOOTSTRAP_READY frame=%llu pc=81 address=40\n",(unsigned long long)frame);
 }
 
 // Only read-only preparation failures BEFORE world_host_submit can use this
@@ -324,7 +365,7 @@ void midvunit_base_state::usa_host_start()
 		{
 			if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0x81)return;
 			const uint64_t frame=m_screen->frame_number();
-			if(frame<m_host_first || frame>m_host_last || m_host_failed_frame)return;
+			if((!m_host_bootstrap && frame<m_host_first) || frame>m_host_last || m_host_failed_frame)return;
 			const auto cycles=m_maincpu->total_cycles();
 			const auto started=std::chrono::steady_clock::now();
 			if(!cruisn::usa_host::code_matches(m_ram_base,m_ram_base.bytes()/4))
@@ -349,6 +390,7 @@ void midvunit_base_state::usa_host_start()
 			if(host_injected_failure(frame,cycles))return;
 			if(!cruisn::usa_host::build(read,scene,m_host_far,m_host_future?&future:nullptr,m_host_future?&m_usa_model_cache:nullptr,m_host_far_coverage))
 			{host_prepare_failed(frame,cycles,3,"USA host scene/model guard failed");return;}
+			host_bootstrap_ready(frame);
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
 			uint64_t hash=cruisn::world_host::hash_seed;

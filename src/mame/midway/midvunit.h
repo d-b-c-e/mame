@@ -110,6 +110,8 @@ protected:
 	void usa_host_start();
 	void offroad_host_start();
 	void host_failure_start();
+	void host_bootstrap_start();
+	void host_bootstrap_ready(uint64_t frame);
 	void host_prepare_failed(uint64_t frame, uint64_t cycles, uint32_t stage, const char *reason);
 	bool host_injected_failure(uint64_t frame, uint64_t cycles);
 	void world_host_exit();
@@ -195,6 +197,8 @@ protected:
 	bool m_host_fade_metadata = false;
 	FILE *m_host_scene_log = nullptr, *m_host_quad_log = nullptr, *m_host_clip_log = nullptr;
 	uint32_t m_host_mode = 0, m_host_first = 0, m_host_last = 0xffffffff, m_host_far = 80000;
+	bool m_host_bootstrap = false;
+	uint64_t m_host_bootstrap_frame = 0;
 	bool m_host_failure_original = false;
 	uint64_t m_host_failed_frame = 0;
 	uint32_t m_host_inject_frame = 0;
