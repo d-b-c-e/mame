@@ -1679,8 +1679,16 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 				}
 			}
 			std::vector<uint8_t> encoded;
-			if(!cruisn::zeus_wide::encode(future,encoded,material_frame_policy()) || !m_zeus->midz_host_future(encoded.data(),encoded.size()))
+			if(!cruisn::zeus_wide::encode(future,encoded,material_frame_policy()))
+				fatalerror("Exotica future owned encoding rejected\n");
+			const auto submit_started=std::chrono::steady_clock::now();
+			if(!m_zeus->midz_host_future(encoded.data(),encoded.size()))
 				fatalerror("Exotica future owned queue rejected\n");
+			const auto submitted_at=std::chrono::steady_clock::now();
+			m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::future_encode,
+				std::chrono::duration<double,std::micro>(submit_started-material_staged).count(),encoded.size());
+			m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::future_submit,
+				std::chrono::duration<double,std::micro>(submitted_at-submit_started).count(),encoded.size());
 			if(packet.snapshot) {
 				const auto name="exotica-future-"+std::to_string(p.frame)+".xwd";
 				FILE *file=fopen(name.c_str(),"wb");if(!file)fatalerror("Exotica future packet snapshot open\n");
@@ -1699,6 +1707,8 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		if(m_scene_material_pages)m_zeus->midz_host_wave_commit();
 		const auto material_committed=std::chrono::steady_clock::now();
 		auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
+		m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::future_stage,us(material_start,material_staged),packet.wave.pages.size());
+		m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::future_commit,us(material_queued,material_committed),packet.wave.pages.size());
 		if(m_scene_material_log.print("%llu,%u,%llu,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f\n",
 			(unsigned long long)pending.scene,p.frame,(unsigned long long)packet.wave.generation,
 			unsigned(packet.wave.pages.size()),unsigned(packet.rows.size()),unsigned(wire.size()),

@@ -9,7 +9,8 @@ namespace cruisn {
 class PhaseTiming {
 public:
     enum Phase : uint32_t { source, waiting_build, future_build, future_material,
-        active_seal, waiting_ready, active_build, active_material, phase_count };
+        active_seal, waiting_ready, active_build, active_material,
+        future_stage, future_encode, future_submit, future_commit, phase_count };
     struct Row { uint32_t frame; uint64_t scene; Phase phase; double us; uint64_t units; };
     static constexpr size_t capacity=65536;
 private:
@@ -49,7 +50,8 @@ public:
     bool write(FILE *file,uint32_t final_frame)const {
         if(!file || !enabled())return false;
         static const char *names[]={"source","waiting_build","future_build","future_material",
-            "active_seal","waiting_ready","active_build","active_material"};
+            "active_seal","waiting_ready","active_build","active_material",
+            "future_stage","future_encode","future_submit","future_commit"};
         if(std::fprintf(file,"frame,scene,phase,microseconds,units\n")<0)return false;
         for(const auto &r:m_rows)
             if(std::fprintf(file,"%u,%llu,%s,%.3f,%llu\n",r.frame,(unsigned long long)r.scene,
