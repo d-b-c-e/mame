@@ -866,6 +866,7 @@ void crusnexo_state::lifetime_start()
 	m_lifetime_owner_tap=space.install_read_tap(0x67c4,0x67c4,"exotica_lifetime_source",
 		[this](offs_t,uint32_t &,uint32_t) {
 			if(!lifetime_scope() || m_maincpu->state_int(TMS320C3X_PC)!=0xb85a)return;
+			const auto timing_started=std::chrono::steady_clock::now();
 			if(m_lifetime_owner_slot)fatalerror("Exotica lifetime nested source constructor\n");
 			m_lifetime_owner_slot=uint32_t(m_maincpu->state_int(TMS320C3X_AR4));
 			m_lifetime_owner_source=uint32_t(m_maincpu->state_int(TMS320C3X_AR5))-4;m_lifetime_owner_entry=m_ram_base[0x597];
@@ -874,6 +875,7 @@ void crusnexo_state::lifetime_start()
 			m_lifetime_ready_tap=m_maincpu->space(AS_PROGRAM).install_read_tap(m_lifetime_owner_slot+29,m_lifetime_owner_slot+29,"exotica_lifetime_source_ready",
 				[this](offs_t,uint32_t &,uint32_t) {
 					if(machine().side_effects_disabled() || m_maincpu->state_int(TMS320C3X_PC)!=0xb8cc)return;
+					const auto timing_started=std::chrono::steady_clock::now();
 					if(!m_lifetime_owner_slot || m_lifetime_owner_slot!=uint32_t(m_maincpu->state_int(TMS320C3X_AR4)))
 						fatalerror("Exotica lifetime source completion\n");
 					const uint32_t bank=m_disk_asic_jr[5]&3,table=m_ram_base[0xe9]+m_ram_base[0x1fbc];
@@ -888,7 +890,11 @@ void crusnexo_state::lifetime_start()
 					if(!m_lifetime_owners.emplace(m_lifetime_owner_slot,owner).second)fatalerror("Exotica lifetime duplicate owner map\n");
 					lifetime_emit('B',m_lifetime_owner_slot,owner.handle.generation,owner.serial,key,0,m_ram_base[m_lifetime_owner_slot+15]);
 					m_lifetime_owner_slot=0;m_lifetime_ready_tap.remove();
+					m_host_timing.accumulate(renderer_frame(),m_scene_serial,cruisn::PhaseTiming::lifetime_complete,
+						std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-timing_started).count());
 				});
+			m_host_timing.accumulate(renderer_frame(),m_scene_serial,cruisn::PhaseTiming::lifetime_install,
+				std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-timing_started).count());
 		});
 	m_lifetime_submit_tap=space.install_write_tap(0x46e,0x46e,"exotica_lifetime_model_commit",
 		[this](offs_t,uint32_t &data,uint32_t mask) {
