@@ -1467,7 +1467,9 @@ void thread_main()
 			original_color=read_texture(fbTex,RGBA,0x1401);original_depth=read_texture(depthTex,DEPTH_COMPONENT,0x1405);
 		}
 		uint64_t hash=14695981039346656037ull;size_t vertices=0;
-		for(const auto &q:packet.quads) {
+		// Geometry hash is journal-only; quiet mode still validates every packet
+		// and the private material image. The journal opens lazily below.
+		if(journal_policy==cruisn::DiagnosticJournal::Policy::capture)for(const auto &q:packet.quads) {
 			const auto *bytes=reinterpret_cast<const uint8_t *>(&q.polygon);
 			for(size_t i=0;i<sizeof(q.polygon);++i){hash^=bytes[i];hash*=1099511628211ull;}
 		}

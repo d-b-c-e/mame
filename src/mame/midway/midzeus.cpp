@@ -1572,7 +1572,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 				!cruisn::exotica_scene_endpoint::select(m_handover_control,proposed,m_handover_control,false,checked))
 				fatalerror("Private waiting endpoint changed original geometry/materials\n");
 		}
-		const auto hash=cruisn::exotica_scene::byte_hash(proposed.quads.data(),proposed.quads.size()*sizeof(proposed.quads[0]));
+		const auto hash=m_waiting_log.capturing()?cruisn::exotica_scene::byte_hash(proposed.quads.data(),proposed.quads.size()*sizeof(proposed.quads[0])):0;
 		if(m_waiting_log.print("%llu,%u,%.12f,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0\n",
 			(unsigned long long)pending.scene,p.frame,now,(unsigned long long)m_lifetimes.epoch(),(unsigned long long)m_lifetimes.sequence(),(unsigned long long)m_lifetime_records,
 			unsigned(waiting.historical),unsigned(waiting.unowned),unsigned(waiting.submitted),unsigned(waiting.future),
@@ -1636,7 +1636,9 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		fatalerror("Exotica host incomplete depth comparison\n");
 	m_scene_depth_tests+=scene.depth_tests;m_scene_depth_verified+=scene.depth_verified;m_scene_depth_skipped+=scene.depth_skipped;
 	const auto built=std::chrono::steady_clock::now();
-	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
+	// This hash is only printed in the optional per-scene journal. Material
+	// image hashes and all ownership checks remain unconditional.
+	const uint64_t hash=m_scene_log.capturing()?cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0])):0;
 	const auto hashed=std::chrono::steady_clock::now();
 	std::vector<uint8_t> material_wire;
 	if(m_scene_material_image) {
@@ -1908,8 +1910,8 @@ void crusnexo_state::scene_waiting_ready()
 		}
 		m_handover_generation=0;m_handover_packet=cruisn::zeus_wide::Packet{};m_handover_palettes=cruisn::zeus_host::PaletteSet{};
 	}
-	const auto owner_hash=cruisn::exotica_scene::byte_hash(owners.data(),owners.size()*sizeof(owners[0]));
-	const auto geometry_hash=cruisn::exotica_scene::byte_hash(filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0]));
+	const auto owner_hash=m_handover_log.capturing()?cruisn::exotica_scene::byte_hash(owners.data(),owners.size()*sizeof(owners[0])):0;
+	const auto geometry_hash=m_handover_log.capturing()?cruisn::exotica_scene::byte_hash(filtered.quads.data(),filtered.quads.size()*sizeof(filtered.quads[0])):0;
 	if(m_handover_log.print("%llu,%u,%.12f,%llu,%llu,%u,%.12f,%llu,%llu,%u,%u,%u,%u,%016llx,%u,%u,%016llx,0\n",
 		(unsigned long long)m_handover_scene,m_handover_frame,m_handover_time,
 		(unsigned long long)m_handover_proposal_records,(unsigned long long)m_handover_end_records,frame,now,
@@ -2249,7 +2251,7 @@ void crusnexo_state::scene_active_ready()
 		dump(prefix+"-quads.bin",scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
 		m_active_snapshots.erase(p.frame);
 	}
-	const uint64_t hash=cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0]));
+	const uint64_t hash=m_active_log.capturing()?cruisn::exotica_scene::byte_hash(scene.quads.data(),scene.quads.size()*sizeof(scene.quads[0])):0;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active completion changed CPU cycles\n");
 	const auto ram_models=std::count_if(scene.instances.begin(),scene.instances.end(),[](const auto &s){return s.descriptor<0x40000;});
 	if(m_active_log.print("%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,0,%.3f,%.3f,%u,%u,%u,%u,%.3f,%u,%u,%llu,%u,%u,%.3f,%u,%u,%u\n",
