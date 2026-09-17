@@ -28,6 +28,7 @@ The Grid         v1.2   10/18/2000
 
 #include "emu.h"
 #include "cruisn/exotica_journal_policy.h"
+#include "cruisn/phase_timing.h"
 #include "cruisn/diagnostic_count.h"
 #include "cruisn/exotica_bootstrap.h"
 #include "cruisn/exotica_runtime.h"
@@ -240,6 +241,7 @@ private:
 	cruisn::exotica_admissions::Ledger m_endpoint_admissions;
 	uint32_t m_endpoint_admit_from=0;
 	uint64_t m_endpoint_admit_sequence=0,m_endpoint_admit_bytes=0;
+	cruisn::PhaseTiming m_host_timing;
 	cruisn::DiagnosticJournal::Policy m_journal_policy=cruisn::DiagnosticJournal::Policy::capture;
 	cruisn::DiagnosticJournal m_endpoint_admit_packets,m_endpoint_admit_log;
 	struct EndpointPending {
@@ -1193,6 +1195,8 @@ void crusnexo_state::endpoint_admit(uint64_t scene,uint32_t frame,uint64_t realm
 
 void crusnexo_state::scene_observer_start()
 {
+	if(!m_host_timing.configure(std::getenv("MIDZ_HOST_TIMING")))fatalerror("Invalid Exotica timing range (FIRST:LAST, at most2000frames)\n");
+	if(m_host_timing.enabled())fprintf(stderr,"MIDZ_HOST_TIMING first=%u last=%u\n",m_host_timing.first(),m_host_timing.last());
 	const char *journal_mode=std::getenv("MIDZ_HOST_JOURNALS");
 	if(!cruisn::exotica_journals::select(journal_mode,[](const char *key){return std::getenv(key);},m_journal_policy))
 		fatalerror("Invalid Exotica journal policy or missing combined-renderer requirements\n");
@@ -1204,6 +1208,7 @@ void crusnexo_state::scene_observer_start()
 		if(waiting && strcmp(waiting,"0"))fatalerror("Exotica waiting observation requires host scene mode\n");
 		const char *handover=std::getenv("MIDZ_HOST_HANDOVER");
 		if(handover && strcmp(handover,"0"))fatalerror("Exotica waiting completion requires host scene mode\n");
+		if(m_host_timing.enabled())fatalerror("Exotica timing requires host scene mode\n");
 		return;
 	}
 	const char *ffb=std::getenv("MIDV_FFB");
@@ -1610,6 +1615,7 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 			m_handover_geometry=std::move(proposed);
 		}
 	}
+	const auto waiting_built=std::chrono::steady_clock::now();
 	cruisn::exotica_scene::Result scene;
 	p.early_depth=m_scene_depth_mode;
 	const bool injected=m_scene_inject_frame && p.frame>=m_scene_inject_frame;
@@ -1731,6 +1737,10 @@ void crusnexo_state::scene_observer_model(uint32_t base,uint32_t count,uint32_t 
 		(unsigned long long)pending.scene,pending.scene_frame,pending.scene_time,unsigned(p.frustum_bounds),unsigned(scene.culled_bounds),us(hashed,materials_done),
 		m_scene_source_mode,m_scene_depth_mode,unsigned(scene.depth_tests),unsigned(scene.depth_verified),unsigned(scene.depth_skipped))<0)
 		fatalerror("Exotica host scene log write\n");
+	m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::source,us(started,ready),sources.sources.size());
+	m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::waiting_build,us(ready,waiting_built),m_handover_geometry.quads.size());
+	m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::future_build,us(waiting_built,built),scene.quads.size());
+	m_host_timing.add(p.frame,pending.scene,cruisn::PhaseTiming::future_material,us(hashed,materials_done),material_wire.size());
 	++m_scene_matched;m_scene_quads+=scene.quads.size();
 }
 
@@ -1793,6 +1803,7 @@ void crusnexo_state::scene_fence_ready(bool immediate)
 
 void crusnexo_state::scene_waiting_ready()
 {
+	const auto timing_started=std::chrono::steady_clock::now();
 	const auto cycles=m_maincpu->total_cycles();
 	const auto frame=renderer_frame();const double now=machine().time().as_double();
 	if(m_handover_scene!=m_scene_fence_scene || !m_handover_end_records ||
@@ -1924,6 +1935,7 @@ void crusnexo_state::scene_waiting_ready()
 	m_handover_geometry=cruisn::exotica_scene::Result{};
 	m_handover_control={};m_handover_early=false;
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica waiting completion changed CPU cycles\n");
+	m_host_timing.add(frame,m_handover_scene,cruisn::PhaseTiming::waiting_ready,std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-timing_started).count(),completion.items.size());
 }
 
 void crusnexo_state::scene_active_list(uint32_t entry,uint32_t head)
@@ -1997,6 +2009,7 @@ void crusnexo_state::scene_active_seal()
 	}
 	if(m_maincpu->total_cycles()!=cycles)fatalerror("Exotica active sealing changed CPU cycles\n");
 	m_active_seal_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count();
+	m_host_timing.add(renderer_frame(),m_scene_fence_scene,cruisn::PhaseTiming::active_seal,m_active_seal_us);
 }
 
 void crusnexo_state::scene_active_ready()
@@ -2234,11 +2247,20 @@ void crusnexo_state::scene_active_ready()
 		unsigned(selected.objects),unsigned(selected.candidates),unsigned(selected.already_submitted),unsigned(scene.instances.size()),unsigned(scene.quads.size()),unsigned(excluded),
 		(unsigned long long)hash,us(started,assembled),us(assembled,committed),m_scene_fence_end_frame,unsigned(camera_advanced),changed_objects,binding_checks,m_active_seal_us,
 		bindings_advanced,unsigned(model_checks),(unsigned long long)model_bytes,unsigned(scene.instances.size()),unsigned(coverage.count()),lease_us,unsigned(ram_models),m_active_seal_pages,unsigned(m_active_seal_verified))<0)fatalerror("Exotica active scene log write\n");
+	m_host_timing.add(renderer_frame(),m_scene_fence_scene,cruisn::PhaseTiming::active_build,us(started,assembled),scene.quads.size());
+	m_host_timing.add(renderer_frame(),m_scene_fence_scene,cruisn::PhaseTiming::active_material,us(assembled,committed),material_wire.size());
 	++m_active_scenes;m_active_quads+=scene.quads.size();
 }
 
 void crusnexo_state::scene_observer_exit()
 {
+	if(m_host_timing.enabled()) {
+		FILE *file=fopen("exotica-host-timing.csv","w");
+		const bool written=m_host_timing.write(file,renderer_frame());
+		const int closed=file?fclose(file):EOF;
+		fprintf(stderr,"MIDZ_HOST_TIMING_RESULT complete=%u rows=%u final_frame=%u\n",
+			unsigned(written && !closed),unsigned(m_host_timing.size()),renderer_frame());
+	}
 	if(!m_scene_log)return;
 	if(m_compose_log) {
 		const bool good=!m_compose_log.error();const int closed=m_compose_log.close();
