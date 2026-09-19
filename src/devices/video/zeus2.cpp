@@ -27,6 +27,9 @@
 #include "../../mame/midway/cruisn/pause_cheats_win.h"
 namespace mzgl { void start(); void stop(); }
 void midv_trace_wheelpos(running_machine &machine, const char *tag);   // midvunit_v.cpp (POC)
+void midv_ffb_user_stop();
+bool midv_ffb_user_stopped();
+bool midv_ffb_user_stop_saved();
 #endif
 
 
@@ -742,6 +745,12 @@ void thread_main()
 	auto cheat_title = cruisn::menu_text_bitmap("CHEATS");
 	Label lb_cheats = make_label(cheat_title.pixels.data(), cheat_title.width, cheat_title.height);
 	cruisn::pause_cheats cheat_menu;
+	auto stop_bitmap = cruisn::menu_text_bitmap("Stop FFB (F8)");
+	Label lb_stop = make_label(stop_bitmap.pixels.data(), stop_bitmap.width, stop_bitmap.height);
+	auto stopped_bitmap = cruisn::menu_text_bitmap("FFB off - choose On in launcher to resume");
+	Label lb_stopped = make_label(stopped_bitmap.pixels.data(), stopped_bitmap.width, stopped_bitmap.height);
+	auto stop_error_bitmap = cruisn::menu_text_bitmap("FFB stopped this game - saving failed; choose Off in launcher");
+	Label lb_stop_error = make_label(stop_error_bitmap.pixels.data(), stop_error_bitmap.width, stop_error_bitmap.height);
 	Label text_labels[16]{};
 	std::string text_values[16];
 	bool left_prev = false, right_prev = false;
@@ -753,7 +762,7 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(menuprog, "uTex"), 0);
 	bool menu_open = false;
 	int menu_sel = 0;
-	bool f9_prev = false, esc_prev = false, up_prev = false,
+	bool f8_prev = false, f9_prev = false, esc_prev = false, up_prev = false,
 		down_prev = false, ret_prev = false;
 
 	// ---- streaming batch state (port of gpu/zeus_renderer.py) ----
@@ -936,6 +945,7 @@ void thread_main()
 				prev = down;
 				return e || menu_test_key == vk;
 			};
+			if (edge(VK_F8, f8_prev)) midv_ffb_user_stop();
 			bool const escape = edge(VK_ESCAPE, esc_prev);
 			bool const up = edge(VK_UP, up_prev), dn = edge(VK_DOWN, down_prev);
 			bool const ok = edge(VK_RETURN, ret_prev);
@@ -954,13 +964,14 @@ void thread_main()
 				if (dn) cheat_menu.move(1);
 				if (left || right || ok) cheat_menu.change(left ? -1 : right ? 1 : 0, ok);
 			} else if (menu_open) {
-				if (up) menu_sel = (menu_sel + 3) % 4;
-				if (dn) menu_sel = (menu_sel + 1) % 4;
+				if (up) menu_sel = (menu_sel + 4) % 5;
+				if (dn) menu_sel = (menu_sel + 1) % 5;
 				if (ok) {
 					if (menu_sel == 0) { cheat_menu.resume(); menu_open = false; }
 					else if (menu_sel == 1) { crt = !crt; }
 					else if (menu_sel == 2) cheat_menu.open = true;
-					else { cheat_menu.cancel(); PostMessageA(parent, WM_CLOSE, 0, 0); menu_open = false; }
+					else if (menu_sel == 3) { cheat_menu.cancel(); PostMessageA(parent, WM_CLOSE, 0, 0); menu_open = false; }
+					else midv_ffb_user_stop();
 				}
 			}
 			s_zpause.store(menu_open ? 1 : 0);
@@ -1194,13 +1205,14 @@ void thread_main()
 				});
 			} else {
 			mlabel(lb_title, ch * 0.24f, 72 * sc, 1.0f, 0.72f, 0.20f);
-			Label const *items[4] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_cheats, &lb_exit };
-			for (int i = 0; i < 4; i++)
+			Label const *items[5] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_cheats, &lb_exit, &lb_stop };
+			for (int i = 0; i < 5; i++)
 			{
 				bool const sel = (i == menu_sel);
-				mlabel(*items[i], ch * (0.42f + 0.09f * i), 44 * sc,
+				mlabel(*items[i], ch * (0.37f + 0.09f * i), 44 * sc,
 					sel ? 1.0f : 0.85f, sel ? 0.72f : 0.85f, sel ? 0.20f : 0.90f);
 			}
+			if (midv_ffb_user_stopped()) mlabel(midv_ffb_user_stop_saved()?lb_stopped:lb_stop_error, ch * 0.81f, 22 * sc, 1.f, .72f, .20f);
 			mlabel(lb_hint, ch * 0.86f, 22 * sc, 0.75f, 0.75f, 0.80f);
 			}
 			gl.Disable(0x0BE2);

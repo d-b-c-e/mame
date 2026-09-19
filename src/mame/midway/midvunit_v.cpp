@@ -1241,6 +1241,12 @@ void thread_main()
 	auto cheat_title = cruisn::menu_text_bitmap("CHEATS");
 	Label lb_cheats = make_label(cheat_title.pixels.data(), cheat_title.width, cheat_title.height);
 	cruisn::pause_cheats cheat_menu;
+	auto stop_bitmap = cruisn::menu_text_bitmap("Stop FFB (F8)");
+	Label lb_stop = make_label(stop_bitmap.pixels.data(), stop_bitmap.width, stop_bitmap.height);
+	auto stopped_bitmap = cruisn::menu_text_bitmap("FFB off - choose On in launcher to resume");
+	Label lb_stopped = make_label(stopped_bitmap.pixels.data(), stopped_bitmap.width, stopped_bitmap.height);
+	auto stop_error_bitmap = cruisn::menu_text_bitmap("FFB stopped this game - saving failed; choose Off in launcher");
+	Label lb_stop_error = make_label(stop_error_bitmap.pixels.data(), stop_error_bitmap.width, stop_error_bitmap.height);
 	Label text_labels[16]{};
 	std::string text_values[16];
 	bool left_prev = false, right_prev = false;
@@ -1252,6 +1258,7 @@ void thread_main()
 	gl.Uniform1i(gl.GetUniformLocation(menuprog, "uTex"), 0);
 	bool menu_open = false;
 	int menu_sel = 0;
+	bool f8_prev = false;
 	bool esc_prev = false, up_prev = false, down_prev = false, ret_prev = false;
 
 	logf("GL up: scale %d canvas %dx%d crt=%d locs crop=%d crt=%d srch=%d err=%u snapdir=%s",
@@ -1463,6 +1470,7 @@ void thread_main()
 				prev = down;
 				return e || menu_test_key == vk;
 			};
+			if (edge(VK_F8, f8_prev)) midv_ffb_user_stop();
 			bool const escape = edge(VK_ESCAPE, esc_prev);
 			bool const up = edge(VK_UP, up_prev), dn = edge(VK_DOWN, down_prev);
 			bool const ok = edge(VK_RETURN, ret_prev);
@@ -1481,13 +1489,14 @@ void thread_main()
 				if (dn) cheat_menu.move(1);
 				if (left || right || ok) cheat_menu.change(left ? -1 : right ? 1 : 0, ok);
 			} else if (menu_open) {
-				if (up) menu_sel = (menu_sel + 3) % 4;
-				if (dn) menu_sel = (menu_sel + 1) % 4;
+				if (up) menu_sel = (menu_sel + 4) % 5;
+				if (dn) menu_sel = (menu_sel + 1) % 5;
 				if (ok) {
 					if (menu_sel == 0) { cheat_menu.resume(); menu_open = false; }
 					else if (menu_sel == 1) { crt = !crt; gl.UseProgram(pal); gl.Uniform1i(uCrt, crt ? 1 : 0); }
 					else if (menu_sel == 2) cheat_menu.open = true;
-					else { cheat_menu.cancel(); PostMessageA(parent, WM_CLOSE, 0, 0); menu_open = false; }
+					else if (menu_sel == 3) { cheat_menu.cancel(); PostMessageA(parent, WM_CLOSE, 0, 0); menu_open = false; }
+					else midv_ffb_user_stop();
 				}
 			}
 			s_menu_pause.store(menu_open ? 1 : 0);
@@ -1677,13 +1686,14 @@ void thread_main()
 				});
 			} else {
 			mlabel(lb_title, ch * 0.24f, 72 * sc, 1.0f, 0.72f, 0.20f);
-			Label const *items[4] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_cheats, &lb_exit };
-			for (int i = 0; i < 4; i++)
+			Label const *items[5] = { &lb_resume, crt ? &lb_crt_on : &lb_crt_off, &lb_cheats, &lb_exit, &lb_stop };
+			for (int i = 0; i < 5; i++)
 			{
 				bool const s = (i == menu_sel);
-				mlabel(*items[i], ch * (0.42f + 0.09f * i), 44 * sc,
+				mlabel(*items[i], ch * (0.37f + 0.09f * i), 44 * sc,
 					s ? 1.0f : 0.85f, s ? 0.72f : 0.85f, s ? 0.20f : 0.90f);
 			}
+			if (midv_ffb_user_stopped()) mlabel(midv_ffb_user_stop_saved()?lb_stopped:lb_stop_error, ch * 0.81f, 22 * sc, 1.f, .72f, .20f);
 			mlabel(lb_hint, ch * 0.86f, 22 * sc, 0.75f, 0.75f, 0.80f);
 			}
 			gl.Disable(0x0BE2);
@@ -1967,13 +1977,19 @@ namespace mvffb {
 	X(int, SDL_HapticRumbleSupported, (SDL_Haptic *)) \
 	X(int, SDL_HapticRumbleInit, (SDL_Haptic *)) \
 	X(int, SDL_HapticRumblePlay, (SDL_Haptic *, float, Uint32)) \
-	X(int, SDL_HapticRumbleStop, (SDL_Haptic *))
+	X(int, SDL_HapticRumbleStop, (SDL_Haptic *)) \
+	X(int, SDL_HapticStopAll, (SDL_Haptic *))
 
 #define MVFFB_DECL(ret, name, args) static ret (*p_##name) args = nullptr;
 MVFFB_SDL_FUNCS(MVFFB_DECL)
 #undef MVFFB_DECL
 
 static std::atomic<bool> s_game_active{true};
+// A player stop is process-latched. Only an explicit saved On followed by a
+// new launch can resume; game motor writes and menu transitions cannot do so.
+static std::atomic<bool> s_user_stopped{false};
+static std::atomic<bool> s_user_stop_saved{false};
+static std::mutex s_output_mtx; // Serializes user-stop acceptance with one output tick.
 static std::atomic<bool> s_running{false};     // worker up and a device in hand
 static std::atomic<bool> s_stop{false};
 static std::atomic<int> s_level{0};            // requested signed level (-32767..32767)
@@ -2002,6 +2018,7 @@ static std::chrono::steady_clock::time_point s_t0;
 // Explicit diagnostic sink: the actual worker runs, but no SDL haptic API is
 // loaded or called. Journals describe requests, never physical delivery.
 static bool s_observe_worker = false;
+static uint64_t s_worker_user_stop_frame = 0;
 static FILE *s_worker_ticks = nullptr, *s_worker_sources = nullptr;
 static std::atomic<bool> s_worker_error{false}, s_worker_closed{false};
 static uint64_t s_worker_tick_count = 0, s_worker_source_count = 0;
@@ -2217,6 +2234,7 @@ static bool select_device(Device &d)
 
 static void apply(Device &d, int level, bool &running, int &applied)
 {
+	if (s_user_stopped.load()) level=0;
 	if (s_observe_worker)
 	{
 		// This sink accepts a requested value, not a hardware command.
@@ -2336,7 +2354,7 @@ static void worker()
 	// describes. Off by default; the arcade cabinet's own mechanism is what it
 	// stands in for, so how much you want is a matter of taste and of base.
 	int cond_ids[3] = { -1, -1, -1 };
-	bool conditions_active=s_game_active.load();
+	bool conditions_active=s_game_active.load() && !s_user_stopped.load();
 	struct { int pct; unsigned cap; Uint16 type; const char *name; } const conds[3] = {
 		{ s_damper, SDL_HAPTIC_DAMPER, SDL_HAPTIC_DAMPER, "damper" },
 		{ s_friction, SDL_HAPTIC_FRICTION, SDL_HAPTIC_FRICTION, "friction" },
@@ -2373,7 +2391,7 @@ static void worker()
 		e.condition.right_sat[0] = e.condition.left_sat[0] = sat;
 		e.condition.right_coeff[0] = e.condition.left_coeff[0] = coeff;
 		cond_ids[i] = p_SDL_HapticNewEffect(d.hp, &e);
-		if (cond_ids[i] < 0 || (conditions_active && p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0))
+		if (cond_ids[i] < 0 || (conditions_active && !s_user_stopped.load() && p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0))
 			flog("%s: could not start: %s", conds[i].name, p_SDL_GetError());
 		else
 			flog("%s: %d%% of full (%d%% x strength %d%%)", conds[i].name,
@@ -2388,8 +2406,8 @@ static void worker()
 		int const pct = std::clamp(atoi(t), -100, 100);
 		int const lvl = pct * 32767 / 100;
 		flog("TEST: level %d (%d%%) for 1500 ms", lvl, pct);
-		apply(d, lvl, running, applied);
-		for (int i = 0; i < 150 && !s_stop.load(); i++)
+		if (!s_user_stopped.load()) apply(d, lvl, running, applied);
+		for (int i = 0; i < 150 && !s_stop.load() && !s_user_stopped.load(); i++)
 			Sleep(10);
 		apply(d, 0, running, applied);
 		flog("TEST: released");
@@ -2447,6 +2465,7 @@ static void worker()
 	auto last_tick = std::chrono::steady_clock::now();
 	dbce::force::RiseDetector impact_detector;
 	dbce::force::ImpactMixer impact_mixer;
+	bool user_stop_acknowledged=false;
 	while (!s_stop.load() && !s_worker_error.load())
 	{
 		{
@@ -2456,20 +2475,26 @@ static void worker()
 		}
 		if (s_stop.load())
 			break;
+		// The output owner also watches the panic key, so a slow renderer cannot
+		// defer a stop until its next presentation. Never consume another app's F8.
+		DWORD foreground_pid=0;
+		GetWindowThreadProcessId(GetForegroundWindow(),&foreground_pid);
+		if (foreground_pid==GetCurrentProcessId() && (GetAsyncKeyState(VK_F8)&0x8000)) midv_ffb_user_stop();
+		std::lock_guard<std::mutex> output_guard(s_output_mtx);
 		WorkerTick trace;
 		if (s_observe_worker) trace.host = worker_host_seconds();
-		bool const game_active=s_game_active.load();
+		bool const game_active=s_game_active.load() && !s_user_stopped.load();
 		trace.active = game_active;
 		if (game_active!=conditions_active) {
 			for (int id : cond_ids) if (id>=0) {
-				int const rc=game_active?p_SDL_HapticRunEffect(d.hp,id,1):p_SDL_HapticStopEffect(d.hp,id);
+				int const rc=game_active && !s_user_stopped.load()?p_SDL_HapticRunEffect(d.hp,id,1):p_SDL_HapticStopEffect(d.hp,id);
 				if (rc<0) flog("condition gate failed: %s",p_SDL_GetError());
 			}
 			conditions_active=game_active;
 		}
 		int want = game_active?s_level.load():0;
 		trace.before = want;
-		trace.cancel = s_cancel_impact.exchange(false);
+		trace.cancel = s_cancel_impact.exchange(false) || s_user_stopped.load();
 		if (trace.cancel) {
 			impact_mixer.reset(); impact_detector.reset(); shaper.reset();
 			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
@@ -2491,7 +2516,7 @@ static void worker()
 		// including idle: changed-nonzero-only history missed an isolated hit and
 		// dividing this ungained level by a gained maximum changed classification
 		// whenever the player moved the strength slider.
-		int const candidate_level = s_impact_axis ? s_raw_level.load() : want;
+		int const candidate_level = game_active ? (s_impact_axis ? s_raw_level.load() : want) : 0;
 		trace.candidate = candidate_level;
 		bool const impact_candidate = impact_detector.observe(float(candidate_level) / 32767.f,
 			double(trace.detector_ms = now_ms()) / 1000.0);
@@ -2509,7 +2534,7 @@ static void worker()
 			int result = -1;
 			if (s_impact_axis)
 				impact_mixer.trigger(impact_detector.last_arrival, float(candidate_level), double(trace.trigger_ms = now_ms()) / 1000.0);
-			if (rumble_ok && !s_impact_axis)
+			if (rumble_ok && !s_impact_axis && !s_user_stopped.load())
 			{
 				float const amplitude = impact_detector.last_arrival * float(s_rumble) / 100.f
 					* float(s_strength) / 100.f;
@@ -2536,7 +2561,7 @@ static void worker()
 		float const shaped = shaper.shape(float(want) / 32767.f, 0.f, trace.dt, false);
 		float const mixed = s_impact_axis ? impact_mixer.mix(shaped, double(trace.mix_ms = now_ms()) / 1000.0,
 			float(s_strength) / 100.f) : shaped;
-		int const out = int(std::lround(double(mixed) * 32767.0));
+		int const out = s_user_stopped.load() ? 0 : int(std::lround(double(mixed) * 32767.0));
 		trace.shaped = shaped; trace.mixed = mixed; trace.out = out;
 		if (out != applied)
 		{
@@ -2559,6 +2584,17 @@ static void worker()
 					std::chrono::steady_clock::now() - s_ffb_trace_t0).count();
 				fprintf(s_ffb_trace, "%lld,%s,%d\n", (long long)ms,
 					s_observe_worker ? "constant_sink_accepted" : "constant_api_accepted", applied == out);
+			}
+		}
+		if (s_user_stopped.load() && !user_stop_acknowledged) {
+			// Retry a failed device stop on the owner thread. A zero bookkeeping
+			// value alone must not be reported as successful actuator cancellation.
+			apply(d,0,running,applied);
+			bool const stopped=s_observe_worker || p_SDL_HapticStopAll(d.hp)==0;
+			bool const rumble_stopped=!rumble_ok || p_SDL_HapticRumbleStop(d.hp)==0;
+			if (stopped && rumble_stopped) {
+				user_stop_acknowledged=true;
+				osd_printf_info("MIDV_FFB_USER_STOP_ACK host_seconds=%.17g device_free=%d\n",worker_host_seconds(),int(s_observe_worker));
 			}
 		}
 		worker_tick_trace(trace);
@@ -2607,8 +2643,17 @@ static void start(running_machine &machine)
 	}
 	if (s_observe_worker && (!on || strcmp(on, "0") || std::getenv("MIDV_FFB_TEST")))
 		fatalerror("FFB worker observation requires MIDV_FFB=0 and no sign test");
+	if (const char *text=std::getenv("MIDV_FFB_USER_STOP_FRAME")) {
+		char *end=nullptr;unsigned long long frame=strtoull(text,&end,10);
+		if (!s_observe_worker || !*text || *end || frame<1 || frame>1000000)
+			fatalerror("User-stop schedule requires device-free worker and frame1..1000000");
+		s_worker_user_stop_frame=frame;
+	}
+	if (const wchar_t *path=_wgetenv(L"MIDV_FFB_STOP_FILE"))
+		if (GetFileAttributesW(path)!=INVALID_FILE_ATTRIBUTES) s_user_stopped.store(true);
 	if (!s_observe_worker && (!on || atoi(on) == 0))
 		return;
+	if (!s_observe_worker && s_user_stopped.load()) return;
 	s_t0 = std::chrono::steady_clock::now();
 	s_impact_axis = std::getenv("MIDV_FFB_IMPACT") && atoi(std::getenv("MIDV_FFB_IMPACT")) == 1;
 	if (const char *l = std::getenv("MIDV_FFB_LOG"))
@@ -2680,6 +2725,7 @@ static FILE *s_drivetrain_trace = nullptr;
 void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds, bool game_invert)
 {
 	mvffb::worker_source_trace(raw, adapted, frame, seconds, game_invert);
+	if (mvffb::s_worker_user_stop_frame && frame>=mvffb::s_worker_user_stop_frame) midv_ffb_user_stop();
 	mvffb::s_raw_level.store(mvffb::s_game_active.load()?cruisn::motor_level(raw, mvffb::s_invert, game_invert):0);
 	if (s_force_gate)
 		fprintf(s_force_gate,"%.9f,%llu,%d,%d,%d,%d,%d\n",seconds,(unsigned long long)frame,
@@ -2692,11 +2738,30 @@ void midv_ffb_source(int raw, int adapted, uint64_t frame, double seconds, bool 
 
 // Motor byte from the drivers (signed, after gain/slew/clamp). Any thread.
 void midv_ffb_cancel() { mvffb::s_raw_level.store(0); mvffb::s_cancel_impact.store(true); midv_ffb_write(0); }
+bool midv_ffb_user_stopped() { return mvffb::s_user_stopped.load(); }
+bool midv_ffb_user_stop_saved() { return mvffb::s_user_stop_saved.load(); }
+void midv_ffb_user_stop()
+{
+	{
+		std::lock_guard<std::mutex> output_guard(mvffb::s_output_mtx);
+		if (mvffb::s_user_stopped.exchange(true)) return;
+	}
+	midv_ffb_cancel(); // Wakes the sole haptic owner; no SDL calls on the UI thread.
+	bool persisted=false;
+	if (const wchar_t *path = _wgetenv(L"MIDV_FFB_STOP_FILE")) {
+		HANDLE file=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+		if (file!=INVALID_HANDLE_VALUE) {
+			persisted=FlushFileBuffers(file)!=0;CloseHandle(file);
+		} else persisted=GetLastError()==ERROR_FILE_EXISTS || GetLastError()==ERROR_ALREADY_EXISTS;
+	}
+	mvffb::s_user_stop_saved.store(persisted);
+	osd_printf_info("MIDV_FFB_USER_STOP host_seconds=%.17g persisted=%d\n",mvffb::s_running.load()?mvffb::worker_host_seconds():-1.,int(persisted));
+}
 void midv_ffb_write(int f, bool game_invert)
 {
 	if (!mvffb::s_running.load())
 		return;
-	int const level = mvffb::s_game_active.load()?cruisn::motor_level(f, mvffb::s_invert,game_invert):0;
+	int const level = mvffb::s_game_active.load() && !mvffb::s_user_stopped.load()?cruisn::motor_level(f, mvffb::s_invert,game_invert):0;
 	if (mvffb::s_loglevel >= 2)
 		mvffb::flog("write %d -> level %d", f, level);
 	mvffb::s_level.store(level);
