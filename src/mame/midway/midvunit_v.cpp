@@ -2212,12 +2212,14 @@ static bool select_device(Device &d)
 	}
 	if (s_user_stopped.load()) return false;
 	int const index=selected.index;
+	if (instances[index]<0) { flog("selected device instance query failed - force feedback off");return false; }
 	SDL_Joystick *js=p_SDL_JoystickOpen(index);
 	if (!js) { flog("selected joystick could not open: %s",p_SDL_GetError());return false; }
 	char const *name=p_SDL_JoystickName(js),*path=p_SDL_JoystickPath(js);
 	std::vector<cruisn::force_device_identity> const opened{{name?name:"",path?path:"",
 		p_SDL_JoystickGetVendor(js),p_SDL_JoystickGetProduct(js),false}};
-	if (!p_SDL_JoystickGetAttached(js) || p_SDL_JoystickInstanceID(js)!=instances[index]
+	Sint32 const opened_instance=p_SDL_JoystickInstanceID(js);
+	if (!p_SDL_JoystickGetAttached(js) || opened_instance<0 || opened_instance!=instances[index]
 		|| cruisn::select_force_device(want,opened).index!=0 || s_user_stopped.load()) {
 		flog("selected device changed before haptic open - force feedback off");
 		p_SDL_JoystickClose(js);return false;
