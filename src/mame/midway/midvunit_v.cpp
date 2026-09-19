@@ -2001,6 +2001,7 @@ static std::atomic<bool> s_game_active{true};
 // new launch can resume; game motor writes and menu transitions cannot do so.
 static std::atomic<bool> s_user_stopped{false};
 static std::atomic<bool> s_user_stop_saved{false};
+static std::atomic<bool> s_user_stop_persist_pending{false};
 static std::mutex s_output_mtx; // Serializes user-stop acceptance with one output tick.
 static std::atomic<bool> s_running{false};     // worker up and a device in hand
 static std::atomic<bool> s_stop{false};
@@ -2245,6 +2246,32 @@ static bool select_device(Device &d)
 	return true;
 }
 
+static bool latch_user_stop()
+{
+	{
+		std::lock_guard<std::mutex> output_guard(s_output_mtx);
+		if (s_user_stopped.exchange(true)) return false;
+		worker_output_trace("latch",0,1.);
+		s_user_stop_persist_pending.store(true);
+	}
+	midv_ffb_cancel(); // Wake the sole output owner before any filesystem work.
+	return true;
+}
+
+static void persist_user_stop()
+{
+	if (!s_user_stop_persist_pending.exchange(false)) return;
+	bool persisted=false;
+	if (const wchar_t *path = _wgetenv(L"MIDV_FFB_STOP_FILE")) {
+		HANDLE file=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+		if (file!=INVALID_HANDLE_VALUE) {
+			persisted=FlushFileBuffers(file)!=0;CloseHandle(file);
+		} else persisted=GetLastError()==ERROR_FILE_EXISTS || GetLastError()==ERROR_ALREADY_EXISTS;
+	}
+	s_user_stop_saved.store(persisted);
+	osd_printf_info("MIDV_FFB_USER_STOP host_seconds=%.17g persisted=%d\n",s_running.load()?worker_host_seconds():-1.,int(persisted));
+}
+
 // Sole output-owner thread, before taking s_output_mtx. SDL's attachment flag
 // is refreshed by Update; checking its cached value alone misses unplugging.
 // Never enumerate/open a replacement here. Loss latches the same durable Off
@@ -2263,7 +2290,7 @@ static bool check_output_attachment(Device &d, long long now)
 	if (!attached) {
 		flog("selected output disconnected or changed - force latched off; explicitly enable after reconnecting");
 		osd_printf_info("MIDV_FFB_DEVICE_LOST instance=%d\n",int(d.instance));
-		midv_ffb_user_stop();
+		latch_user_stop(); // Owner defers persistence until cancellation is attempted.
 	}
 	return attached;
 }
@@ -2344,6 +2371,26 @@ static int stop_all_output(Device &d)
 	s_worker_sink_level=0;s_worker_condition_mask=0;s_worker_rumble=0.f;
 	worker_output_trace("stop_all",0,0.);
 	return 0;
+}
+
+// Called by the output owner under s_output_mtx. Disk persistence may stall;
+// attempt ALL effect-family cancellations first, and acknowledge only successful
+// SDL stops. Failed API stops remain retryable on later worker ticks.
+static void service_user_stop(Device &d,bool &running,int &applied,bool rumble_ok,bool &acknowledged)
+{
+	if (!s_user_stopped.load()) return;
+	if (!acknowledged) {
+		apply(d,0,running,applied);
+		bool const stopped=stop_all_output(d)==0;
+		bool const rumble_stopped=!rumble_ok || rumble_output(d,0.f)==0;
+		if (stopped && rumble_stopped) {
+			acknowledged=true;
+			s_worker_user_stop_ack=worker_host_seconds();
+			worker_output_trace("ack",0,0.);
+			osd_printf_info("MIDV_FFB_USER_STOP_ACK host_seconds=%.17g device_free=%d\n",worker_host_seconds(),int(s_observe_worker));
+		}
+	}
+	persist_user_stop();
 }
 
 static void worker()
@@ -2467,6 +2514,7 @@ static void worker()
 
 	bool running = false;
 	int applied = 0;
+	bool user_stop_acknowledged=false;
 	bool hold_said = false;
 	if (const char *t = std::getenv("MIDV_FFB_TEST"))
 	{
@@ -2479,7 +2527,11 @@ static void worker()
 			check_output_attachment(d,now_ms());
 			Sleep(10);
 		}
-		apply(d, 0, running, applied);
+		{
+			std::lock_guard<std::mutex> output_guard(s_output_mtx);
+			apply(d, 0, running, applied);
+			service_user_stop(d,running,applied,rumble_ok,user_stop_acknowledged);
+		}
 		flog("TEST: released");
 	}
 	// ---- conditioning: the toolkit's shaper, driven by a named profile ----
@@ -2535,7 +2587,6 @@ static void worker()
 	auto last_tick = std::chrono::steady_clock::now();
 	dbce::force::RiseDetector impact_detector;
 	dbce::force::ImpactMixer impact_mixer;
-	bool user_stop_acknowledged=false;
 	while (!s_stop.load() && !s_worker_error.load())
 	{
 		{
@@ -2549,7 +2600,7 @@ static void worker()
 		// defer a stop until its next presentation. Never consume another app's F8.
 		DWORD foreground_pid=0;
 		GetWindowThreadProcessId(GetForegroundWindow(),&foreground_pid);
-		if (foreground_pid==GetCurrentProcessId() && (GetAsyncKeyState(VK_F8)&0x8000)) midv_ffb_user_stop();
+		if (foreground_pid==GetCurrentProcessId() && (GetAsyncKeyState(VK_F8)&0x8000)) latch_user_stop();
 		check_output_attachment(d,now_ms());
 		std::lock_guard<std::mutex> output_guard(s_output_mtx);
 		WorkerTick trace;
@@ -2657,25 +2708,14 @@ static void worker()
 					s_observe_worker ? "constant_sink_accepted" : "constant_api_accepted", applied == out);
 			}
 		}
-		if (s_user_stopped.load() && !user_stop_acknowledged) {
-			// Retry a failed device stop on the owner thread. A zero bookkeeping
-			// value alone must not be reported as successful actuator cancellation.
-			apply(d,0,running,applied);
-			bool const stopped=stop_all_output(d)==0;
-			bool const rumble_stopped=!rumble_ok || rumble_output(d,0.f)==0;
-			if (stopped && rumble_stopped) {
-				user_stop_acknowledged=true;
-				s_worker_user_stop_ack=worker_host_seconds();
-				worker_output_trace("ack",0,0.);
-				osd_printf_info("MIDV_FFB_USER_STOP_ACK host_seconds=%.17g device_free=%d\n",worker_host_seconds(),int(s_observe_worker));
-			}
-		}
+		service_user_stop(d,running,applied,rumble_ok,user_stop_acknowledged);
 		worker_tick_trace(trace);
 	}
 	std::lock_guard<std::mutex> output_guard(s_output_mtx);
 	apply(d, 0, running, applied);
 	if (rumble_ok) rumble_output(d,0.f);
 	for (int id:cond_ids) if (id>=0) condition_output(d,id,false);
+	service_user_stop(d,running,applied,rumble_ok,user_stop_acknowledged);
 	if (s_observe_worker)
 	{
 		s_worker_stop_seconds = worker_host_seconds();
@@ -2827,21 +2867,9 @@ bool midv_ffb_user_stopped() { return mvffb::s_user_stopped.load(); }
 bool midv_ffb_user_stop_saved() { return mvffb::s_user_stop_saved.load(); }
 void midv_ffb_user_stop()
 {
-	{
-		std::lock_guard<std::mutex> output_guard(mvffb::s_output_mtx);
-		if (mvffb::s_user_stopped.exchange(true)) return;
-		mvffb::worker_output_trace("latch",0,1.);
-	}
-	midv_ffb_cancel(); // Wakes the sole haptic owner; no SDL calls on the UI thread.
-	bool persisted=false;
-	if (const wchar_t *path = _wgetenv(L"MIDV_FFB_STOP_FILE")) {
-		HANDLE file=CreateFileW(path,GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
-		if (file!=INVALID_HANDLE_VALUE) {
-			persisted=FlushFileBuffers(file)!=0;CloseHandle(file);
-		} else persisted=GetLastError()==ERROR_FILE_EXISTS || GetLastError()==ERROR_ALREADY_EXISTS;
-	}
-	mvffb::s_user_stop_saved.store(persisted);
-	osd_printf_info("MIDV_FFB_USER_STOP host_seconds=%.17g persisted=%d\n",mvffb::s_running.load()?mvffb::worker_host_seconds():-1.,int(persisted));
+	// UI/game thread persistence cannot delay the independently woken actuator
+	// owner. Calls from that owner use latch_user_stop + service_user_stop instead.
+	if (mvffb::latch_user_stop()) mvffb::persist_user_stop();
 }
 void midv_ffb_write(int f, bool game_invert)
 {
