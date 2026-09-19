@@ -10,6 +10,7 @@
 
 #include "emu.h"
 #include "inputdev.h"
+#include "control_calibration.h"
 
 #include "corestr.h"
 #include "emuopts.h"
@@ -1003,6 +1004,20 @@ s32 input_device_absolute_item::read_as_relative(input_item_modifier modifier)
 
 s32 input_device_absolute_item::read_as_absolute(input_item_modifier modifier)
 {
+	// Only explicitly calibrated device/axis pairs bypass the stock deadzone
+	// and half-axis conversion. Everything else follows the original path below.
+	int const slot=int(itemid())-int(ITEM_ID_XAXIS);
+	if (m_device.devclass()==DEVICE_CLASS_JOYSTICK && slot>=0 && slot<8) {
+		auto const *cal=cruisn::active_control_calibration().find(m_device.id(),slot);
+		if (cal) {
+			if (modifier!=ITEM_MODIFIER_NONE) fatalerror("Calibrated axis cannot apply a second reverse/half-axis modifier");
+			// DirectInput already applied this profile, at its raw device/axis
+			// boundary. Do not add MAME deadzone, saturation or half-axis again.
+			s32 const value=update_value();
+			return value<osd::input_device::ABSOLUTE_MIN || value>osd::input_device::ABSOLUTE_MAX?
+				(cal->pedal?osd::input_device::ABSOLUTE_MIN:0):value;
+		}
+	}
 	// start with the current value
 	s32 result = m_device.adjust_absolute(update_value());
 	assert(result >= osd::input_device::ABSOLUTE_MIN && result <= osd::input_device::ABSOLUTE_MAX);

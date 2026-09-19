@@ -96,6 +96,7 @@ Rz          Rudder
 #if defined(OSD_WINDOWS) || defined(SDLMAME_WIN32)
 
 #include "input_dinput.h"
+#include "control_calibration.h"
 
 #include "interface/inputseq.h"
 #include "windows/winutil.h"
@@ -572,6 +573,10 @@ void dinput_joystick_device::reset()
 {
 	memset(&m_joystick.state, 0, sizeof(m_joystick.state));
 	std::fill(std::begin(m_joystick.state.rgdwPOV), std::end(m_joystick.state.rgdwPOV), 0xffff);
+	for (int slot=0;slot<8;++slot) {
+		auto const *cal=cruisn::active_control_calibration().find(id(),slot);
+		if (cal) *(&m_joystick.state.lX+slot)=cal->pedal?input_device::ABSOLUTE_MIN:0;
+	}
 }
 
 void dinput_joystick_device::poll(bool relative_reset)
@@ -589,9 +594,21 @@ void dinput_joystick_device::poll(bool relative_reset)
 				LONG *const axis = &m_joystick.state.lX + axisnum;
 				double const offset = *axis - m_joystick.rangemin[axisnum];
 				double const scaled = offset * double(input_device::ABSOLUTE_MAX - input_device::ABSOLUTE_MIN) / double(range);
-				*axis = lround(std::clamp<double>(scaled + input_device::ABSOLUTE_MIN, input_device::ABSOLUTE_MIN, input_device::ABSOLUTE_MAX));
+				double const raw=std::clamp<double>(scaled+input_device::ABSOLUTE_MIN,input_device::ABSOLUTE_MIN,input_device::ABSOLUTE_MAX);
+				auto const *cal=cruisn::active_control_calibration().find(id(),axisnum);
+				if (cal) {
+					double const value=cruisn::normalize_control(raw/double(input_device::ABSOLUTE_MAX),*cal);
+					*axis=LONG(std::lround((cal->pedal?value*2.-1.:value)*double(input_device::ABSOLUTE_MAX)));
+				} else *axis=lround(raw);
 			}
 		}
+	}
+	else if (cruisn::active_control_calibration().configured) {
+		// Opted-in controls cannot retain the last successful sample after loss.
+		// These states are already normalized for calibrated axes. Reset their
+		// effective values to exact zero, regardless of endpoint/inversion, and
+		// release every button/POV on this device, including shared-primary roles.
+		reset();
 	}
 }
 
@@ -650,6 +667,8 @@ void dinput_joystick_device::configure(input_device &device)
 
 		m_joystick.rangemin[axisnum] = dipr.lMin;
 		m_joystick.rangemax[axisnum] = dipr.lMax;
+		if (cruisn::active_control_calibration().find(id(),int(axisnum)) && dipr.lMax<=dipr.lMin)
+			fatalerror("Calibrated control axis has an invalid device range");
 
 		// populate the item description as well
 		axisitems[axisnum] = device.add_item(

@@ -21,6 +21,7 @@
 #include "inputdev.h"
 
 #include "corestr.h"
+#include "control_calibration.h"
 
 
 
@@ -1189,10 +1190,19 @@ void input_manager::seq_from_tokens(input_seq &seq, std::string_view string)
 
 bool input_manager::map_device_to_controller(const devicemap_table &table)
 {
+	try {
+		auto const &profile=cruisn::active_control_calibration();
+		if (profile.configured) osd_printf_info("CRUISN_INPUT_PROFILE version=1 entries=%u\n",unsigned(profile.entries.size()));
+	} catch (std::exception const &error) { fatalerror("Control calibration: %s",error.what()); }
+	// Apply explicit identities last so a legacy name mapping cannot override
+	// the selected physical instance. Legacy-only configurations retain order.
+	for (int identity_pass=0;identity_pass<2;++identity_pass)
 	for (const auto &it : table)
 	{
 		std::string_view deviceid = it.first;
 		std::string_view controllername = it.second;
+		bool const strict=cruisn::strict_input_selector(deviceid);
+		if (strict!=(identity_pass==1)) continue;
 
 		// tokenize the controller name into device class and index (i.e. controller name should be of the form "GUNCODE_1")
 		std::string token[2];
@@ -1228,6 +1238,23 @@ bool input_manager::map_device_to_controller(const devicemap_table &table)
 
 		// enumerate through devices and look for a match
 		input_class *input_devclass = m_class[devclass].get();
+		if (strict) {
+			if (devclass!=DEVICE_CLASS_JOYSTICK || devindex<0) fatalerror("Invalid strict joystick mapping");
+			std::vector<std::string> identities;
+			for (int i=0;i<=input_devclass->maxindex();++i) {
+				auto const *device=input_devclass->device(i);identities.push_back(device?device->id():"");
+			}
+			int const index=cruisn::unique_input_identity(deviceid,identities);
+			if (index<0) fatalerror("Saved control device is %s; reconnect or explicitly replace it in Controls",
+				index==-2?"ambiguous":index==-3?"invalid":"disconnected");
+			auto *device=input_devclass->device(index);
+			for (auto const &entry:cruisn::active_control_calibration().entries)
+				if (entry.identity==cruisn::actual_input_identity(device->id()) && !device->item(input_item_id(ITEM_ID_XAXIS+entry.slot)))
+					fatalerror("Saved calibrated axis is unavailable; calibrate the replacement explicitly");
+			input_devclass->remap_device_index(device->devindex(),devindex);
+			osd_printf_info("CRUISN_INPUT_IDENTITY controller=%s identity=%s\n",std::string(controllername),std::string(deviceid));
+			continue;
+		}
 		for (int devnum = 0; devnum <= input_devclass->maxindex(); devnum++)
 		{
 			input_device *device = input_devclass->device(devnum);
