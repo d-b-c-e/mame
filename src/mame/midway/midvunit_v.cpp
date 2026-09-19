@@ -14,6 +14,7 @@
 #include "cruisn/hud_numeric_speed.h"
 #include "cruisn/hud_drivetrain.h"
 #include "cruisn/motor_signal.h"
+#include "cruisn/ffb_device_selection.h"
 #include "cruisn/tjunctions.h"
 #include "cruisn/retained_texture.h"
 #include "cruisn/cpu_upload_spans.h"
@@ -1957,10 +1958,21 @@ namespace mvffb {
 	X(SDL_bool, SDL_SetHint, (const char *, const char *)) \
 	X(const char *, SDL_GetError, (void)) \
 	X(int, SDL_NumJoysticks, (void)) \
+	X(void, SDL_LockJoysticks, (void)) \
+	X(void, SDL_UnlockJoysticks, (void)) \
+	X(const char *, SDL_JoystickNameForIndex, (int)) \
+	X(const char *, SDL_JoystickPathForIndex, (int)) \
+	X(Uint16, SDL_JoystickGetDeviceVendor, (int)) \
+	X(Uint16, SDL_JoystickGetDeviceProduct, (int)) \
+	X(Sint32, SDL_JoystickGetDeviceInstanceID, (int)) \
+	X(SDL_bool, SDL_JoystickIsVirtual, (int)) \
 	X(void, SDL_JoystickUpdate, (void)) \
 	X(SDL_Joystick *, SDL_JoystickOpen, (int)) \
 	X(void, SDL_JoystickClose, (SDL_Joystick *)) \
 	X(const char *, SDL_JoystickName, (SDL_Joystick *)) \
+	X(const char *, SDL_JoystickPath, (SDL_Joystick *)) \
+	X(Sint32, SDL_JoystickInstanceID, (SDL_Joystick *)) \
+	X(SDL_bool, SDL_JoystickGetAttached, (SDL_Joystick *)) \
 	X(SDL_JoystickType, SDL_JoystickGetType, (SDL_Joystick *)) \
 	X(Uint16, SDL_JoystickGetVendor, (SDL_Joystick *)) \
 	X(Uint16, SDL_JoystickGetProduct, (SDL_Joystick *)) \
@@ -2163,16 +2175,6 @@ static bool load_sdl()
 	return ok;
 }
 
-static bool icontains(const char *hay, const char *needle)
-{
-	if (!hay || !needle || !*needle)
-		return false;
-	std::string h(hay), n(needle);
-	for (auto &c : h) c = char(tolower((unsigned char)c));
-	for (auto &c : n) c = char(tolower((unsigned char)c));
-	return h.find(n) != std::string::npos;
-}
-
 struct Device
 {
 	SDL_Joystick *js = nullptr;
@@ -2183,75 +2185,58 @@ struct Device
 	std::string name;
 };
 
-// Cannonball DX's selection order, trimmed to what we know: the device the
-// launcher names (wizard steering device) is authoritative; else a wheel-type
-// device with a constant-force actuator; else any constant-force device.
+// Resolve the whole inventory before opening haptics. Never choose a first
+// device on a missing/ambiguous selection. SDL's Windows DirectInput path is
+// the same DIPROP_GUIDANDPATH value used by the launcher's identity inventory.
 static bool select_device(Device &d)
 {
-	const char *want = std::getenv("MIDV_FFB_DEVICE");
-	unsigned wvid = 0, wpid = 0;
-	bool const want_vidpid = want && sscanf(want, "%x:%x", &wvid, &wpid) == 2;
-	bool const want_name = want && *want && !want_vidpid;
-	int const n = p_SDL_NumJoysticks();
-	flog("%d joystick(s) via SDL %s", n, want ? want : "(no MIDV_FFB_DEVICE: first wheel)");
-	for (int pass = 0; pass < 3; pass++)
-	{
-		if (pass == 0 && !want_vidpid && !want_name)
-			continue;
-		for (int i = 0; i < n; i++)
-		{
-			SDL_Joystick *js = p_SDL_JoystickOpen(i);
-			if (!js)
-				continue;
-			const char *name = p_SDL_JoystickName(js);
-			unsigned const vid = p_SDL_JoystickGetVendor(js), pid = p_SDL_JoystickGetProduct(js);
-			bool const wheel = (p_SDL_JoystickGetType(js) == SDL_JOYSTICK_TYPE_WHEEL);
-			if (pass == 0)
-				flog("  [%d] \"%s\" vid %04x pid %04x%s", i, name ? name : "?", vid, pid, wheel ? " (wheel)" : "");
-			bool match = true;
-			if (pass == 0)
-				match = want_vidpid ? (vid == wvid && pid == wpid) : icontains(name, want);
-			else if (pass == 1)
-				match = wheel;
-			if (!match)
-			{
-				p_SDL_JoystickClose(js);
-				continue;
-			}
-			SDL_Haptic *hp = p_SDL_HapticOpenFromJoystick(js);
-			if (!hp)
-			{
-				if (pass == 0)
-					flog("  [%d] matches but has no haptics: %s", i, p_SDL_GetError());
-				p_SDL_JoystickClose(js);
-				if (pass == 0)
-					return false;   // the named device cannot do it: never push another wheel
-				continue;
-			}
-			unsigned const caps = p_SDL_HapticQuery(hp);
-			if (!(caps & SDL_HAPTIC_CONSTANT))
-			{
-				flog("  [%d] haptic but no constant force (caps 0x%x)", i, caps);
-				p_SDL_HapticClose(hp);
-				p_SDL_JoystickClose(js);
-				if (pass == 0)
-					return false;
-				continue;
-			}
-			d.js = js; d.hp = hp; d.caps = caps; d.is_wheel = wheel;
-			d.name = name ? name : "?";
-			flog("using [%d] \"%s\" (pass %d, caps 0x%x%s)", i, d.name.c_str(), pass, caps,
-					wheel ? ", steering axis" : ", cartesian");
-			return true;
-		}
-		if (pass == 0)
-		{
-			flog("MIDV_FFB_DEVICE \"%s\" matched nothing - force feedback off", want);
-			return false;
-		}
+	const char *want=std::getenv("MIDV_FFB_DEVICE");
+	struct InventoryLock {
+		InventoryLock() { p_SDL_LockJoysticks(); }
+		~InventoryLock() { p_SDL_UnlockJoysticks(); }
+	} lock;
+	int const count=p_SDL_NumJoysticks();
+	if (count<0 || count>1024) { flog("invalid joystick inventory - force feedback off");return false; }
+	std::vector<cruisn::force_device_identity> inventory;
+	std::vector<Sint32> instances;
+	for (int i=0;i<count;++i) {
+		char const *name=p_SDL_JoystickNameForIndex(i),*path=p_SDL_JoystickPathForIndex(i);
+		inventory.push_back({name?name:"",path?path:"",p_SDL_JoystickGetDeviceVendor(i),
+			p_SDL_JoystickGetDeviceProduct(i),p_SDL_JoystickIsVirtual(i)==SDL_TRUE});
+		instances.push_back(p_SDL_JoystickGetDeviceInstanceID(i));
 	}
-	flog("no constant-force device found - force feedback off");
-	return false;
+	auto const selected=cruisn::select_force_device(want?want:"",inventory);
+	if (selected.index<0) {
+		flog("%s - force feedback off",selected.reason);
+		osd_printf_info("MIDV_FFB_DEVICE_INACTIVE %s\n",selected.reason);return false;
+	}
+	if (s_user_stopped.load()) return false;
+	int const index=selected.index;
+	SDL_Joystick *js=p_SDL_JoystickOpen(index);
+	if (!js) { flog("selected joystick could not open: %s",p_SDL_GetError());return false; }
+	char const *name=p_SDL_JoystickName(js),*path=p_SDL_JoystickPath(js);
+	std::vector<cruisn::force_device_identity> const opened{{name?name:"",path?path:"",
+		p_SDL_JoystickGetVendor(js),p_SDL_JoystickGetProduct(js),false}};
+	if (!p_SDL_JoystickGetAttached(js) || p_SDL_JoystickInstanceID(js)!=instances[index]
+		|| cruisn::select_force_device(want,opened).index!=0 || s_user_stopped.load()) {
+		flog("selected device changed before haptic open - force feedback off");
+		p_SDL_JoystickClose(js);return false;
+	}
+	SDL_Haptic *hp=p_SDL_HapticOpenFromJoystick(js);
+	if (!hp) {
+		flog("selected device has no haptics: %s",p_SDL_GetError());
+		p_SDL_JoystickClose(js);return false;
+	}
+	unsigned const caps=p_SDL_HapticQuery(hp);
+	if (!(caps&SDL_HAPTIC_CONSTANT)) {
+		flog("selected device has no constant force (caps 0x%x)",caps);
+		p_SDL_HapticClose(hp);p_SDL_JoystickClose(js);return false;
+	}
+	d.js=js;d.hp=hp;d.caps=caps;d.name=name?name:"?";
+	d.is_wheel=p_SDL_JoystickGetType(js)==SDL_JOYSTICK_TYPE_WHEEL;
+	flog("using exact unique [%d] \"%s\" (caps 0x%x%s)",index,d.name.c_str(),caps,
+		d.is_wheel?", steering axis":", cartesian");
+	return true;
 }
 
 static void apply(Device &d, int level, bool &running, int &applied)
