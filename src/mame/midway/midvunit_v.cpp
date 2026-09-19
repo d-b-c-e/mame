@@ -2019,7 +2019,7 @@ static std::chrono::steady_clock::time_point s_t0;
 // loaded or called. Journals describe requests, never physical delivery.
 static bool s_observe_worker = false;
 static uint64_t s_worker_user_stop_frame = 0;
-static FILE *s_worker_ticks = nullptr, *s_worker_sources = nullptr;
+static FILE *s_worker_ticks = nullptr, *s_worker_sources = nullptr, *s_worker_outputs = nullptr;
 static std::atomic<bool> s_worker_error{false}, s_worker_closed{false};
 static uint64_t s_worker_tick_count = 0, s_worker_source_count = 0;
 static uint64_t s_worker_tick_bytes = 0, s_worker_source_bytes = 0;
@@ -2027,11 +2027,26 @@ static bool s_worker_profile_loaded = false;
 static float s_worker_effective_smoothing = 0.f;
 static double s_worker_stop_seconds = 0.;
 static int s_worker_sink_level = 0;
+static unsigned s_worker_condition_mask = 0;
+static float s_worker_rumble = 0.f;
+static uint64_t s_worker_output_count = 0, s_worker_output_bytes = 0;
+static double s_worker_user_stop_ack = -1.;
 static constexpr uint64_t worker_max_records = 131072, worker_max_bytes = 64 * 1024 * 1024;
 
 static double worker_host_seconds()
 {
 	return std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count();
+}
+
+// Called under the output mutex (or during owner-thread shutdown). This is
+// accepted logical sink state, not proof that a physical wheel delivered it.
+static void worker_output_trace(char const *family, int channel, double value)
+{
+	if (!s_observe_worker || !s_worker_outputs || s_worker_error.load()) return;
+	if (++s_worker_output_count > worker_max_records) { s_worker_error.store(true); return; }
+	int const bytes=fprintf(s_worker_outputs,"%llu,%.17g,%s,%d,%.17g,%d\n",
+		(unsigned long long)s_worker_output_count,worker_host_seconds(),family,channel,value,int(s_user_stopped.load()));
+	if (bytes<0 || (s_worker_output_bytes+=uint64_t(bytes))>worker_max_bytes) s_worker_error.store(true);
 }
 
 struct WorkerTick
@@ -2070,24 +2085,31 @@ static void worker_source_trace(int raw, int adapted, uint64_t frame, double sec
 static void worker_finish_trace()
 {
 	if (!s_observe_worker) return;
+	std::lock_guard<std::mutex> output_guard(s_output_mtx);
 	if (s_worker_ticks && fclose(s_worker_ticks)) s_worker_error.store(true);
 	if (s_worker_sources && fclose(s_worker_sources)) s_worker_error.store(true);
-	s_worker_ticks = s_worker_sources = nullptr;
+	if (s_worker_outputs && fclose(s_worker_outputs)) s_worker_error.store(true);
+	s_worker_ticks = s_worker_sources = s_worker_outputs = nullptr;
 	FILE *receipt = fopen("ffb-worker-receipt.json", "wb");
 	if (!receipt) { s_worker_error.store(true); return; }
-	bool const complete = !s_worker_error.load() && s_worker_closed.load() && s_worker_tick_count > 0;
+	bool const complete = !s_worker_error.load() && s_worker_closed.load() && s_worker_tick_count > 0
+		&& s_worker_output_count>0 && s_worker_sink_level==0 && s_worker_condition_mask==0 && s_worker_rumble==0.f;
 	int const written = fprintf(receipt,"{\"schema\":1,\"complete\":%s,\"device_free\":true,\"physical_output\":false,"
 		"\"ticks\":%llu,\"sources\":%llu,\"tick_bytes\":%llu,\"source_bytes\":%llu,"
 		"\"profile\":\"%s\",\"profile_loaded\":%s,\"smoothing_ms\":%.9g,"
 		"\"strength\":%d,\"impact_axis\":%s,\"hold_ms\":%d,\"invert\":%s,"
 		"\"damper\":%d,\"friction\":%d,\"spring\":%d,\"rumble\":%d,"
-		"\"stop_host_seconds\":%.17g,\"sink_final_level\":%d}\n",
+		"\"stop_host_seconds\":%.17g,\"sink_final_level\":%d,"
+		"\"outputs\":%llu,\"output_bytes\":%llu,\"sink_final_conditions\":%u,\"sink_final_rumble\":%.9g,"
+		"\"user_stop_ack_seconds\":%.17g,\"user_stopped\":%s}\n",
 		complete ? "true" : "false", (unsigned long long)s_worker_tick_count,
 		(unsigned long long)s_worker_source_count, (unsigned long long)s_worker_tick_bytes,
 		(unsigned long long)s_worker_source_bytes, s_profile_id.c_str(), s_worker_profile_loaded ? "true" : "false",
 		s_worker_effective_smoothing, s_strength, s_impact_axis ? "true" : "false", s_hold_ms,
 		s_invert ? "true" : "false", s_damper, s_friction, s_spring, s_rumble,
-		s_worker_stop_seconds, s_worker_sink_level);
+		s_worker_stop_seconds, s_worker_sink_level,(unsigned long long)s_worker_output_count,
+		(unsigned long long)s_worker_output_bytes,s_worker_condition_mask,s_worker_rumble,
+		s_worker_user_stop_ack,s_user_stopped.load()?"true":"false");
 	if (fclose(receipt) || written < 0) s_worker_error.store(true);
 	if (s_worker_error.load()) osd_printf_error("FFB worker journal incomplete\n");
 }
@@ -2239,6 +2261,7 @@ static void apply(Device &d, int level, bool &running, int &applied)
 	{
 		// This sink accepts a requested value, not a hardware command.
 		s_worker_sink_level = level; applied = level; running = level != 0;
+		worker_output_trace("constant",0,level);
 		return;
 	}
 	SDL_HapticEffect e;
@@ -2280,6 +2303,33 @@ static void apply(Device &d, int level, bool &running, int &applied)
 	}
 	running = true;
 	applied = level;
+}
+
+static int condition_output(Device &d, int id, bool enabled)
+{
+	enabled=enabled && !s_user_stopped.load();
+	if (!s_observe_worker) return enabled?p_SDL_HapticRunEffect(d.hp,id,1):p_SDL_HapticStopEffect(d.hp,id);
+	if (enabled) s_worker_condition_mask|=1u<<id;
+	else s_worker_condition_mask&=~(1u<<id);
+	worker_output_trace("condition",id,enabled?1.:0.);
+	return 0;
+}
+
+static int rumble_output(Device &d, float amplitude)
+{
+	if (s_user_stopped.load()) amplitude=0.f;
+	if (!s_observe_worker) return amplitude>0.f?p_SDL_HapticRumblePlay(d.hp,amplitude,120):p_SDL_HapticRumbleStop(d.hp);
+	s_worker_rumble=amplitude;
+	worker_output_trace("rumble",0,amplitude);
+	return 0;
+}
+
+static int stop_all_output(Device &d)
+{
+	if (!s_observe_worker) return p_SDL_HapticStopAll(d.hp);
+	s_worker_sink_level=0;s_worker_condition_mask=0;s_worker_rumble=0.f;
+	worker_output_trace("stop_all",0,0.);
+	return 0;
 }
 
 static void worker()
@@ -2328,12 +2378,13 @@ static void worker()
 	else
 	{
 		d.is_wheel = true; // Logical steering channel; no physical device selected.
+		d.caps=SDL_HAPTIC_DAMPER | SDL_HAPTIC_FRICTION | SDL_HAPTIC_SPRING;
 		flog("device-free worker: SDL loading, enumeration and haptic delivery disabled");
 	}
 	flog("ready: strength %d%%, invert %d, hold %d ms, smooth %d ms, damper %d%%, friction %d%%, rumble %d%%",
 			s_strength, int(s_invert), s_hold_ms, s_smooth_ms, s_damper, s_friction, s_rumble);
 	flog("spring: %d%% (the plugin runs one for these games; 0 = off)", s_spring);
-	bool rumble_ok = false;
+	bool rumble_ok = s_observe_worker && s_rumble>0;
 	if (s_rumble > 0 && !s_observe_worker)
 	{
 		if (p_SDL_HapticRumbleSupported(d.hp) == 1 && p_SDL_HapticRumbleInit(d.hp) == 0)
@@ -2361,7 +2412,7 @@ static void worker()
 		{ s_spring, SDL_HAPTIC_SPRING, SDL_HAPTIC_SPRING, "spring" } };
 	for (int i = 0; i < 3; i++)
 	{
-		if (conds[i].pct <= 0 || s_observe_worker)
+		if (conds[i].pct <= 0)
 			continue;
 		if (!(d.caps & conds[i].cap))
 		{
@@ -2390,8 +2441,9 @@ static void worker()
 		Uint16 const sat = Uint16(0xffff * eff / 100);
 		e.condition.right_sat[0] = e.condition.left_sat[0] = sat;
 		e.condition.right_coeff[0] = e.condition.left_coeff[0] = coeff;
-		cond_ids[i] = p_SDL_HapticNewEffect(d.hp, &e);
-		if (cond_ids[i] < 0 || (conditions_active && !s_user_stopped.load() && p_SDL_HapticRunEffect(d.hp, cond_ids[i], 1) < 0))
+		std::lock_guard<std::mutex> output_guard(s_output_mtx);
+		cond_ids[i] = s_observe_worker?i:p_SDL_HapticNewEffect(d.hp, &e);
+		if (cond_ids[i] < 0 || (conditions_active && condition_output(d,cond_ids[i],true)<0))
 			flog("%s: could not start: %s", conds[i].name, p_SDL_GetError());
 		else
 			flog("%s: %d%% of full (%d%% x strength %d%%)", conds[i].name,
@@ -2406,7 +2458,7 @@ static void worker()
 		int const pct = std::clamp(atoi(t), -100, 100);
 		int const lvl = pct * 32767 / 100;
 		flog("TEST: level %d (%d%%) for 1500 ms", lvl, pct);
-		if (!s_user_stopped.load()) apply(d, lvl, running, applied);
+		{ std::lock_guard<std::mutex> output_guard(s_output_mtx); apply(d,lvl,running,applied); }
 		for (int i = 0; i < 150 && !s_stop.load() && !s_user_stopped.load(); i++)
 			Sleep(10);
 		apply(d, 0, running, applied);
@@ -2487,7 +2539,7 @@ static void worker()
 		trace.active = game_active;
 		if (game_active!=conditions_active) {
 			for (int id : cond_ids) if (id>=0) {
-				int const rc=game_active && !s_user_stopped.load()?p_SDL_HapticRunEffect(d.hp,id,1):p_SDL_HapticStopEffect(d.hp,id);
+				int const rc=condition_output(d,id,game_active);
 				if (rc<0) flog("condition gate failed: %s",p_SDL_GetError());
 			}
 			conditions_active=game_active;
@@ -2497,7 +2549,7 @@ static void worker()
 		trace.cancel = s_cancel_impact.exchange(false) || s_user_stopped.load();
 		if (trace.cancel) {
 			impact_mixer.reset(); impact_detector.reset(); shaper.reset();
-			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
+			if (rumble_ok) rumble_output(d,0.f);
 		}
 		if (s_hold_ms > 0 && want != 0 && (trace.hold_now = now_ms()) - (trace.last_write = s_last_write.load()) > s_hold_ms)
 		{
@@ -2507,7 +2559,7 @@ static void worker()
 			impact_detector.reset();
 			impact_mixer.reset();
 			s_raw_level.store(0);
-			if (rumble_ok) p_SDL_HapticRumbleStop(d.hp);
+			if (rumble_ok) rumble_output(d,0.f);
 			if (!hold_said) { flog("no motor write for %d ms - force released", s_hold_ms); hold_said = true; }
 		}
 		else if (want != 0)
@@ -2538,7 +2590,7 @@ static void worker()
 			{
 				float const amplitude = impact_detector.last_arrival * float(s_rumble) / 100.f
 					* float(s_strength) / 100.f;
-				result = p_SDL_HapticRumblePlay(d.hp, amplitude, 120);
+				result = rumble_output(d,amplitude);
 				if (result < 0) { flog("rumble play failed: %s", p_SDL_GetError()); rumble_ok = false; }
 			}
 			flog("impact candidate: arrived %.3f rise %.3f rumble_result %d",
@@ -2590,16 +2642,21 @@ static void worker()
 			// Retry a failed device stop on the owner thread. A zero bookkeeping
 			// value alone must not be reported as successful actuator cancellation.
 			apply(d,0,running,applied);
-			bool const stopped=s_observe_worker || p_SDL_HapticStopAll(d.hp)==0;
-			bool const rumble_stopped=!rumble_ok || p_SDL_HapticRumbleStop(d.hp)==0;
+			bool const stopped=stop_all_output(d)==0;
+			bool const rumble_stopped=!rumble_ok || rumble_output(d,0.f)==0;
 			if (stopped && rumble_stopped) {
 				user_stop_acknowledged=true;
+				s_worker_user_stop_ack=worker_host_seconds();
+				worker_output_trace("ack",0,0.);
 				osd_printf_info("MIDV_FFB_USER_STOP_ACK host_seconds=%.17g device_free=%d\n",worker_host_seconds(),int(s_observe_worker));
 			}
 		}
 		worker_tick_trace(trace);
 	}
+	std::lock_guard<std::mutex> output_guard(s_output_mtx);
 	apply(d, 0, running, applied);
+	if (rumble_ok) rumble_output(d,0.f);
+	for (int id:cond_ids) if (id>=0) condition_output(d,id,false);
 	if (s_observe_worker)
 	{
 		s_worker_stop_seconds = worker_host_seconds();
@@ -2607,10 +2664,8 @@ static void worker()
 	}
 	else
 	{
-		if (rumble_ok)
-			p_SDL_HapticRumbleStop(d.hp);
 		for (int id : cond_ids)
-			if (id >= 0) { p_SDL_HapticStopEffect(d.hp, id); p_SDL_HapticDestroyEffect(d.hp, id); }
+			if (id >= 0) p_SDL_HapticDestroyEffect(d.hp, id);
 		p_SDL_HapticDestroyEffect(d.hp, d.effect);
 		p_SDL_HapticClose(d.hp);
 		p_SDL_JoystickClose(d.js);
@@ -2645,12 +2700,19 @@ static void start(running_machine &machine)
 		fatalerror("FFB worker observation requires MIDV_FFB=0 and no sign test");
 	if (const char *text=std::getenv("MIDV_FFB_USER_STOP_FRAME")) {
 		char *end=nullptr;unsigned long long frame=strtoull(text,&end,10);
-		if (!s_observe_worker || !*text || *end || frame<1 || frame>1000000)
+		if (!s_observe_worker || !*text || strspn(text,"0123456789")!=strlen(text) || *end || frame<1 || frame>1000000)
 			fatalerror("User-stop schedule requires device-free worker and frame1..1000000");
 		s_worker_user_stop_frame=frame;
 	}
-	if (const wchar_t *path=_wgetenv(L"MIDV_FFB_STOP_FILE"))
-		if (GetFileAttributesW(path)!=INVALID_FILE_ATTRIBUTES) s_user_stopped.store(true);
+	if (const wchar_t *path=_wgetenv(L"MIDV_FFB_STOP_FILE")) {
+		if (GetFileAttributesW(path)!=INVALID_FILE_ATTRIBUTES) {
+			s_user_stopped.store(true);s_user_stop_saved.store(true);
+		} else {
+			DWORD const error=GetLastError();
+			if (error!=ERROR_FILE_NOT_FOUND && error!=ERROR_PATH_NOT_FOUND)
+				fatalerror("Cannot verify saved FFB stop preference (Windows error %u)",unsigned(error));
+		}
+	}
 	if (!s_observe_worker && (!on || atoi(on) == 0))
 		return;
 	if (!s_observe_worker && s_user_stopped.load()) return;
@@ -2694,19 +2756,23 @@ static void start(running_machine &machine)
 			fatalerror("Unsupported diagnostic force profile identifier");
 		s_worker_ticks = fopen("ffb-worker-ticks.csv", "wb");
 		s_worker_sources = fopen("ffb-worker-sources.csv", "wb");
-		if (!s_worker_ticks || !s_worker_sources)
+		s_worker_outputs = fopen("ffb-worker-outputs.csv", "wb");
+		if (!s_worker_ticks || !s_worker_sources || !s_worker_outputs)
 		{
 			if (s_worker_ticks) fclose(s_worker_ticks);
 			if (s_worker_sources) fclose(s_worker_sources);
-			s_worker_ticks = s_worker_sources = nullptr;
+			if (s_worker_outputs) fclose(s_worker_outputs);
+			s_worker_ticks = s_worker_sources = s_worker_outputs = nullptr;
 			fatalerror("Cannot open FFB worker journals");
 		}
 		setvbuf(s_worker_ticks, nullptr, _IOFBF, 262144);
 		setvbuf(s_worker_sources, nullptr, _IOFBF, 65536);
+		setvbuf(s_worker_outputs,nullptr,_IOFBF,65536);
 		int const tick_header = fprintf(s_worker_ticks,"sequence,host_seconds,active,before,candidate,cancel,hold_now_ms,last_write_ms,timeout,detector_ms,trigger_ms,mix_ms,dt,event,arrival,rise,shaped,mixed,out,sink_host_seconds,rumble_request\n");
 		int const source_header = fprintf(s_worker_sources,"sequence,host_seconds,emulated_seconds,frame,raw,adapted,active,game_invert,device_invert\n");
-		if (tick_header < 0 || source_header < 0) s_worker_error.store(true);
-		else { s_worker_tick_bytes = tick_header; s_worker_source_bytes = source_header; }
+		int const output_header=fprintf(s_worker_outputs,"sequence,host_seconds,family,channel,value,user_stopped\n");
+		if (tick_header < 0 || source_header < 0 || output_header<0) s_worker_error.store(true);
+		else { s_worker_tick_bytes = tick_header; s_worker_source_bytes = source_header;s_worker_output_bytes=output_header; }
 		osd_printf_info("MIDV_FFB_WORKER_OBSERVE=1 physical_output=0\n");
 	}
 	else if (!load_sdl())
@@ -2745,6 +2811,7 @@ void midv_ffb_user_stop()
 	{
 		std::lock_guard<std::mutex> output_guard(mvffb::s_output_mtx);
 		if (mvffb::s_user_stopped.exchange(true)) return;
+		mvffb::worker_output_trace("latch",0,1.);
 	}
 	midv_ffb_cancel(); // Wakes the sole haptic owner; no SDL calls on the UI thread.
 	bool persisted=false;
