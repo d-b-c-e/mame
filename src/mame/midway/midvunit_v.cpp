@@ -2183,6 +2183,9 @@ struct Device
 	bool is_wheel = false;
 	int effect = -1;
 	std::string name;
+	Sint32 instance = -1;
+	std::string path;
+	long long next_attachment_check = -1;
 };
 
 // Resolve the whole inventory before opening haptics. Never choose a first
@@ -2235,10 +2238,34 @@ static bool select_device(Device &d)
 		p_SDL_HapticClose(hp);p_SDL_JoystickClose(js);return false;
 	}
 	d.js=js;d.hp=hp;d.caps=caps;d.name=name?name:"?";
+	d.instance=opened_instance;d.path=path?path:"";
 	d.is_wheel=p_SDL_JoystickGetType(js)==SDL_JOYSTICK_TYPE_WHEEL;
 	flog("using exact unique [%d] \"%s\" (caps 0x%x%s)",index,d.name.c_str(),caps,
 		d.is_wheel?", steering axis":", cartesian");
 	return true;
+}
+
+// Sole output-owner thread, before taking s_output_mtx. SDL's attachment flag
+// is refreshed by Update; checking its cached value alone misses unplugging.
+// Never enumerate/open a replacement here. Loss latches the same durable Off
+// state as F8 and all output wrappers refuse subsequent nonzero requests.
+static bool check_output_attachment(Device &d, long long now)
+{
+	if (s_observe_worker) return true; // Device-free observation never loads SDL.
+	if (s_user_stopped.load()) return false;
+	if (now < d.next_attachment_check) return true;
+	d.next_attachment_check=now+50;
+	p_SDL_JoystickUpdate();
+	char const *path=p_SDL_JoystickPath(d.js);
+	bool const attached=p_SDL_JoystickGetAttached(d.js)==SDL_TRUE
+		&& d.instance>=0 && p_SDL_JoystickInstanceID(d.js)==d.instance
+		&& cruisn::force_identity_fold(path?path:"")==cruisn::force_identity_fold(d.path);
+	if (!attached) {
+		flog("selected output disconnected or changed - force latched off; explicitly enable after reconnecting");
+		osd_printf_info("MIDV_FFB_DEVICE_LOST instance=%d\n",int(d.instance));
+		midv_ffb_user_stop();
+	}
+	return attached;
 }
 
 static void apply(Device &d, int level, bool &running, int &applied)
@@ -2383,6 +2410,7 @@ static void worker()
 			flog("rumble: not available on this device (%s)", p_SDL_GetError());
 	}
 	// static condition effects (the arcade wheel mechanism the base lacks)
+	check_output_attachment(d,now_ms());
 	// The spring is the one the FFB Arcade Plugin runs for these games
 	// (EnableForceSpringEffectCrusnUSA=1 in its stock FFBPlugin.ini) and this
 	// code did not have. It is a POSITION-based centring torque, so its
@@ -2447,7 +2475,10 @@ static void worker()
 		flog("TEST: level %d (%d%%) for 1500 ms", lvl, pct);
 		{ std::lock_guard<std::mutex> output_guard(s_output_mtx); apply(d,lvl,running,applied); }
 		for (int i = 0; i < 150 && !s_stop.load() && !s_user_stopped.load(); i++)
+		{
+			check_output_attachment(d,now_ms());
 			Sleep(10);
+		}
 		apply(d, 0, running, applied);
 		flog("TEST: released");
 	}
@@ -2519,6 +2550,7 @@ static void worker()
 		DWORD foreground_pid=0;
 		GetWindowThreadProcessId(GetForegroundWindow(),&foreground_pid);
 		if (foreground_pid==GetCurrentProcessId() && (GetAsyncKeyState(VK_F8)&0x8000)) midv_ffb_user_stop();
+		check_output_attachment(d,now_ms());
 		std::lock_guard<std::mutex> output_guard(s_output_mtx);
 		WorkerTick trace;
 		if (s_observe_worker) trace.host = worker_host_seconds();
