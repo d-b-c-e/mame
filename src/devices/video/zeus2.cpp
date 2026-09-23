@@ -789,14 +789,22 @@ void thread_main()
 	// the overlay covers the MONITOR, not MAME's window: MAME's gdi window
 	// stays small (its software stretch to 4K cost ~3% emulation speed),
 	// it just holds keyboard focus and DirectInput foreground under us
+	// Keep the display chosen at launch. Re-querying the nearest monitor from
+	// the MAME window on every present can briefly select the entire desktop
+	// while Windows rearranges multiple displays.
+	HMONITOR const overlay_monitor = MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST);
 	auto monitor_rect = [&]() -> RECT
 	{
 		MONITORINFO mi{};
 		mi.cbSize = sizeof(mi);
-		GetMonitorInfoA(MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST), &mi);
+		GetMonitorInfoA(overlay_monitor, &mi);
 		return mi.rcMonitor;
 	};
 	RECT rc = monitor_rect();
+	RECT const launch_rc = rc;
+	int64_t const launch_width = int64_t(launch_rc.right) - launch_rc.left;
+	int64_t const launch_height = int64_t(launch_rc.bottom) - launch_rc.top;
+	bool bad_monitor_rect_reported = false;
 	HWND child = CreateWindowExA(
 		WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
 		"MidzGLOverlay", "", WS_POPUP | WS_VISIBLE,
@@ -1706,7 +1714,24 @@ void thread_main()
 			}
 			s_zpause.store(menu_open ? 1 : 0);
 		}
-		rc = monitor_rect();
+		RECT const next_rc = monitor_rect();
+		// A transient virtual-desktop rectangle must not turn a single-monitor
+		// overlay (and its framebuffer/readback) into a three-monitor canvas.
+		// Preserve the last valid rectangle; a normal resolution change on the
+		// same display remains possible.
+		int64_t const next_width = int64_t(next_rc.right) - next_rc.left;
+		int64_t const next_height = int64_t(next_rc.bottom) - next_rc.top;
+		if (next_width > 0 && next_height > 0 && next_width <= launch_width * 2 && next_height <= launch_height * 2)
+		{
+			rc = next_rc;
+			bad_monitor_rect_reported = false;
+		}
+		else if (!bad_monitor_rect_reported)
+		{
+			zlogf("ignored overlay monitor resize %lldx%lld (launch %lldx%lld)",
+				(long long)next_width, (long long)next_height, (long long)launch_width, (long long)launch_height);
+			bad_monitor_rect_reported = true;
+		}
 		RECT crc; GetWindowRect(child, &crc);
 		if (IsIconic(parent))
 			ShowWindow(child, SW_HIDE);
