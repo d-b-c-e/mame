@@ -553,11 +553,13 @@ static uint8_t *s_ringbuf = nullptr;
 static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 // Current decoded record, for bounded backpressure diagnostics only.
 static std::atomic<uint64_t> s_consumer_record{0};
-enum { STAGE_START, STAGE_WINDOW, STAGE_RING, STAGE_FLUSH, STAGE_MIRROR, STAGE_PRESENT, STAGE_IDLE };
+enum { STAGE_START, STAGE_WINDOW, STAGE_RING, STAGE_FLUSH, STAGE_MIRROR,
+	STAGE_PRESENT_SETUP, STAGE_PRESENT_DRAW, STAGE_PRESENT_AFTER_DRAW, STAGE_IDLE };
 static std::atomic<unsigned> s_consumer_stage{STAGE_START};
 static const char *stage_name(unsigned stage)
 {
-	static const char *names[] = { "start", "window", "ring", "flush", "mirror", "present", "idle" };
+	static const char *names[] = { "start", "window", "ring", "flush", "mirror",
+		"present_setup", "present_draw", "present_after_draw", "idle" };
 	return stage < sizeof(names) / sizeof(names[0]) ? names[stage] : "unknown";
 }
 static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
@@ -2079,7 +2081,7 @@ void thread_main()
 			s_consumer_stage.store(STAGE_IDLE, std::memory_order_relaxed);
 			Sleep(1); continue;
 		}
-		s_consumer_stage.store(STAGE_PRESENT, std::memory_order_relaxed);
+		s_consumer_stage.store(STAGE_PRESENT_SETUP, std::memory_order_relaxed);
         if (frame_ready && !stall_applied && stall_frame > 0 && completed_frame >= uint32_t(stall_frame))
         {
             stall_applied = true;
@@ -2138,7 +2140,9 @@ void thread_main()
 		}
 		gl.Viewport((cw - vw) / 2, (ch - vh) / 2, vw, vh);
 		gl.BindVertexArray(vao_empty);
+		s_consumer_stage.store(STAGE_PRESENT_DRAW, std::memory_order_relaxed);
 		gl.DrawArrays(0x0004, 0, 3);
+		s_consumer_stage.store(STAGE_PRESENT_AFTER_DRAW, std::memory_order_relaxed);
 
 		if (menu_open)
 		{
