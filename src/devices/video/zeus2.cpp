@@ -555,12 +555,14 @@ static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 static std::atomic<uint64_t> s_consumer_record{0};
 enum { STAGE_START, STAGE_WINDOW, STAGE_RING, STAGE_FLUSH, STAGE_MIRROR,
 	STAGE_PRESENT_SETUP, STAGE_PRESENT_BIND, STAGE_PRESENT_CLEAR,
-	STAGE_PRESENT_UNIFORMS, STAGE_PRESENT_DRAW, STAGE_PRESENT_AFTER_DRAW, STAGE_IDLE };
+	STAGE_PRESENT_PROGRAM, STAGE_PRESENT_VALUES, STAGE_PRESENT_TEXTURE,
+	STAGE_PRESENT_DRAW, STAGE_PRESENT_AFTER_DRAW, STAGE_IDLE };
 static std::atomic<unsigned> s_consumer_stage{STAGE_START};
 static const char *stage_name(unsigned stage)
 {
 	static const char *names[] = { "start", "window", "ring", "flush", "mirror",
-		"present_setup", "present_bind", "present_clear", "present_uniforms",
+		"present_setup", "present_bind", "present_clear", "present_program",
+		"present_values", "present_texture",
 		"present_draw", "present_after_draw", "idle" };
 	return stage < sizeof(names) / sizeof(names[0]) ? names[stage] : "unknown";
 }
@@ -1022,6 +1024,8 @@ void thread_main()
 	gl.Uniform1f(gl.GetUniformLocation(present, "uSrcH"), float(DISPH));
 	int const uBaseRow = gl.GetUniformLocation(present, "uBaseRow");
 	int const uCrt = gl.GetUniformLocation(present, "uCrt");
+	int const uSampW = gl.GetUniformLocation(present, "uSampW");
+	int const uSampX0 = gl.GetUniformLocation(present, "uSampX0");
 
 	// menu (labels shared with the V-Unit overlay)
 	struct Label { uint tex; int w, h; };
@@ -2129,14 +2133,16 @@ void thread_main()
 		float const aspect = wide_mode ? (16.0f / 9.0f) : (4.0f / 3.0f);
 		int vw = cw, vh = int(cw / aspect + 0.5f);
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
-		s_consumer_stage.store(STAGE_PRESENT_UNIFORMS, std::memory_order_relaxed);
+		s_consumer_stage.store(STAGE_PRESENT_PROGRAM, std::memory_order_relaxed);
 		gl.UseProgram(present);
+		s_consumer_stage.store(STAGE_PRESENT_VALUES, std::memory_order_relaxed);
 		gl.Uniform1i(uBaseRow, int((zb38 >> 16) & (CH - 1)));
 		gl.Uniform1i(uCrt, crt ? 1 : 0);
-		gl.Uniform1f(gl.GetUniformLocation(present, "uSampW"),
+		gl.Uniform1f(uSampW,
 			wide_mode ? float(CWW) : 512.0f);
-		gl.Uniform1f(gl.GetUniformLocation(present, "uSampX0"),
+		gl.Uniform1f(uSampX0,
 			wide_mode ? 0.0f : float(MARGIN));
+		s_consumer_stage.store(STAGE_PRESENT_TEXTURE, std::memory_order_relaxed);
 		gl.ActiveTexture(TEXTURE0 + 3);
 		gl.BindTexture(0x0DE1, future_present && (!retire_frame || completed_frame<retire_frame)?mirror_color:fbTex);
 		if(retire_frame && completed_frame>=retire_frame && !retire_presented) {
