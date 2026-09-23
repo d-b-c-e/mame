@@ -554,12 +554,14 @@ static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 // Current decoded record, for bounded backpressure diagnostics only.
 static std::atomic<uint64_t> s_consumer_record{0};
 enum { STAGE_START, STAGE_WINDOW, STAGE_RING, STAGE_FLUSH, STAGE_MIRROR,
-	STAGE_PRESENT_SETUP, STAGE_PRESENT_DRAW, STAGE_PRESENT_AFTER_DRAW, STAGE_IDLE };
+	STAGE_PRESENT_SETUP, STAGE_PRESENT_BIND, STAGE_PRESENT_CLEAR,
+	STAGE_PRESENT_UNIFORMS, STAGE_PRESENT_DRAW, STAGE_PRESENT_AFTER_DRAW, STAGE_IDLE };
 static std::atomic<unsigned> s_consumer_stage{STAGE_START};
 static const char *stage_name(unsigned stage)
 {
 	static const char *names[] = { "start", "window", "ring", "flush", "mirror",
-		"present_setup", "present_draw", "present_after_draw", "idle" };
+		"present_setup", "present_bind", "present_clear", "present_uniforms",
+		"present_draw", "present_after_draw", "idle" };
 	return stage < sizeof(names) / sizeof(names[0]) ? names[stage] : "unknown";
 }
 static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
@@ -2115,16 +2117,19 @@ void thread_main()
 		if (frame_ready) had_quads_iter = had_writes_iter = false;
 
 		int const cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+		s_consumer_stage.store(STAGE_PRESENT_BIND, std::memory_order_relaxed);
 		gl.BindFramebuffer(FRAMEBUFFER, 0);
 		gl.Disable(GLDEPTH_TEST);
 		gl.Disable(GLSCISSOR_TEST);
 		gl.Viewport(0, 0, cw, ch);
 		gl.ClearColor(0, 0, 0, 1);
+		s_consumer_stage.store(STAGE_PRESENT_CLEAR, std::memory_order_relaxed);
 		gl.Clear(0x4000);
 		// PAR ~1.0: 512x400 4:3-ish; 16:9 spans the full CWW canvas
 		float const aspect = wide_mode ? (16.0f / 9.0f) : (4.0f / 3.0f);
 		int vw = cw, vh = int(cw / aspect + 0.5f);
 		if (vh > ch) { vh = ch; vw = int(ch * aspect + 0.5f); }
+		s_consumer_stage.store(STAGE_PRESENT_UNIFORMS, std::memory_order_relaxed);
 		gl.UseProgram(present);
 		gl.Uniform1i(uBaseRow, int((zb38 >> 16) & (CH - 1)));
 		gl.Uniform1i(uCrt, crt ? 1 : 0);
