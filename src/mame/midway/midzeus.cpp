@@ -889,7 +889,11 @@ void crusnexo_state::lifetime_start()
 						fatalerror("Endpoint admission source binding\n");
 					if(!m_lifetime_owners.emplace(m_lifetime_owner_slot,owner).second)fatalerror("Exotica lifetime duplicate owner map\n");
 					lifetime_emit('B',m_lifetime_owner_slot,owner.handle.generation,owner.serial,key,0,m_ram_base[m_lifetime_owner_slot+15]);
-					m_lifetime_owner_slot=0;m_lifetime_ready_tap.remove();
+					m_lifetime_owner_slot=0;
+					const auto removal_started=std::chrono::steady_clock::now();
+					m_lifetime_ready_tap.remove();
+					m_host_timing.accumulate(renderer_frame(),m_scene_serial,cruisn::PhaseTiming::lifetime_remove,
+						std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-removal_started).count());
 					m_host_timing.accumulate(renderer_frame(),m_scene_serial,cruisn::PhaseTiming::lifetime_complete,
 						std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-timing_started).count());
 				});
