@@ -1832,11 +1832,8 @@ void thread_main()
 			rec.resize(hdr[1]);
 			if (hdr[1]) ring_get(rec.data(), hdr[1]);
 			r = (r + 7) & ~7ull;
-			// The record now lives in this thread's private buffer. Release its
-			// ring bytes immediately, even if validation/drawing takes a long time;
-			// the producer must never wait for the entire frame batch to finish.
-			s_rr.store(r, std::memory_order_release);
-			s_consumer_record.store((uint64_t(hdr[0]) << 32) | hdr[1], std::memory_order_relaxed);
+			if (s_phase_trace)
+				s_consumer_record.store((uint64_t(hdr[0]) << 32) | hdr[1], std::memory_order_relaxed);
 			if(stream_active) {
 				if(hdr[0]<1 || hdr[0]>6 || hdr[1]>(16u<<20)+8 || stream_count>=131072 ||
 					stream_records.size()+8+rec.size()>64u*1024u*1024u) {
@@ -2066,7 +2063,8 @@ void thread_main()
 				break;
 			}
 			if(private_failed)break;
-			s_consumer_record.store(0, std::memory_order_relaxed);
+			if (s_phase_trace)
+				s_consumer_record.store(0, std::memory_order_relaxed);
             if (frame_ready) break; // never consume the next frame before presenting this one
 		}
 		s_rr.store(r, std::memory_order_release);
