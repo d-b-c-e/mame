@@ -553,6 +553,13 @@ static uint8_t *s_ringbuf = nullptr;
 static std::atomic<uint64_t> s_rw{0}, s_rr{0};
 // Current decoded record, for bounded backpressure diagnostics only.
 static std::atomic<uint64_t> s_consumer_record{0};
+enum { STAGE_START, STAGE_WINDOW, STAGE_RING, STAGE_FLUSH, STAGE_MIRROR, STAGE_PRESENT, STAGE_IDLE };
+static std::atomic<unsigned> s_consumer_stage{STAGE_START};
+static const char *stage_name(unsigned stage)
+{
+	static const char *names[] = { "start", "window", "ring", "flush", "mirror", "present", "idle" };
+	return stage < sizeof(names) / sizeof(names[0]) ? names[stage] : "unknown";
+}
 static std::atomic<bool> s_on{false}, s_stopz{false}, s_donez{true};
 static std::atomic<uint32_t> s_presented_frame{0};
 // Host-only diagnostics. A single atomic preserves the phase/start-time pair
@@ -615,7 +622,8 @@ static bool ring_push2(uint32_t type, const void *p1, uint32_t n1,
 			s_drops_state.fetch_add(1);
 			s_stopz.store(true);
 			uint64_t const active = s_consumer_record.load(std::memory_order_relaxed);
-			osd_printf_info("MIDZ consumer record: type=%u bytes=%u\n",
+			osd_printf_info("MIDZ consumer state: stage=%s type=%u bytes=%u\n",
+				stage_name(s_consumer_stage.load(std::memory_order_relaxed)),
 				unsigned(active >> 32), unsigned(active));
 			osd_printf_error("MIDZ render stream failed: consumer timeout; native presentation fallback; "
 				"presented=%u type=%u need=%llu queued=%llu capacity=%llu consumer_bytes=%llu wait_ms=%llu phase=%s phase_ms=%llu\n",
@@ -1699,6 +1707,7 @@ void thread_main()
 	ULONGLONG menu_test_next = 0;
 	while (IsWindow(parent) && !s_stopz.load())
 	{
+		s_consumer_stage.store(STAGE_WINDOW, std::memory_order_relaxed);
 		MSG msg;
 		while (PeekMessageA(&msg, child, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
 
@@ -1807,6 +1816,7 @@ void thread_main()
 			if (n > first) memcpy((uint8_t *)dst + first, s_ringbuf, n - first);
 			r += n;
 		};
+		s_consumer_stage.store(STAGE_RING, std::memory_order_relaxed);
 		while (r < w)
 		{
 			uint32_t hdr[2];
@@ -2052,18 +2062,24 @@ void thread_main()
             if (frame_ready) break; // never consume the next frame before presenting this one
 		}
 		s_rr.store(r, std::memory_order_release);
+		s_consumer_stage.store(STAGE_FLUSH, std::memory_order_relaxed);
 		flush();
 
         if(frame_ready && !endpoint_order.complete()) {
 			private_failed=true;s_stopz.store(true);zlogf("endpoint model incomplete at frame boundary");break;
 		}
-        if(frame_ready && !mirror_frame(completed_frame)) {
+		s_consumer_stage.store(STAGE_MIRROR, std::memory_order_relaxed);
+		if(frame_ready && !mirror_frame(completed_frame)) {
 			mirror_failed=true;s_stopz.store(true);zlogf("depth mirror comparison failed at frame%u",completed_frame);break;
 		}
 		if(frame_ready && !stream_boundary(completed_frame)) {
 			stream_failed=true;s_stopz.store(true);zlogf("Zeus command capture boundary failure");break;
 		}
-		if (!frame_ready && !menu_open && !ui_changed) { Sleep(1); continue; }
+		if (!frame_ready && !menu_open && !ui_changed) {
+			s_consumer_stage.store(STAGE_IDLE, std::memory_order_relaxed);
+			Sleep(1); continue;
+		}
+		s_consumer_stage.store(STAGE_PRESENT, std::memory_order_relaxed);
         if (frame_ready && !stall_applied && stall_frame > 0 && completed_frame >= uint32_t(stall_frame))
         {
             stall_applied = true;
@@ -2410,6 +2426,7 @@ void start()
 	s_donez.store(false);
 	s_presented_frame.store(0);
 	s_consumer_record.store(0);
+	s_consumer_stage.store(STAGE_START);
 	s_phase_trace = std::getenv("MIDZ_GL_LOG") != nullptr;
 	s_phase_stamp.store(0);
 	begin_phase(PHASE_OTHER);
