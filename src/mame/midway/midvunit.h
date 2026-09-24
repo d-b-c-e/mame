@@ -122,7 +122,7 @@ protected:
 	void world_host_exit();
 	void world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
 		const std::vector<std::array<uint32_t,4>> *depths=nullptr, const std::vector<uint32_t> *policies=nullptr,
-		const std::vector<uint8_t> *margins=nullptr);
+		const std::vector<uint8_t> *margins=nullptr, const std::vector<uint8_t> *residents=nullptr);
 	void usa_distance_start();
 	void usa_distance_tick();
 	void usa_distance_exit();
@@ -224,6 +224,7 @@ protected:
 	uint32_t m_offroad_host_multiplier = 1;
 	bool m_offroad_host_clip_admission = false;
 	bool m_offroad_host_recover_partial = false;
+	bool m_offroad_host_resident_margins = false;
 	memory_passthrough_handler m_usa_far_tap, m_usa_reciprocal_tap, m_usa_residency_tap;
 	uint32_t m_usa_far = 0, m_usa_max_index = 0;
 	bool m_usa_residency = false;

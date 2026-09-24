@@ -960,7 +960,7 @@ static size_t build_vertices(const std::vector<QuadMsg> &quads, float xoff,
 			f[14] = us[2]; f[15] = vs[2]; f[16] = us[3]; f[17] = vs[3];
 			for (int i = 0; i < 4; i++) f[18 + i] = bounds[i];
 			uint32_t *u = &udata[(q * 6 + k) * 4];
-			u[0] = pixdata; u[1] = mode; u[2] = dither | ((quads[q].pad & 1) ? 8u : 0u) | ((quads[q].pad & 4) ? 16u : 0u); u[3] = uint32_t(dma[14]) * 256;
+			u[0] = pixdata; u[1] = mode; u[2] = dither | ((quads[q].pad & 1) ? 8u : 0u) | ((quads[q].pad & 4) ? 16u : 0u) | ((quads[q].pad & 8) ? 32u : 0u); u[3] = uint32_t(dma[14]) * 256;
 		}
 	}
 	return joined.aligned;
@@ -1332,6 +1332,7 @@ void thread_main()
 	bool const bg_gate = margin_on &&
 		!(std::getenv("MIDV_GL_CRACKFILL") && atoi(std::getenv("MIDV_GL_CRACKFILL")) == 0);
 	gl.Uniform1i(gl.GetUniformLocation(prog, "uBgMargin"), bg_gate ? MARGIN : 0);
+	gl.Uniform1i(gl.GetUniformLocation(prog, "uResidentMargin"), MARGIN);
 	gl.UseProgram(pal);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "idxTex"), 1);
 	gl.Uniform1i(gl.GetUniformLocation(pal, "palTex"), 2);
@@ -1491,7 +1492,7 @@ void thread_main()
 		bool const auxiliary = original_mirror && (run.front().pad & 2);
 		if(original_mirror)
 		{
-			for(auto const &q:run)if(auxiliary?(q.pad!=3 && q.pad!=7):q.pad!=0)fatalerror("Original mirror unqualified layer ownership\n");
+			for(auto const &q:run)if(auxiliary?((q.pad&3)!=3 || (q.pad&~15)!=0):q.pad!=0)fatalerror("Original mirror unqualified layer ownership\n");
 			if(auxiliary)mirror_auxiliary+=run.size();
 			else {mirror_ordinary+=run.size();original_cpu_written[pg]=0;}
 		}
@@ -3489,7 +3490,7 @@ void midvunit_base_state::observe_numeric_hud()
 
 void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_t,16>> &quads,
 	const std::vector<std::array<uint32_t,4>> *depths, const std::vector<uint32_t> *policies,
-	const std::vector<uint8_t> *margins)
+	const std::vector<uint8_t> *margins, const std::vector<uint8_t> *residents)
 {
 	if(!live().enabled)fatalerror("World host scenery drawing requires the live GL renderer\n");
 	if(quads.empty())return;
@@ -3497,6 +3498,8 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 	if(policies && (!m_host_fade_metadata || !depths || policies->size()!=quads.size()))fatalerror("Host fade policies mismatch\n");
 	if(margins && (m_host_layer!=3 || margins->size()!=quads.size() ||
 		std::any_of(margins->begin(),margins->end(),[](uint8_t v){return v>1;})))fatalerror("Host margin permissions mismatch\n");
+	if(residents && (m_host_layer!=3 || residents->size()!=quads.size() || policies ||
+		std::any_of(residents->begin(),residents->end(),[](uint8_t v){return v>1;})))fatalerror("Host resident permissions mismatch\n");
 	const uint32_t frame=uint32_t(m_screen->frame_number());
 	live().last_frame=frame;
 	live().sync_state(frame,m_paletteram.target(),uint32_t(m_paletteram.bytes()),
@@ -3507,7 +3510,7 @@ void midvunit_base_state::world_host_submit(const std::vector<std::array<uint16_
 	int const fade_frame=capture_text?atoi(capture_text):0;
 	for(size_t i=0;i<quads.size();++i)
 	{
-		h.pad=m_host_layer | ((margins && (*margins)[i])?4:0);
+		h.pad=m_host_layer | ((margins && (*margins)[i])?4:0) | ((residents && (*residents)[i])?8:0);
 		if(policies)
 		{
 			cruisn::vunit_fade::Packet packet;

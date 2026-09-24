@@ -256,6 +256,14 @@ void midvunit_base_state::offroad_host_start()
 		if(m_offroad_host_recover_partial && (m_host_mode!=2 || m_offroad_host_multiplier!=3 || !m_host_future || !ffb || strcmp(ffb,"0")))
 			fatalerror("Off Road partial recovery requires 3x future draw and physical FFB0\n");
 	}
+	if(const char *resident=std::getenv("MIDV_OFFROAD_HOST_RESIDENT_MARGINS"))
+	{
+		if(strcmp(resident,"0") && strcmp(resident,"1"))fatalerror("Invalid Off Road resident margin policy\n");
+		m_offroad_host_resident_margins=!strcmp(resident,"1");
+		const char *ffb=std::getenv("MIDV_FFB");
+		if(m_offroad_host_resident_margins && (m_host_mode!=2 || m_offroad_host_multiplier!=3 || !m_host_future || !ffb || strcmp(ffb,"0")))
+			fatalerror("Off Road resident margins require candidate 3x future draw and FFB0\n");
+	}
 	if(const char *layer=std::getenv("MIDV_OFFROAD_HOST_LAYER"))
 	{
 		if(strlen(layer)!=1 || *layer<'0' || *layer>'3')fatalerror("Invalid Off Road host layer\n");
@@ -277,6 +285,8 @@ void midvunit_base_state::offroad_host_start()
 		if(!m_host_fade_log || fwrite("VFD1",1,4,m_host_fade_log)!=4)fatalerror("Cannot create Off Road metadata evidence\n");
 		setvbuf(m_host_fade_log,nullptr,_IOFBF,65536);
 	}
+	if(m_offroad_host_resident_margins && (m_host_fade_metadata || m_host_layer!=3))
+		fatalerror("Off Road resident margins require both host layers without depth metadata\n");
 	bool trace=false;
 	if(const char *text=std::getenv("MIDV_OFFROAD_HOST_QUADS"))
 	{
@@ -287,7 +297,7 @@ void midvunit_base_state::offroad_host_start()
 	if(trace)m_host_quad_log=fopen("offroad-host-quads.csv","w");
 	if(!m_host_scene_log || (trace && !m_host_quad_log))fatalerror("Cannot create Off Road host evidence\n");
 	if(m_host_scene_log.buffer(nullptr,_IOFBF,65536))fatalerror("Cannot buffer host scene journal\n");
-	m_host_scene_log.print("frame,time,page,mode,multiplier,future_enabled,pending,future,future_definitions,unsupported,near,far,projection,material,decoded,pretrack,partial,deferred,quads,quads_hash,guard_us,prepare_us,pack_us,log_us,submit_us,microseconds\n");
+	m_host_scene_log.print("frame,time,page,mode,multiplier,future_enabled,pending,future,future_definitions,unsupported,near,far,projection,material,decoded,pretrack,partial,deferred,quads,quads_hash,guard_us,prepare_us,pack_us,log_us,submit_us,microseconds,resident_candidates,resident_margin,resident_pruned\n");
 	if(m_host_quad_log)
 	{
 		setvbuf(m_host_quad_log,nullptr,_IOFBF,65536);
@@ -314,11 +324,12 @@ void midvunit_base_state::offroad_host_start()
 			const auto guarded=std::chrono::steady_clock::now();
 			cruisn::offroad_host::Scene scene;
 			if(host_injected_failure(frame,cycles))return;
-			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,m_host_fade_metadata,m_offroad_host_recover_partial))
+			if(!cruisn::offroad_host::build(read,scene,m_offroad_host_multiplier,m_host_future,m_offroad_host_cache,m_offroad_host_clip_admission,m_host_fade_metadata,m_offroad_host_recover_partial,m_offroad_host_resident_margins))
 			{host_prepare_failed(frame,cycles,3,"Off Road host scene/model/material guard failed");return;}
 			host_bootstrap_ready(frame);
 			const auto prepared=std::chrono::steady_clock::now();
 			std::vector<std::array<uint16_t,16>> quads;
+			std::vector<uint8_t> resident_flags;
 			uint64_t hash=cruisn::world_host::hash_seed;
 			std::vector<std::array<uint32_t,4>> depths;
 			for(const auto &o:scene.objects)
@@ -328,6 +339,7 @@ void midvunit_base_state::offroad_host_start()
 				{
 					if(m_host_fade_metadata)depths.push_back(o.depths[i]);
 					quads.push_back(o.quads[i]);hash=cruisn::world_host::quad_hash(hash,o.quads[i]);
+					if(m_offroad_host_resident_margins)resident_flags.push_back(o.resident_margin?1:0);
 				}
 			}
 			const auto packed=std::chrono::steady_clock::now();
@@ -341,18 +353,20 @@ void midvunit_base_state::offroad_host_start()
 			const auto logged=std::chrono::steady_clock::now();
 			std::vector<uint32_t> policies;
 			if(m_host_fade_metadata)policies.assign(quads.size(),0);
-			if(m_host_mode==2)world_host_submit(quads,m_host_fade_metadata?&depths:nullptr,m_host_fade_metadata?&policies:nullptr);
+			if(m_host_mode==2)world_host_submit(quads,m_host_fade_metadata?&depths:nullptr,m_host_fade_metadata?&policies:nullptr,
+				nullptr,m_offroad_host_resident_margins?&resident_flags:nullptr);
 			if(m_maincpu->total_cycles()!=cycles)fatalerror("Off Road host inspection changed guest cycles\n");
 			host_scene_record(frame,quads.size(),hash);
 			const auto submitted=std::chrono::steady_clock::now();
 			auto us=[](auto a,auto b){return std::chrono::duration<double,std::micro>(b-a).count();};
 			const unsigned definitions=m_host_future && !scene.pretrack && !scene.deferred ? unsigned(m_offroad_host_cache.future.value.sources.size())+scene.partial_recovered:0;
 			if(scene.partial_recovered && m_host_journal_policy==cruisn::DiagnosticJournal::Policy::capture)osd_printf_info("OFFROAD_PARTIAL frame=%llu sources=%u\n",(unsigned long long)frame,scene.partial_recovered);
-			m_host_scene_log.print("%llu,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+			m_host_scene_log.print("%llu,%.12f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%016llx,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u\n",
 				(unsigned long long)frame,time,m_page_control,m_host_mode,m_offroad_host_multiplier,unsigned(m_host_future),
 				scene.pending,scene.future,definitions,scene.unsupported,scene.near,scene.far,scene.projection,scene.material,unsigned(scene.objects.size()),
 				unsigned(scene.pretrack),unsigned(scene.partial),unsigned(scene.deferred),unsigned(quads.size()),(unsigned long long)hash,
-				us(started,guarded),us(guarded,prepared),us(prepared,packed),us(packed,logged),us(logged,submitted),us(started,submitted));
+				us(started,guarded),us(guarded,prepared),us(prepared,packed),us(packed,logged),us(logged,submitted),us(started,submitted),
+				scene.resident_candidates,scene.resident_margin,scene.resident_pruned);
 		});
 	osd_printf_info("Off Road host mode=%u frames=%u..%u distance=%ux future=%u; guest state unchanged\n",m_host_mode,m_host_first,m_host_last,m_offroad_host_multiplier,unsigned(m_host_future));
 }
